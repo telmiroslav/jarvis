@@ -18,3 +18,7 @@ __pycache__/
 # Образцы голоса и рабочие файлы лаборатории
 voice_lab/out/
 voice_lab/work/
+
+# Записи голоса Мирослава (личные данные)
+voice_lab/ref/
+voice_lab/clone/out/
