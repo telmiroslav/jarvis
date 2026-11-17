@@ -1,0 +1,12 @@
+# Стенд клонирования голоса: в git только скрипты и заметки
+out/
+work/
+logs/
+*.log
+omnivoice/pylibs/
+f5/ruaccent_data/
+silero/models/
+ref_placeholder.wav
+__pycache__/
+# venv'ы (uv и так кладёт в них свой .gitignore)
+.venv/
