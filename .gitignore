@@ -1,0 +1,20 @@
+# Сборка ESP-IDF
+firmware/build/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.old
+# Версию пишет CI перед сборкой (firmware/dependencies.lock остаётся в git)
+firmware/version.txt
+
+# Python и логи
+__pycache__/
+*.log
+.venv
+
+# Ключи API (GEMINI_API_KEY и т.п.) никогда не коммитим
+.env
+.env.*
+
+# Образцы голоса и рабочие файлы лаборатории
+voice_lab/out/
+voice_lab/work/

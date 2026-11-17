@@ -1,0 +1,80 @@
+name: Firmware
+
+# Собирает прошивку в ESP-IDF v5.5.6 и кладёт один готовый образ
+# (bootloader + таблица разделов + приложение, прошивается с адреса 0x0).
+#   - каждый push в main и каждый запуск вручную: образ лежит в артефактах запуска;
+#   - тег v*: образ jarvis-firmware.bin публикуется в Releases (его качает tools/flash.sh).
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Внутри Docker git describe часто не работает, поэтому версию кладём файлом:
+      # ESP-IDF берёт firmware/version.txt как версию приложения (она видна в логе при старте).
+      - name: Версия прошивки
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            branch="${GITHUB_REF_NAME//[^A-Za-z0-9._-]/-}"
+            version="${branch}-$(git rev-parse --short=7 HEAD)"
+          fi
+          # в образе под версию отведено 31 символ
+          version="${version:0:31}"
+          echo "$version" > firmware/version.txt
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Версия: $version"
+
+      # Образ получается в firmware/build/merged-binary.bin (имя по умолчанию у idf.py merge-bin).
+      - name: Сборка (idf.py build + merge-bin)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.6
+          target: esp32s3
+          path: firmware
+          command: idf.py build merge-bin
+
+      - name: Готовый образ
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp firmware/build/merged-binary.bin dist/jarvis-firmware.bin
+          # .elf нужен, чтобы расшифровывать адреса из логов падений
+          cp firmware/build/jarvis.elf dist/jarvis.elf
+          ls -l dist
+          sha256sum dist/jarvis-firmware.bin
+
+      - name: Артефакт запуска
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-firmware-${{ steps.ver.outputs.version }}
+          path: |
+            dist/jarvis-firmware.bin
+            dist/jarvis.elf
+          if-no-files-found: error
+
+      - name: Релиз
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/jarvis-firmware.bin
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          make_latest: "true"
