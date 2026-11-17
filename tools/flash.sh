@@ -8,12 +8,15 @@
 #   ./tools/flash.sh monitor        только смотреть лог (плата перезагрузится)
 #
 # Переменные: PORT=/dev/ttyACM0 (порт руками), BAUD=460800 (скорость прошивки).
-# Нужны: gh, esptool, python3 + pyserial (скрипт сам скажет, чего не хватает).
+# Нужны: curl (или wget), esptool, python3 + pyserial (скрипт сам скажет, чего не хватает).
+# Аккаунт GitHub не нужен: прошивка качается с публичной страницы Releases.
 
 set -euo pipefail
 
-REPO="telmiroslav/jarvis"
-ASSET="jarvis-firmware.bin"
+# JARVIS_REPO и JARVIS_ASSET нужны только для проверки скрипта на чужом релизе
+REPO="${JARVIS_REPO:-telmiroslav/jarvis}"
+ASSET="${JARVIS_ASSET:-jarvis-firmware.bin}"
+RELEASES="https://github.com/$REPO/releases"
 CHIP="esp32s3"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="$HOME/jarvis-logs"
@@ -60,6 +63,7 @@ while (( $# )); do
     -*)             die "Не знаю ключ $1. Справка: ./tools/flash.sh --help" ;;
     *)
       [[ "$MODE" == "release" && -z "$TAG" ]] || die "Лишний аргумент: $1. Справка: ./tools/flash.sh --help"
+      [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die "Странный тег: $1. Тег выглядит так: v0.0.2"
       TAG="$1"
       ;;
   esac
@@ -74,13 +78,9 @@ check_python() {
     || die "Нет pyserial (нужен для лога). Поставь:  sudo pacman -S python-pyserial"
 }
 
-check_gh() {
-  command -v gh >/dev/null 2>&1 \
-    || die "Нет gh (GitHub CLI). Поставь:  sudo pacman -S github-cli
-Потом один раз войди в аккаунт:  gh auth login"
-  gh auth status >/dev/null 2>&1 \
-    || die "gh не вошёл в GitHub (или нет сети: включён ли VPN?). Войди командой:  gh auth login
-(выбери GitHub.com, HTTPS, Login with a web browser). Потом запусти скрипт ещё раз."
+check_downloader() {
+  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \
+    || die "Нет curl (и wget тоже). Поставь:  sudo pacman -S curl"
 }
 
 ESPTOOL=""
@@ -178,25 +178,70 @@ wait_port_back() {
 BIN=""
 FW_DESC=""
 
+DL_CODE=0   # HTTP-код последнего скачивания, 0 = до сервера достучаться не удалось
+
+# http_get URL ФАЙЛ: 0 если скачалось. Редиректы (GitHub отдаёт файл через другой адрес) идут сами.
+http_get() {
+  local url="$1" out="$2" rc=0
+  DL_CODE=0
+  if command -v curl >/dev/null 2>&1; then
+    DL_CODE="$(curl -sSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 \
+      -o "$out" -w '%{http_code}' "$url" 2>"$tmp/dl.err")" || rc=$?
+    if (( rc != 0 )); then DL_CODE=0; fi
+  else
+    wget -nv -S --tries=3 --timeout=20 -O "$out" "$url" 2>"$tmp/dl.err" || rc=$?
+    if (( rc == 0 )); then
+      DL_CODE=200
+    elif (( rc == 8 )); then
+      DL_CODE="$(grep -o 'HTTP/[0-9.]* [0-9]*' "$tmp/dl.err" | tail -n1 | cut -d' ' -f2)"
+      DL_CODE="${DL_CODE:-500}"
+    fi
+  fi
+  [[ "$DL_CODE" == "200" ]]
+}
+
+# Номер версии последнего релиза: только чтобы показать и записать в лог (не страшно, если не вышло)
+latest_tag() {
+  command -v curl >/dev/null 2>&1 || return 0
+  local final
+  final="$(curl -sSIL --max-time 15 -o /dev/null -w '%{url_effective}' "$RELEASES/latest" 2>/dev/null || true)"
+  if [[ "$final" == */releases/tag/* ]]; then printf '%s' "${final##*/releases/tag/}"; fi
+}
+
 fetch_release() {
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/jarvis-flash.XXXXXX")"
-  local rel
-  step "Ищу релиз ${TAG:-(последний)} в $REPO ..."
-  if ! rel="$(GH_PROMPT_DISABLED=1 gh release view ${TAG:+"$TAG"} -R "$REPO" --json tagName -q .tagName 2>"$tmp/gh.err")"; then
-    cat "$tmp/gh.err" >&2
-    die "Не получилось найти релиз ${TAG:-(последний)}. Что проверить:
-  - релизов ещё нет: Miroslav не выпустил прошивку (на GitHub идёт сборка);
-  - нет доступа: репозиторий закрытый, Miroslav должен добавить тебя (приглашение придёт на почту, прими его на github.com);
-  - тег набран неверно (должно быть что-то вроде v0.0.2);
-  - нет сети: включён ли VPN?"
+  local url rel
+  if [[ -n "$TAG" ]]; then
+    url="$RELEASES/download/$TAG/$ASSET"
+    rel="$TAG"
+  else
+    url="$RELEASES/latest/download/$ASSET"
+    rel="$(latest_tag)"
   fi
-  step "Скачиваю $ASSET (версия $rel) ..."
-  if ! GH_PROMPT_DISABLED=1 gh release download "$rel" -R "$REPO" -p "$ASSET" -D "$tmp" --clobber 2>"$tmp/gh.err"; then
-    cat "$tmp/gh.err" >&2
-    die "Не получилось скачать $ASSET из релиза $rel. Возможно, сборка ещё идёт и файла пока нет. Подожди минуту и повтори."
+  step "Скачиваю $ASSET (${rel:-последний релиз}) с GitHub ..."
+  if ! http_get "$url" "$tmp/$ASSET"; then
+    if [[ -s "$tmp/dl.err" ]]; then tail -n 1 "$tmp/dl.err" >&2; fi
+    case "$DL_CODE" in
+      0)
+        die "Не получилось связаться с GitHub. Проверь интернет и VPN, потом запусти скрипт ещё раз." ;;
+      404)
+        if [[ -n "$TAG" ]]; then
+          die "Релиз $TAG не найден (или в нём нет файла $ASSET). Проверь, что тег набран верно, например v0.0.2.
+Список версий: $RELEASES"
+        else
+          die "Готовой прошивки на GitHub пока нет: релиза ещё нет или он ещё собирается.
+Подожди пару минут и запусти ещё раз. Если долго нет, напиши Мирославу.
+Список версий: $RELEASES"
+        fi ;;
+      403|429)
+        die "GitHub отказал (код $DL_CODE), обычно это временно из-за частых запросов. Подожди несколько минут и повтори." ;;
+      *)
+        die "GitHub ответил ошибкой (код $DL_CODE). Подожди минуту и повтори. Если не проходит, напиши Мирославу." ;;
+    esac
   fi
   BIN="$tmp/$ASSET"
-  FW_DESC="релиз $rel"
+  FW_DESC="${rel:+релиз $rel}"
+  FW_DESC="${FW_DESC:-последний релиз}"
 }
 
 check_bin() {
@@ -244,7 +289,7 @@ flash_failed_help() {
      Потом сразу запусти ту же команду ещё раз.
   2. Перетыкни кабель в другой USB-порт платы (COM или USB) и повтори.
   3. Попробуй другой кабель (нужен с данными) и другой порт ноутбука.
-Если не помогло, скопируй текст ошибки выше и пришли Miroslav.
+Если не помогло, скопируй текст ошибки выше и пришли Мирославу.
 EOF
 }
 
@@ -274,7 +319,7 @@ final_hint() {
   echo
   ok "Лог сохранён в файл:"
   echo "    $LOG"
-  echo "Пришли этот файл Miroslav (папка с логами: ~/jarvis-logs)."
+  echo "Пришли этот файл Мирославу (папка с логами: ~/jarvis-logs)."
 }
 
 # --- главное ----------------------------------------------------------------------------
@@ -282,7 +327,7 @@ final_hint() {
 check_python
 case "$MODE" in
   release)
-    check_gh
+    check_downloader
     check_esptool
     step "[1/3] Скачиваю прошивку"
     fetch_release
