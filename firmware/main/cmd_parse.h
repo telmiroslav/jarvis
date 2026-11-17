@@ -9,6 +9,10 @@
 //   wifi_clear                     забыть сеть
 //   tz <POSIX TZ>                  часовой пояс, например CST-8
 //   lcd <1-6>                      вариант настройки экрана (запоминается)
+//   server                         показать, к какому серверу плата подключена
+//   server ws://ip:порт/путь       адрес сервера руками (поиск по UDP отключается)
+//   server auto                    забыть адрес и искать сервер по UDP
+//   echo                           диагностика звука: запись 4 с с микрофона и воспроизведение
 //   status                         одна строка состояния
 //   reboot                         перезагрузка
 //   help                           список команд
@@ -19,12 +23,13 @@
 namespace jarvis {
 namespace cmd {
 
-enum class Kind { Empty, WifiSet, WifiClear, Tz, Lcd, Status, Reboot, Help, Error };
+enum class Kind { Empty, WifiSet, WifiClear, Tz, Lcd, Server, Echo, Status, Reboot, Help, Error };
 
 constexpr size_t kMaxSsid = 32;      // байт, предел стандарта 802.11
 constexpr size_t kMaxPass = 64;      // 8..63 символа или ровно 64 шестнадцатеричные цифры
 constexpr size_t kMaxTz = 63;
 constexpr size_t kMaxLine = 160;     // длиннее строка не принимается (SSID 32 + пароль 64 + команда с запасом)
+constexpr size_t kMaxServerUrl = 127;
 
 struct Command {
     Kind kind = Kind::Empty;
@@ -32,6 +37,8 @@ struct Command {
     char pass[kMaxPass + 1] = {0};
     char tz[kMaxTz + 1] = {0};
     int lcd = 0;
+    char url[kMaxServerUrl + 1] = {0};   // Kind::Server: адрес; пусто = только показать
+    bool server_auto = false;            // Kind::Server: «server auto»
     // для Kind::Error: имя команды (или "cmd") и причина, обе строки статические, без пробелов
     const char *err_cmd = "cmd";
     const char *err_reason = "";

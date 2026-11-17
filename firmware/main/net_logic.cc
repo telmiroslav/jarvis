@@ -1,5 +1,7 @@
 #include "net_logic.h"
 
+#include <stdio.h>
+
 namespace jarvis {
 namespace net_logic {
 
@@ -82,6 +84,73 @@ int bars_from_rssi(int rssi_dbm)
         return 1;
     }
     return 0;
+}
+
+CredsGate::Apply CredsGate::on_saved()
+{
+    if (inited_) {
+        return Apply::Now;
+    }
+    if (failed_) {
+        return Apply::WifiDown;
+    }
+    pending_ = true;
+    return Apply::Deferred;
+}
+
+bool CredsGate::on_init_done(bool ok)
+{
+    if (ok) {
+        inited_ = true;
+    } else {
+        failed_ = true;
+    }
+    const bool apply = ok && pending_;
+    pending_ = false;
+    return apply;
+}
+
+namespace {
+
+// Копирует s в dst как одно слово: всё, кроме [A-Za-z0-9_.:-], становится '_'
+void put_word(char *dst, size_t cap, const char *s)
+{
+    size_t n = 0;
+    if (cap == 0) {
+        return;
+    }
+    for (; s && *s && n + 1 < cap; s++) {
+        const char c = *s;
+        const bool good = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+                          c == '.' || c == ':' || c == '-';
+        dst[n++] = good ? c : '_';
+    }
+    dst[n] = '\0';
+}
+
+}  // namespace
+
+void format_wifi_set_reply(SetOutcome o, const char *stage, const char *err_name, char *buf, size_t cap)
+{
+    if (cap == 0) {
+        return;
+    }
+    switch (o) {
+    case SetOutcome::Ok:
+        snprintf(buf, cap, "WIFI_SET OK");
+        break;
+    case SetOutcome::WifiDown:
+        snprintf(buf, cap, "ERR wifi_set wifi_down");
+        break;
+    case SetOutcome::SaveFailed:
+    default: {
+        char st[32], er[64];
+        put_word(st, sizeof(st), stage && *stage ? stage : "unknown");
+        put_word(er, sizeof(er), err_name && *err_name ? err_name : "unknown");
+        snprintf(buf, cap, "ERR wifi_set save_failed:%s_%s", st, er);
+        break;
+    }
+    }
 }
 
 }  // namespace net_logic

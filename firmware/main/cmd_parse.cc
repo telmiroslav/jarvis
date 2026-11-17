@@ -1,8 +1,11 @@
 #include "cmd_parse.h"
 
+#include "link_logic.h"
+
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 namespace jarvis {
 namespace cmd {
@@ -278,6 +281,37 @@ Command parse_command(const char *line)
         c.lcd = static_cast<int>(v);
         return c;
     }
+    if (word_eq(w, wlen, "server")) {
+        const char *a = skip_spaces(rest);
+        size_t alen = strlen(a);
+        while (alen > 0 && is_space(a[alen - 1])) {
+            alen--;
+        }
+        Command c;
+        c.kind = Kind::Server;
+        if (alen == 0) {
+            return c;   // без аргумента: показать текущий
+        }
+        if (alen > kMaxServerUrl) {
+            return make_error("server", "bad_url");
+        }
+        memcpy(c.url, a, alen);
+        c.url[alen] = '\0';
+        if (alen == 4 && strncasecmp(c.url, "auto", 4) == 0) {
+            c.url[0] = '\0';
+            c.server_auto = true;
+            return c;
+        }
+        if (!link_logic::parse_ws_url(c.url, nullptr)) {
+            return make_error("server", "bad_url");
+        }
+        return c;
+    }
+    if (word_eq(w, wlen, "echo")) {
+        Command c;
+        c.kind = Kind::Echo;
+        return c;
+    }
     if (word_eq(w, wlen, "status")) {
         Command c;
         c.kind = Kind::Status;
@@ -318,6 +352,7 @@ const char *describe_error(const char *reason)
         {"tz_invalid", "это не POSIX-строка часового пояса, пример: CST-8"},
         {"tz_too_long", "строка часового пояса длиннее 63 символов"},
         {"lcd_range", "номер варианта экрана от 1 до 6"},
+        {"bad_url", "адрес сервера должен выглядеть так: ws://192.168.1.5:47801/ws (или server auto)"},
     };
     for (const Item &it : kItems) {
         if (strcmp(it.key, reason) == 0) {

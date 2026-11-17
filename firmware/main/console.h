@@ -23,6 +23,8 @@ struct Hooks {
     void (*status_json)(char *buf, size_t cap) = nullptr;
     // Применяет и сохраняет вариант экрана 1..6; false при ошибке
     bool (*apply_lcd)(int cfg) = nullptr;
+    // Команда echo: false, если звук сейчас занят или микрофон/динамик не поднялись
+    bool (*start_echo)() = nullptr;
 };
 
 // Ставит драйверы приёма и запускает задачу разбора. Ошибка одного порта не мешает другому.

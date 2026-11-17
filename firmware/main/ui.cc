@@ -99,9 +99,11 @@ const Look kLooks[] = {
     /* Thinking  */ { 900,  950, -90, -120, 1000,    0,    0, 1000,    0, kAccent},
     /* Speaking  */ {1000, 1000,   0,    0, 1000, 1000, 1000,    0,    0, kAccentLight},
     /* NoWifi    */ { 420, 1020,   0,   70,  620,    0,    0,    0,    0, kSleepyTeal},
+    /* NoServer  */ { 420, 1020,   0,   70,  620,    0,    0,    0,    0, kSleepyTeal},
     /* Error     */ { 360,  990,   0,   70,  720,    0,    0,    0,    0, kWarm},
     /* Sleep     */ {  70, 1000,   0,    0,  330,    0,    0,    0,    0, kAccent},
 };
+static_assert(sizeof(kLooks) / sizeof(kLooks[0]) == static_cast<size_t>(State::Sleep) + 1, "kLooks must have a row per State, in the enum order");
 
 // ---------------------------------------------------------------- модель (общая с другими задачами)
 
@@ -385,10 +387,12 @@ bool blink_allowed() { return U.state != State::Sleep; }
 // переполнится на 50-й день работы.
 inline bool due(uint32_t now, uint32_t t) { return static_cast<int32_t>(now - t) >= 0; }
 
+inline bool is_sleepy(State s) { return s == State::NoWifi || s == State::NoServer || s == State::Error; }
+
 void start_blink()
 {
     Face &f = U.face;
-    const bool sleepy = (U.state == State::NoWifi || U.state == State::Error);
+    const bool sleepy = is_sleepy(U.state);
     f.blinking = true;
     tween(&f.blink, 60, sleepy ? 150 : 85, lv_anim_path_ease_in);
     f.reopen_at = lv_tick_get() + (sleepy ? 170 : 95);
@@ -398,7 +402,7 @@ void run_schedules(uint32_t now)
 {
     Face &f = U.face;
     if (f.blinking && due(now, f.reopen_at)) {
-        const bool sleepy = (U.state == State::NoWifi || U.state == State::Error);
+        const bool sleepy = is_sleepy(U.state);
         tween(&f.blink, 1000, sleepy ? 260 : 150, lv_anim_path_ease_out);
         f.blinking = false;
         f.reopen_at = now;
@@ -406,7 +410,7 @@ void run_schedules(uint32_t now)
     if (!f.blinking && blink_allowed() && !g_pause_motion && due(now, f.next_blink)) {
         start_blink();
         const uint32_t base = ui_logic::blink_delay_ms(rnd());
-        const bool sleepy = (U.state == State::NoWifi || U.state == State::Error);
+        const bool sleepy = is_sleepy(U.state);
         f.next_blink = now + (sleepy ? base + 3000 : base);
         f.second_blink_at = (!sleepy && ui_logic::double_blink(rnd())) ? now + 330 : 0;
     }
@@ -1005,6 +1009,7 @@ const char *state_name(State s)
     case State::Thinking:  return "THINKING";
     case State::Speaking:  return "SPEAKING";
     case State::NoWifi:    return "NO_WIFI";
+    case State::NoServer:  return "NO_SERVER";
     case State::Error:     return "ERROR";
     case State::Sleep:     return "SLEEP";
     }

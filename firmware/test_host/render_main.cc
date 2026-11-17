@@ -22,8 +22,10 @@
 #endif
 #endif
 
+#include "link_logic.h"
 #include "lvgl.h"
 #include "net_logic.h"
+#include "subtitle.h"
 #include "ui.h"
 
 using namespace jarvis;
@@ -524,6 +526,69 @@ int main(int argc, char **argv)
         CHECK(face.y0 >= 24 && face.y1 <= 144);
         // и между лицом и подписью есть воздух, чтобы ничего не налезало друг на друга
         CHECK(lit_pixels(with_user, 0, 140, 240, 8) == 0);
+    }
+
+    // v0.3: связь с ноутбуком. Тексты берутся из тех же констант, что и на плате.
+    {
+        ui::set_out_level(0.0f);
+        ui::set_mic_level(0.0f);
+        ui::clear_texts();
+
+        // 15. Wi-Fi есть, сервер ищется: сонное лицо и «Ищу ноутбук…»
+        ui::set_state(ui::State::NoServer);
+        ui::set_hint(link_logic::kHintSearching);
+        advance(1500);
+        const Image searching = shot(++n, "searching_server");
+        const Box4 s_eyes = lit_box(searching, 0, 24, 240, 120);
+        CHECK(s_eyes.any() && s_eyes.y1 < 146);
+        const Box4 s_hint = lit_box(searching, 0, 150, 240, 90);
+        CHECK(s_hint.any() && s_hint.x0 >= 4 && s_hint.x1 <= 236 && s_hint.y1 <= 238);
+
+        // 16. Ноутбука нет: «Нет связи с ноутбуком. Запущен ли сервер?» (две строки)
+        ui::set_hint(link_logic::kHintNoServer);
+        advance(900);
+        const Image noserver = shot(++n, "no_server");
+        const Box4 n_hint = lit_box(noserver, 0, 150, 240, 90);
+        CHECK(n_hint.any() && n_hint.x0 >= 4 && n_hint.x1 <= 236 && n_hint.y1 <= 238);
+        CHECK(ui::testing::main_text_height() <= ui::testing::main_view_height());   // подсказка влезает без прокрутки
+
+        // 17. Ошибка сервера: ERROR и текст msg (пример из PROTOCOL.md)
+        ui::set_state(ui::State::Error);
+        ui::set_hint("Не могу связаться с ИИ. Проверь VPN на ноутбуке.");
+        advance(1200);
+        const Image err = shot(++n, "error_server_message");
+        const Box4 e_hint = lit_box(err, 0, 150, 240, 90);
+        CHECK(e_hint.any() && e_hint.x0 >= 4 && e_hint.x1 <= 236 && e_hint.y1 <= 238);
+        CHECK(ui::testing::main_text_height() <= ui::testing::main_view_height());
+
+        // 18. Ответ приходит по предложениям: каждое ДОПИСЫВАЕТСЯ к субтитру, прокрутка не сбрасывается
+        ui::set_hint("");
+        ui::set_state(ui::State::Speaking);
+        ui::set_out_level(0.6f);
+        ui::set_user_text("Джарвис, что у меня завтра?");
+        subtitle::Answer ans;
+        ui::set_jarvis_text(ans.append("Завтра у вас три дела, сэр.", false));
+        advance(1500);
+        ui::set_jarvis_text(ans.append("В девять утра звонок по проекту, в час дня обед с партнёрами в центре.", false));
+        advance(1800);
+        ui::set_jarvis_text(ans.append("А в шесть вечера тренировка. Между встречами остаётся свободное окно, можно заняться почтой.", false));
+        advance(3000);
+        const int32_t scroll_a = ui::testing::scroll_px();
+        CHECK(ui::testing::main_text_height() > ui::testing::main_view_height());
+        shot(++n, "answer_appended_sentences");
+        ui::set_jarvis_text(ans.append("Напомнить за час до первого звонка?", true));   // последнее предложение
+        advance(100);
+        CHECK(ui::testing::scroll_px() >= scroll_a);   // дописывание не откатило прокрутку к началу
+        advance(4000);
+        CHECK(ans.finished());
+        // после final следующий текст это новый ответ
+        ui::set_jarvis_text(ans.append("Новый ответ.", false));
+        advance(500);
+        CHECK(ui::testing::main_text_height() <= ui::testing::main_view_height());
+        ui::clear_texts();
+        ui::set_out_level(0.0f);
+        ui::set_state(ui::State::Idle);
+        advance(500);
     }
 
     // Нагрузка на шину при анимации (чем меньше, тем плавнее на плате)

@@ -97,6 +97,64 @@ bool AudioOut::wait_idle(uint32_t timeout_ms) const
     return true;
 }
 
+bool AudioOut::stream_start(PullFn fn, void *ctx)
+{
+    if (!ok_ || !fn) {
+        return false;
+    }
+    // Прежний поток мог остановиться только что и ещё выходит из цикла (до 20 мс): ждём чуть-чуть
+    bool got = false;
+    for (int i = 0; i < 14 && !got; i++) {
+        bool expected = false;
+        got = busy_.compare_exchange_strong(expected, true);
+        if (!got) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+    if (!got) {
+        return false;   // играет звонок или эхо
+    }
+    pull_fn_ = fn;
+    pull_ctx_ = ctx;
+    stream_chunks_.store(0);
+    stream_active_.store(true);
+    stream_req_.store(true);
+    xTaskNotifyGive(task_);
+    return true;
+}
+
+// Поток: чанки по 20 мс, настоящий звук берём у pull, остаток тишина. Запись в I2S сама держит такт (блокируется,
+// пока в DMA нет места), поэтому отдельных пауз не нужно.
+void AudioOut::run_stream(int16_t *stereo)
+{
+    int16_t mono[kChunkFrames];
+    while (stream_active_.load()) {
+        size_t real = pull_fn_(pull_ctx_, mono, kChunkFrames);
+        if (real > kChunkFrames) {
+            real = kChunkFrames;
+        }
+        if (real < kChunkFrames) {
+            memset(mono + real, 0, (kChunkFrames - real) * sizeof(int16_t));
+        }
+        for (size_t i = 0; i < kChunkFrames; i++) {
+            stereo[2 * i] = mono[i];
+            stereo[2 * i + 1] = mono[i];
+        }
+        level_dbfs_.store(real > 0 ? dsp::rms_dbfs_i16(mono, real) : dsp::kFloorDbfs);
+        size_t written = 0;
+        const esp_err_t err = i2s_channel_write(tx_, stereo, kChunkFrames * 2 * sizeof(int16_t), &written, kWriteTimeoutMs);
+        if (err != ESP_OK) {
+            if (write_errors_.fetch_add(1) == 0) {
+                ESP_LOGE(TAG, "i2s_channel_write failed in the stream: %s (further failures are only counted)",
+                         esp_err_to_name(err));
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));   // не крутим цикл вхолостую при поломке
+        }
+        stream_chunks_.fetch_add(1);
+    }
+    level_dbfs_.store(dsp::kFloorDbfs);
+}
+
 void AudioOut::task_entry(void *arg) { static_cast<AudioOut *>(arg)->run(); }
 
 void AudioOut::run()
@@ -112,6 +170,12 @@ void AudioOut::run()
 
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (stream_req_.exchange(false)) {
+            run_stream(stereo);
+            plays_.fetch_add(1);
+            busy_.store(false);
+            continue;
+        }
         const int16_t *pcm = pcm_;
         const size_t total = samples_;
 

@@ -1,17 +1,20 @@
-// Jarvis v0.2: лицо на экране, Wi-Fi, часы, субтитры (поверх проверки железа из v0.1).
+// Jarvis v0.3: голосовой помощник. Плата слушает кнопку BOOT, отправляет голос серверу на ноутбуке, показывает лицо
+// и субтитры и играет ответ (поверх проверки железа из v0.1 и экрана, Wi-Fi и часов из v0.2).
 //
 // Что делает:
-//   - ЭКРАН: LVGL 9 (gui.cc, ui.cc): строка состояния (Wi-Fi, часы), лицо, субтитры. Лицо в состояниях
-//     IDLE / LISTENING / THINKING / SPEAKING / NO_WIFI / ERROR / SLEEP (ui.h);
+//   - РАЗГОВОР (docs/PROTOCOL.md, session.cc, dialog.cc): BOOT зажата дольше 200 мс = запись (лицо LISTENING, голос идёт
+//     серверу по WebSocket), отпустил = ответ (THINKING, потом SPEAKING со звуком и субтитрами). Короткое нажатие во время
+//     ответа = замолчать. Максимум записи 15 с;
+//   - СВЯЗЬ (link.cc): поиск сервера по UDP, WebSocket, hello/welcome, ping, возврат связи с паузами 1, 2, 4, 8, 10 с;
+//   - ЭКРАН: LVGL 9 (gui.cc, ui.cc): строка состояния (Wi-Fi, часы), лицо IDLE / LISTENING / THINKING / SPEAKING /
+//     NO_WIFI / NO_SERVER / ERROR / SLEEP, субтитры и подсказки («Ищу ноутбук…», «Нет связи с ноутбуком…», «Нет Wi-Fi…»);
 //   - Wi-Fi и время: net.cc. Сеть и пароль задаются командой по серийному порту (./tools/flash.sh wifi),
 //     время по SNTP (серверы, доступные из Китая, первыми), часовой пояс по умолчанию CST-8;
-//   - серийные команды: console.cc (wifi_set, wifi_clear, tz, lcd, status, reboot). Слушаются оба порта платы;
-//   - ДЕМО: короткое нажатие BOOT листает IDLE -> LISTENING -> THINKING -> SPEAKING -> IDLE с примерами
-//     подписей; длинное нажатие (дольше 0,8 с) это эхо-тест: запись с микрофона (до 5 с), отпустил = воспроизведение,
-//     лицо при этом реагирует на настоящий звук;
+//   - серийные команды: console.cc (wifi_set, wifi_clear, tz, lcd, server, echo, status, reboot). Слушаются оба порта платы;
 //   - при старте: отчёт о плате, тест PSRAM, звонок + проверка «динамик услышан микрофоном» (LOOPBACK);
-//   - каждые 30 с одна строка "STATUS: ..." (Wi-Fi, адрес, время, память, loopback, сброс) вместо писка из v0.1;
-//   - светодиод: ожидание плавно зелёный, слушает красный, думает фиолетовый, говорит синий, нет Wi-Fi медленно янтарный.
+//   - каждые 30 с одна строка "STATUS: ..." (Wi-Fi, сервер, время, память, loopback, сброс);
+//   - светодиод: ожидание плавно зелёный, слушает красный, думает янтарный пульс, говорит синий, нет сервера или
+//     Wi-Fi медленно янтарный, ошибка красным миганием.
 // Любая ошибка инициализации пишется в лог и пропускается, остальное продолжает работать.
 
 #include <atomic>
@@ -43,10 +46,16 @@
 #include "console.h"
 #include "display.h"
 #include "dsp.h"
+#include "face_logic.h"
 #include "gui.h"
 #include "lcd_cfg.h"
+#include "link.h"
+#include "link_logic.h"
+#include "mic_stream.h"
 #include "net.h"
 #include "net_logic.h"
+#include "playback.h"
+#include "session.h"
 #include "settings.h"
 #include "text_util.h"
 #include "ui.h"
@@ -70,15 +79,12 @@ constexpr int64_t kReportMs = 30000;
 constexpr TickType_t kPollTicks = pdMS_TO_TICKS(10);
 constexpr int64_t kDebounceMs = 30;         // уровень кнопки должен продержаться 30 мс (по времени, не по числу опросов)
 
-constexpr int64_t kShortPressMaxMs = 600;   // короче = следующее состояние лица в демо
-constexpr int64_t kLongPressMs = 800;       // дольше = эхо-тест (между ними ничего не делаем)
-constexpr int64_t kDemoTimeoutMs = 60000;   // забытое демо само возвращается в IDLE
-
 constexpr float kChimePeakDbfs = -12.0f;    // умеренно, чтобы не просадить питание по USB
 
 constexpr float kLoopbackMinDeltaDb = 6.0f; // на столько дБ микрофон должен «услышать» звук динамика
 
-constexpr size_t kRecMaxSamples = AudioIn::kSampleRate * 5;                       // 5 с
+constexpr size_t kRecMaxSamples = AudioIn::kSampleRate * 5;                       // буфер эха 5 с
+constexpr size_t kEchoRecSamples = AudioIn::kSampleRate * 4;                      // команда echo пишет 4 с
 constexpr size_t kRecMinSamples = AudioIn::kSampleRate * 3 / 10;                  // 0,3 с
 constexpr size_t kPlayMaxSamples = AudioOut::kSampleRate * 5 + 64;                // 5 с после ресемплинга
 constexpr float kEchoTargetPeakDbfs = -6.0f;
@@ -88,9 +94,8 @@ constexpr size_t kLcdMaxTransferBytes = static_cast<size_t>(Display::kWidth) * 4
 
 // ---------------------------------------------------------------- состояние
 
+// Rec и Play это только диагностическая команда echo; разговор живёт в session.cc
 enum class Mode : int { Boot = 0, Idle, Rec, Play };
-
-enum class Demo : int { Idle = 0, Listening, Thinking, Speaking };
 
 enum class PsramTest { NotRun, Skipped, AllocFailed, Passed, Failed };
 
@@ -152,10 +157,8 @@ int16_t *g_rec_buf = nullptr;
 int16_t *g_play_buf = nullptr;
 int64_t g_rec_started_ms = 0;
 
-Demo g_demo = Demo::Idle;
-int g_demo_next = 0;            // какой пример подписей показывать в следующий раз
-int64_t g_demo_since_ms = 0;
-size_t g_demo_words = 0;        // сколько слов вопроса уже «услышано»
+std::atomic<bool> g_echo_request{false};   // команда echo из консоли
+bool g_link_started = false;
 
 // ---------------------------------------------------------------- мелочи
 
@@ -294,8 +297,8 @@ void led_show(uint8_t r, uint8_t g, uint8_t b)
     g_led.last_b = b;
 }
 
-// Ожидание: медленное «дыхание» зелёным (период 4 с); слушает красный; думает фиолетовый; говорит синий;
-// нет Wi-Fi медленно янтарный; ошибка красным миганием; сон почти не светит
+// Ожидание: медленное «дыхание» зелёным (период 4 с); слушает красный; думает янтарный пульс (период 1,2 с); говорит
+// синий; нет сервера или Wi-Fi медленно янтарный (период 5 с); ошибка красным миганием; сон почти не светит
 void led_update(int64_t now_ms)
 {
     const auto breath = [&](int64_t period_ms, int lo, int hi) {
@@ -313,10 +316,11 @@ void led_update(int64_t now_ms)
         break;
     case ui::State::Thinking: {
         const int v = breath(1200, 4, kLedLevel);
-        led_show(static_cast<uint8_t>(v * 6 / 10), 0, static_cast<uint8_t>(v));
+        led_show(static_cast<uint8_t>(v), static_cast<uint8_t>(v * 4 / 10), 0);
         break;
     }
-    case ui::State::NoWifi: {
+    case ui::State::NoWifi:
+    case ui::State::NoServer: {
         const int v = breath(5000, 2, kLedLevel);
         led_show(static_cast<uint8_t>(v), static_cast<uint8_t>(v * 4 / 10), 0);
         break;
@@ -458,119 +462,6 @@ void run_psram_test()
     }
 }
 
-// ---------------------------------------------------------------- демо подписей
-
-struct DemoSample {
-    const char *user;
-    const char *answer;
-};
-
-// Первый пример из задания (4 строки, одна прокрутка), второй короткий (3 строки, прокрутки нет), третий длинный
-constexpr DemoSample kDemoSamples[] = {
-    {"Джарвис, какая сегодня погода?",
-     "Сейчас плюс восемь и облачно, сэр. К вечеру обещают дождь, зонт не помешает."},
-    {"Который час?", "Сейчас половина первого, сэр."},
-    {"Что у меня запланировано на завтра?",
-     "Завтра у вас три дела, сэр. В девять утра звонок по проекту, в час дня обед с партнёрами в центре, а в шесть "
-     "вечера тренировка. Между встречами остаётся свободное окно с двух до четырёх, можно заняться почтой. "
-     "Напомнить за час до первого звонка?"},
-};
-constexpr int kDemoSampleCount = static_cast<int>(sizeof(kDemoSamples) / sizeof(kDemoSamples[0]));
-
-const char *demo_name(Demo d)
-{
-    switch (d) {
-    case Demo::Listening: return "LISTENING";
-    case Demo::Thinking:  return "THINKING";
-    case Demo::Speaking:  return "SPEAKING";
-    default:              return "IDLE";
-    }
-}
-
-// Первые n слов строки (UTF-8, слова разделены пробелами)
-void first_words(const char *s, size_t n, char *out, size_t cap)
-{
-    size_t words = 0, i = 0;
-    while (s[i] && i + 1 < cap) {
-        if (s[i] == ' ') {
-            if (++words >= n) {
-                break;
-            }
-        }
-        out[i] = s[i];
-        i++;
-    }
-    out[i] = '\0';
-}
-
-// Похоже на речь: слоги, паузы между фразами. Нужно только для демо, пока настоящего голоса нет.
-float demo_voice_level(int64_t now_ms)
-{
-    const float t = static_cast<float>(now_ms) / 1000.0f;
-    const float syllable = fmaxf(0.0f, sinf(6.2831853f * 3.4f * t));
-    const float phrase = 0.55f + 0.45f * sinf(6.2831853f * 0.45f * t + 1.3f);
-    const float pause = sinf(6.2831853f * 0.22f * t) > -0.82f ? 1.0f : 0.0f;
-    const float v = 0.10f + 0.85f * powf(syllable, 0.7f) * phrase * pause;
-    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-}
-
-void demo_reset()
-{
-    g_demo = Demo::Idle;
-    ui::clear_texts();
-}
-
-// Короткое нажатие BOOT: следующее состояние лица
-void demo_advance(int64_t now_ms)
-{
-    const DemoSample &sm = kDemoSamples[g_demo_next % kDemoSampleCount];
-    switch (g_demo) {
-    case Demo::Idle:
-        g_demo = Demo::Listening;
-        g_demo_words = 0;
-        ui::clear_texts();
-        break;
-    case Demo::Listening:
-        g_demo = Demo::Thinking;
-        ui::set_user_text(sm.user);
-        break;
-    case Demo::Thinking:
-        g_demo = Demo::Speaking;
-        ui::set_jarvis_text(sm.answer);
-        break;
-    case Demo::Speaking:
-        g_demo = Demo::Idle;
-        g_demo_next++;
-        ui::clear_texts();
-        break;
-    }
-    g_demo_since_ms = now_ms;
-    ESP_LOGI(TAG, "DEMO: %s (example %d of %d)", demo_name(g_demo), g_demo_next % kDemoSampleCount + 1, kDemoSampleCount);
-}
-
-// Каждый проход главного цикла: слова вопроса появляются по мере «речи», забытое демо возвращается в IDLE
-void demo_tick(int64_t now_ms)
-{
-    if (g_demo == Demo::Idle) {
-        return;
-    }
-    if (now_ms - g_demo_since_ms > kDemoTimeoutMs) {
-        ESP_LOGI(TAG, "DEMO: timeout, back to IDLE");
-        g_demo_next++;
-        demo_reset();
-        return;
-    }
-    if (g_demo == Demo::Listening) {
-        const size_t want = static_cast<size_t>((now_ms - g_demo_since_ms) / 320);
-        if (want > g_demo_words) {
-            g_demo_words = want;
-            char part[160];
-            first_words(kDemoSamples[g_demo_next % kDemoSampleCount].user, g_demo_words, part, sizeof(part));
-            ui::set_user_text(part);
-        }
-    }
-}
-
 // ---------------------------------------------------------------- лицо: что показывать
 
 struct NetCache {
@@ -600,11 +491,24 @@ const char *hardware_problem()
     return nullptr;
 }
 
+// Номера лица те же, что у ui::State: проверяем, чтобы не разошлись при правках
+static_assert(static_cast<int>(face_logic::Face::Idle) == static_cast<int>(ui::State::Idle), "Face/ui::State");
+static_assert(static_cast<int>(face_logic::Face::Listening) == static_cast<int>(ui::State::Listening), "Face/ui::State");
+static_assert(static_cast<int>(face_logic::Face::Thinking) == static_cast<int>(ui::State::Thinking), "Face/ui::State");
+static_assert(static_cast<int>(face_logic::Face::Speaking) == static_cast<int>(ui::State::Speaking), "Face/ui::State");
+static_assert(static_cast<int>(face_logic::Face::NoWifi) == static_cast<int>(ui::State::NoWifi), "Face/ui::State");
+static_assert(static_cast<int>(face_logic::Face::NoServer) == static_cast<int>(ui::State::NoServer), "Face/ui::State");
+static_assert(static_cast<int>(face_logic::Face::Error) == static_cast<int>(ui::State::Error), "Face/ui::State");
+static_assert(static_cast<int>(face_logic::Face::Sleep) == static_cast<int>(ui::State::Sleep), "Face/ui::State");
+
 // Собирает всё, что должно быть на экране, из состояния прошивки и отдаёт в ui::*. Дёшево: можно звать часто.
+// Что именно показывать, решает чистая логика face_logic::decide (проверена тестами), здесь только сбор данных.
 void ui_sync(int64_t now_ms)
 {
     static int64_t last_ms = -1000;
     static int64_t clock_ms = -1000;
+    static link::Status ls;
+    static int64_t link_ms = -1000;
     if (now_ms - last_ms < 40) {
         return;
     }
@@ -618,29 +522,31 @@ void ui_sync(int64_t now_ms)
     hin.uptime_ms = static_cast<uint32_t>(now_ms);
     const bool no_wifi = net_logic::no_wifi_due(hin);
     const bool booted = mode() != Mode::Boot;
-    const char *hw = booted ? hardware_problem() : nullptr;
-
-    // Какое лицо
-    ui::State want = ui::State::Idle;
-    if (mode() == Mode::Rec) {
-        want = ui::State::Listening;
-    } else if (mode() == Mode::Play || g_sound_playing.load()) {
-        want = ui::State::Speaking;
-    } else if (g_demo == Demo::Listening) {
-        want = ui::State::Listening;
-    } else if (g_demo == Demo::Thinking) {
-        want = ui::State::Thinking;
-    } else if (g_demo == Demo::Speaking) {
-        want = ui::State::Speaking;
-    } else if (hw) {
-        want = ui::State::Error;
-    } else if (no_wifi) {
-        want = ui::State::NoWifi;
+    if (g_link_started && now_ms - link_ms >= 200) {
+        ls = link::status();
+        link_ms = now_ms;
     }
+    const session::View sv = session::view();
+
+    face_logic::In fin;
+    fin.booted = booted;
+    fin.hw_problem = booted ? hardware_problem() : nullptr;
+    fin.echo_recording = (mode() == Mode::Rec);
+    fin.echo_playing = (mode() == Mode::Play);
+    fin.chime_playing = g_sound_playing.load();
+    fin.phase = sv.phase;
+    fin.error_msg = sv.error_msg;
+    fin.no_wifi = no_wifi;
+    fin.wifi_hint = no_wifi ? net_logic::hint_text(ns.has_creds, ns.last_fail) : nullptr;
+    // Про сервер говорим, когда Wi-Fi уже есть, а связи с ноутбуком нет (пока связь не стартовала, молчим)
+    fin.server_hint = g_link_started ? link_logic::server_hint(hin.connected, ls.ready, ls.down_ms) : nullptr;
+    const face_logic::Out fo = face_logic::decide(fin);
+
+    const ui::State want = static_cast<ui::State>(fo.face);
     g_ui_state.store(static_cast<int>(want));
     ui::set_state(want);
 
-    // Уровни звука
+    // Уровни звука: микрофон для LISTENING, динамик для SPEAKING
     float mic = 0.0f;
     AudioIn::Block b;
     if (want == ui::State::Listening && g_in.ok() && g_in.latest(&b)) {
@@ -648,25 +554,12 @@ void ui_sync(int64_t now_ms)
     }
     ui::set_mic_level(mic);
     float out = 0.0f;
-    if (mode() == Mode::Play || g_sound_playing.load()) {
+    if (want == ui::State::Speaking) {
         out = ui_logic::level_from_dbfs(g_out.level_dbfs(), ui_logic::kOutFloorDb, ui_logic::kOutCeilDb);
-    } else if (g_demo == Demo::Speaking) {
-        out = demo_voice_level(now_ms);
     }
     ui::set_out_level(out);
 
-    // Подсказка внизу: запись и воспроизведение эха, неисправность, потом Wi-Fi
-    const char *hint = "";
-    if (mode() == Mode::Rec) {
-        hint = "Запись…";
-    } else if (mode() == Mode::Play) {
-        hint = "Повторяю…";
-    } else if (hw) {
-        hint = hw;
-    } else if (no_wifi) {
-        hint = net_logic::hint_text(ns.has_creds, ns.last_fail);
-    }
-    ui::set_hint(hint);
+    ui::set_hint(fo.hint);
 
     // Значок Wi-Fi
     if (ns.state == net::State::Connected) {
@@ -784,21 +677,22 @@ bool run_loopback(const char *tag, const char *what, const int16_t *pcm, size_t 
 
 // ---------------------------------------------------------------- эхо-тест
 
+// Команда echo (серийный порт): 4 с записи с микрофона, потом то же через динамик. Нужна для диагностики звука без сервера.
 void echo_start(int64_t now_ms)
 {
     if (!g_rec_buf || !g_play_buf) {
         ESP_LOGE(TAG, "ECHO: no memory for the recording buffers (PSRAM missing?), echo test unavailable");
         return;
     }
-    if (!g_in.start_recording(g_rec_buf, kRecMaxSamples)) {
+    if (!g_in.start_recording(g_rec_buf, kEchoRecSamples)) {
         ESP_LOGE(TAG, "ECHO: cannot start recording (microphone not initialised)");
         return;
     }
     g_rec_started_ms = now_ms;
-    demo_reset();   // эхо важнее демо: убираем демонстрационные подписи
+    ui::clear_texts();
     set_mode(Mode::Rec);
-    ESP_LOGI(TAG, "ECHO: recording from mic slot %s (up to %u s)... speak now, release BOOT to play back",
-             dsp::mic_slot_name(g_in.slot()), static_cast<unsigned>(kRecMaxSamples / AudioIn::kSampleRate));
+    ESP_LOGI(TAG, "ECHO: recording from mic slot %s for %u s... speak now, then it plays back",
+             dsp::mic_slot_name(g_in.slot()), static_cast<unsigned>(kEchoRecSamples / AudioIn::kSampleRate));
 }
 
 void echo_finish()
@@ -806,7 +700,7 @@ void echo_finish()
     const size_t n = g_in.stop_recording();
     const float secs = static_cast<float>(n) / static_cast<float>(AudioIn::kSampleRate);
     if (n < kRecMinSamples) {
-        ESP_LOGW(TAG, "ECHO: recording too short (%.2f s), hold BOOT longer and speak", static_cast<double>(secs));
+        ESP_LOGW(TAG, "ECHO: recording too short (%.2f s)", static_cast<double>(secs));
         set_mode(Mode::Idle);
         return;
     }
@@ -1099,18 +993,29 @@ void print_status_line()
     } else {
         snprintf(wifi, sizeof(wifi), "no_creds");
     }
-    const bool good = (ns.state == net::State::Connected || !ns.has_creds);
-    char line[700];
+    const link::Status ls = link::status();
+    char srv[200];
+    snprintf(srv, sizeof(srv), "%s url=%s%s connected=%s rtt=%dms reconnects=%u discover=%u/%u", link_logic::phase_name(ls.phase),
+             ls.url[0] ? ls.url : "none", ls.manual ? "(manual)" : "", ls.ready ? "yes" : "NO", ls.rtt_ms,
+             static_cast<unsigned>(ls.reconnects), static_cast<unsigned>(ls.discover_sent),
+             static_cast<unsigned>(ls.discover_replies));
+    const playback::Stats ps = playback::stats();
+    const session::View sv = session::view();
+    const bool good = (ns.state == net::State::Connected || !ns.has_creds) && (ls.ready || ns.state != net::State::Connected);
+    char line[900];
     snprintf(line, sizeof(line),
-             "STATUS: wifi=%s | time=%s tz=%s | state=%s demo=%s | heap=%uKB min=%uKB largest=%uKB psram=%uKB | "
-             "loopback=%s mic=%s mic30s=%.1fdBFS | ui_frames=%u | up=%" PRIu32 "s reset=%s fw=%s",
-             wifi, tm, net::timezone(), ui::state_name(static_cast<ui::State>(g_ui_state.load())), demo_name(g_demo),
-             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             "STATUS: wifi=%s | server=%s | time=%s tz=%s | state=%s dialog=%s | heap=%uKB min=%uKB largest=%uKB psram=%uKB | "
+             "audio: rx=%uKB tx_frames=%u underruns=%u overflow=%u mic_drop=%u | loopback=%s mic=%s mic30s=%.1fdBFS | "
+             "ui_frames=%u | up=%" PRIu32 "s reset=%s fw=%s",
+             wifi, srv, tm, net::timezone(), ui::state_name(static_cast<ui::State>(g_ui_state.load())),
+             dialog::phase_name(sv.phase), static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024),
              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
-             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024), loop_v, mic_v,
-             static_cast<double>(ms.blocks ? ms.rms_dbfs : dsp::kFloorDbfs), static_cast<unsigned>(frames_now - frames_prev),
-             uptime_s(), reset_short_name(esp_reset_reason()), app->version);
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+             static_cast<unsigned>(ls.rx_audio_bytes / 1024), static_cast<unsigned>(ls.tx_audio_frames),
+             static_cast<unsigned>(ps.underruns), static_cast<unsigned>(ps.overflowed), static_cast<unsigned>(ls.mic_dropped),
+             loop_v, mic_v, static_cast<double>(ms.blocks ? ms.rms_dbfs : dsp::kFloorDbfs),
+             static_cast<unsigned>(frames_now - frames_prev), uptime_s(), reset_short_name(esp_reset_reason()), app->version);
     frames_prev = frames_now;
     if (good) {
         ESP_LOGI(TAG, "%s", line);
@@ -1124,20 +1029,35 @@ void build_status_json(char *out, size_t cap)
 {
     const esp_app_desc_t *app = esp_app_get_description();
     const net::Status ns = net::status();
+    const link::Status ls = link::status();
     char tm[24];
     format_time(tm, sizeof(tm));
     char ssid_esc[200];
     text::json_escape(ns.ssid, ssid_esc, sizeof(ssid_esc));
     char tz_esc[140];
     text::json_escape(net::timezone(), tz_esc, sizeof(tz_esc));
+    char url_esc[200];
+    text::json_escape(ls.url, url_esc, sizeof(url_esc));
     snprintf(out, cap,
              "{\"fw\":\"%s\",\"wifi\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"ch\":%d,\"time\":\"%s\","
-             "\"tz\":\"%s\",\"state\":\"%s\",\"heap\":%u,\"heap_min\":%u,\"psram\":%u,\"up\":%" PRIu32 "}",
+             "\"tz\":\"%s\",\"state\":\"%s\",\"server\":\"%s\",\"server_mode\":\"%s\",\"link\":\"%s\","
+             "\"connected\":%s,\"rtt\":%d,\"reconnects\":%u,\"heap\":%u,\"heap_min\":%u,\"psram\":%u,\"up\":%" PRIu32 "}",
              app->version, net::state_name(ns.state), ssid_esc, ns.ip, ns.rssi, ns.channel, tm, tz_esc,
-             ui::state_name(static_cast<ui::State>(g_ui_state.load())),
+             ui::state_name(static_cast<ui::State>(g_ui_state.load())), url_esc, ls.manual ? "manual" : "auto",
+             link_logic::phase_name(ls.phase), ls.ready ? "true" : "false", ls.rtt_ms, static_cast<unsigned>(ls.reconnects),
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
              static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)), uptime_s());
+}
+
+// Команда echo из консоли: просьба главному циклу (он стартует запись, когда разговор молчит)
+bool request_echo()
+{
+    if (mode() != Mode::Idle || !g_in.ok() || !g_out.ok()) {
+        return false;
+    }
+    g_echo_request.store(true);
+    return true;
 }
 
 // Применяет вариант экрана и запоминает его (команда lcd)
@@ -1160,15 +1080,16 @@ bool apply_lcd_cfg(int n)
 void print_greeting()
 {
     ESP_LOGI(TAG, "################################################################");
-    ESP_LOGI(TAG, "# JARVIS v0.2: лицо, Wi-Fi, часы, субтитры");
+    ESP_LOGI(TAG, "# JARVIS v0.3: голос. BOOT зажата = говоришь, отпустил = ответ");
     ESP_LOGI(TAG, "################################################################");
     ESP_LOGI(TAG, "Привет, Давид! Что должно быть:");
-    ESP_LOGI(TAG, "  1. ЭКРАН: чёрный фон, два бирюзовых глаза, они моргают и иногда косятся. Сверху значок Wi-Fi и часы.");
-    ESP_LOGI(TAG, "  2. Wi-Fi: если сети нет, внизу подсказка. Задай сеть: ./tools/flash.sh wifi. Часы появятся после подключения.");
-    ESP_LOGI(TAG, "  3. BOOT коротко: IDLE > LISTENING > THINKING > SPEAKING > IDLE, внизу примеры подписей.");
-    ESP_LOGI(TAG, "  4. BOOT держать дольше 0,8 с: эхо (говори до 5 с, отпусти: плата повторит), глаза реагируют на звук.");
-    ESP_LOGI(TAG, "  5. СВЕТОДИОД: зелёный плавно (ждёт), красный (слушает), фиолетовый (думает), синий (говорит), янтарный (нет Wi-Fi).");
-    ESP_LOGI(TAG, "Пришли мне весь лог и скажи, что видел и слышал. В логе главное: «STATUS:», «HWCHECK RESULT», «WIFI», «TIME synced».");
+    ESP_LOGI(TAG, "  1. ЭКРАН: два бирюзовых глаза. Без Wi-Fi внизу подсказка, с Wi-Fi без ноутбука «Ищу ноутбук…» и «Нет связи…».");
+    ESP_LOGI(TAG, "  2. Wi-Fi: ./tools/flash.sh wifi (один раз). Сервер на ноутбуке плата находит сама, адрес можно задать: server ws://ip:47801/ws.");
+    ESP_LOGI(TAG, "  3. BOOT ЗАЖАТЬ и говорить (лицо слушает), ОТПУСТИТЬ: лицо думает, потом говорит ответ, внизу субтитры.");
+    ESP_LOGI(TAG, "  4. BOOT коротко, пока Jarvis думает или говорит: замолчать. Новая запись во время ответа тоже прерывает его.");
+    ESP_LOGI(TAG, "  5. СВЕТОДИОД: зелёный плавно (ждёт), красный (слушает), янтарный пульс (думает), синий (говорит), янтарный медленно (нет связи).");
+    ESP_LOGI(TAG, "  6. Диагностика звука без сервера: команда echo по серийному порту (запись 4 с и воспроизведение).");
+    ESP_LOGI(TAG, "Пришли мне весь лог и скажи, что видел и слышал. В логе главное: «STATUS:», «HWCHECK RESULT», «WIFI», «link», «session».");
 }
 
 // ---------------------------------------------------------------- основной цикл
@@ -1220,39 +1141,37 @@ void main_loop()
     g_in.take_summary();   // сбрасываем накопитель, чтобы первое окно было «чистым»
 
     bool ignore_press = g_btn.pressed;   // кнопка зажата со старта: ждём отпускания
-    bool long_started = false;
     TickType_t last_wake = xTaskGetTickCount();
 
     for (;;) {
         vTaskDelayUntil(&last_wake, kPollTicks);
         const int64_t now = uptime_ms();
 
+        // Кнопка BOOT это push-to-talk: все решения принимает session/dialog, здесь только события нажатия и отпускания
         const BtnEvent ev = button_poll(now);
         if (ev == BtnEvent::Pressed) {
-            ignore_press = (mode() != Mode::Idle || g_demo != Demo::Idle);
-            long_started = false;
-        }
-
-        // Долгое нажатие: начинаем запись, не дожидаясь отпускания
-        if (mode() == Mode::Idle && g_demo == Demo::Idle && g_btn.pressed && !ignore_press && !long_started &&
-            now - g_btn.pressed_at_ms >= kLongPressMs) {
-            long_started = true;
-            echo_start(now);
-        }
-
-        if (ev == BtnEvent::Released) {
-            if (mode() == Mode::Rec) {
-                echo_finish();
-            } else if (mode() == Mode::Idle && !long_started && g_btn.last_held_ms < kShortPressMaxMs &&
-                       (!ignore_press || g_demo != Demo::Idle)) {
-                demo_advance(now);   // короткое нажатие: следующее состояние лица
+            ignore_press = (mode() != Mode::Idle);   // идёт диагностическое эхо: кнопку не трогаем
+            if (!ignore_press) {
+                session::on_button(true, static_cast<uint32_t>(g_btn.pressed_at_ms));
             }
-            long_started = false;
+        } else if (ev == BtnEvent::Released) {
+            if (!ignore_press) {
+                session::on_button(false, static_cast<uint32_t>(now));
+            }
             ignore_press = false;
         }
+        session::tick(static_cast<uint32_t>(now));
 
-        if (mode() == Mode::Rec && g_in.recorded() >= kRecMaxSamples) {
-            ESP_LOGI(TAG, "ECHO: 5 s limit reached, stopping the recording");
+        // Диагностическое эхо (серийная команда echo): только когда разговор молчит
+        if (mode() == Mode::Idle && g_echo_request.exchange(false)) {
+            const session::View sv = session::view();
+            if (sv.phase == dialog::Phase::Idle && !sv.button_down) {
+                echo_start(now);
+            } else {
+                ESP_LOGW(TAG, "ECHO: the dialog is busy, try again when the face is idle");
+            }
+        }
+        if (mode() == Mode::Rec && g_in.recorded() >= kEchoRecSamples) {
             echo_finish();
         }
         if (mode() == Mode::Play && !g_out.busy()) {
@@ -1267,7 +1186,6 @@ void main_loop()
             format_time(tm, sizeof(tm));
             ESP_LOGI(TAG, "TIME synced: %s (tz %s)", tm, net::timezone());
         }
-        demo_tick(now);
         ui_sync(now);
         led_update(now);
         log_mic_slot_if_changed();
@@ -1330,15 +1248,25 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "MICROPHONE init FAILED (%s): continuing without the microphone", esp_err_to_name(mic_err));
     }
 
-    // Команды по серийному порту и сеть
+    // Разговор: кольцо ответа (3 с) и кольцо голоса (2 с) в PSRAM, блоки микрофона идут в кольцо голоса
+    mic_stream::init(AudioIn::kSampleRate * 2);
+    playback::init(&g_out);
+    g_in.set_sink(&mic_stream::sink, nullptr);
+    session::init();
+
+    // Сеть, и только потом команды по серийному порту. В v0.2.0 было наоборот: wifi_set, пришедшая в первые сотни
+    // миллисекунд после загрузки (родной USB хранит байты, написанные хостом, пока плата загружалась), попадала в
+    // ещё не запущенную сеть и получала «ERR wifi_set save_failed». Теперь так не бывает, а net::set_credentials()
+    // не зависит от запуска сети и в этом случае (см. net_logic::CredsGate).
+    if (net::init() != ESP_OK) {
+        ESP_LOGE(TAG, "Wi-Fi init FAILED: continuing offline");
+    }
     console::Hooks hooks;
     hooks.status_json = &build_status_json;
     hooks.apply_lcd = &apply_lcd_cfg;
+    hooks.start_echo = &request_echo;
     if (console::start(hooks) != ESP_OK) {
         ESP_LOGE(TAG, "serial commands are NOT available");
-    }
-    if (net::init() != ESP_OK) {
-        ESP_LOGE(TAG, "Wi-Fi init FAILED: continuing offline");
     }
 
     ui_sync(uptime_ms());
@@ -1364,5 +1292,13 @@ extern "C" void app_main(void)
     print_result_line();
 
     set_mode(Mode::Idle);
+
+    // Связь с ноутбуком стартует последней: самопроверка звука должна идти без сетевого шума, а динамик быть свободным
+    const esp_err_t link_err = link::start(session::callbacks());
+    if (link_err != ESP_OK) {
+        ESP_LOGE(TAG, "server link did NOT start (%s): the board works as a face with no voice", esp_err_to_name(link_err));
+    } else {
+        g_link_started = true;
+    }
     main_loop();
 }

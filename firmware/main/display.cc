@@ -26,22 +26,16 @@ constexpr int kFillRows = 24;              // строк за одну DMA-пе�
 
 }  // namespace
 
-// Вызывается из прерывания по окончании передачи цвета. Работает только пока идёт начальная заливка:
-// потом LVGL (esp_lvgl_port) ставит своё обратное обращение на то же место.
-bool IRAM_ATTR Display::on_color_done(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t *, void *ctx)
-{
-    Display *self = static_cast<Display *>(ctx);
-    BaseType_t woken = pdFALSE;
-    xSemaphoreGiveFromISR(self->done_sem_, &woken);
-    return woken == pdTRUE;
-}
-
 void Display::set_backlight(bool on)
 {
     const bool high = settings_.bl_active_low ? !on : on;
     gpio_set_level(PIN_LCD_BL, high ? 1 : 0);
 }
 
+// Заливает кадр чёрным. Завершения передачи ждём без своего обратного вызова: каждая команда панели (а draw_bitmap
+// шлёт их перед цветом) в драйвере esp_lcd сначала дожидается всех уже поставленных в очередь цветных передач, и
+// последняя пустая «команда» (-1, без параметров) работает как барьер. Свой on_color_trans_done здесь был бы вторым
+// после того, который ставит esp_lvgl_port, и драйвер ругался бы «Callback on_color_trans_done was already set».
 esp_err_t Display::fill_black()
 {
     const size_t bytes = static_cast<size_t>(kFillRows) * kWidth * sizeof(uint16_t);
@@ -53,9 +47,9 @@ esp_err_t Display::fill_black()
     for (int y = 0; y < kHeight && err == ESP_OK; y += kFillRows) {
         const int rows = (kHeight - y) < kFillRows ? (kHeight - y) : kFillRows;
         err = esp_lcd_panel_draw_bitmap(panel_, 0, y, kWidth, y + rows, buf);
-        if (err == ESP_OK && xSemaphoreTake(done_sem_, pdMS_TO_TICKS(500)) != pdTRUE) {
-            err = ESP_ERR_TIMEOUT;
-        }
+    }
+    if (err == ESP_OK) {
+        err = esp_lcd_panel_io_tx_param(io_, -1, nullptr, 0);   // барьер: все полосы ушли, буфер можно освобождать
     }
     heap_caps_free(buf);
     return err;
@@ -78,10 +72,9 @@ esp_err_t Display::init(const DisplaySettings &s, size_t max_transfer_bytes)
     }
     set_backlight(false);
 
-    done_sem_ = xSemaphoreCreateCounting(4, 0);
     lock_ = xSemaphoreCreateMutex();
-    if (!done_sem_ || !lock_) {
-        ESP_LOGE(TAG, "out of memory: sem=%p lock=%p", static_cast<void *>(done_sem_), static_cast<void *>(lock_));
+    if (!lock_) {
+        ESP_LOGE(TAG, "out of memory: lock=%p", static_cast<void *>(lock_));
         init_err_ = ESP_ERR_NO_MEM;
         return init_err_;
     }
@@ -106,8 +99,6 @@ esp_err_t Display::init(const DisplaySettings &s, size_t max_transfer_bytes)
     io_cfg.spi_mode = 0;
     io_cfg.pclk_hz = kSpiHz;
     io_cfg.trans_queue_depth = 10;
-    io_cfg.on_color_trans_done = &Display::on_color_done;
-    io_cfg.user_ctx = this;
     io_cfg.lcd_cmd_bits = 8;
     io_cfg.lcd_param_bits = 8;
     err = esp_lcd_new_panel_io_spi(static_cast<esp_lcd_spi_bus_handle_t>(kSpiHost), &io_cfg, &io_);

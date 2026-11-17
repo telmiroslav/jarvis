@@ -13,7 +13,9 @@
 #include "sdkconfig.h"
 
 #include "cmd_parse.h"
+#include "link.h"
 #include "net.h"
+#include "net_logic.h"
 
 namespace jarvis {
 namespace console {
@@ -24,7 +26,7 @@ const char *TAG = "console";
 
 constexpr uart_port_t kUart = static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM);
 constexpr int kTaskPrio = 3;
-constexpr int kTaskStack = 6144;
+constexpr int kTaskStack = 7168;
 constexpr size_t kReadChunk = 64;
 
 Hooks g_hooks;
@@ -42,7 +44,7 @@ void reply(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 void reply(const char *fmt, ...)
 {
-    char line[600];
+    char line[900];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(line, sizeof(line), fmt, ap);
@@ -51,20 +53,49 @@ void reply(const char *fmt, ...)
     fflush(stdout);
 }
 
+const char *kind_name(cmd::Kind k)
+{
+    switch (k) {
+    case cmd::Kind::WifiSet:   return "wifi_set";
+    case cmd::Kind::WifiClear: return "wifi_clear";
+    case cmd::Kind::Tz:        return "tz";
+    case cmd::Kind::Lcd:       return "lcd";
+    case cmd::Kind::Server:    return "server";
+    case cmd::Kind::Echo:      return "echo";
+    case cmd::Kind::Status:    return "status";
+    case cmd::Kind::Reboot:    return "reboot";
+    case cmd::Kind::Help:      return "help";
+    default:                   return "?";
+    }
+}
+
+// Каждая принятая строка оставляет след в логе: имя команды и длина. Аргументы не печатаются никогда (в них пароль),
+// у неизвестной команды не печатается даже имя. Так по логу видно, дошла ли команда до платы и как её поняли.
+void log_rx(const cmd::Command &c, size_t len)
+{
+    if (c.kind == cmd::Kind::Error) {
+        ESP_LOGW(TAG, "cmd rx: rejected (%s: %s), %u bytes", c.err_cmd, c.err_reason, static_cast<unsigned>(len));
+    } else if (c.kind != cmd::Kind::Empty) {
+        ESP_LOGI(TAG, "cmd rx: %s, %u bytes", kind_name(c.kind), static_cast<unsigned>(len));
+    }
+}
+
 void run_command(const cmd::Command &c)
 {
     switch (c.kind) {
     case cmd::Kind::Empty:
         break;
-    case cmd::Kind::WifiSet:
-        // В лог идёт только имя сети. Пароль не печатается нигде.
-        ESP_LOGI(TAG, "wifi_set: ssid='%s'", c.ssid);
-        if (net::set_credentials(c.ssid, c.pass)) {
-            reply("WIFI_SET OK");
-        } else {
-            reply("ERR wifi_set save_failed");
-        }
+    case cmd::Kind::WifiSet: {
+        // В лог идёт имя сети и длина пароля, сам пароль не печатается нигде. Длина нужна, чтобы увидеть обрезанный
+        // или лишний символ в пароле.
+        ESP_LOGI(TAG, "wifi_set: ssid='%s' (%s)", c.ssid, c.pass[0] ? "with password" : "open network");
+        const net::SetResult r = net::set_credentials(c.ssid, c.pass);
+        char line[160];
+        net_logic::format_wifi_set_reply(r.outcome, r.stage, r.err == ESP_OK ? "" : esp_err_to_name(r.err), line,
+                                         sizeof(line));
+        reply("%s", line);
         break;
+    }
     case cmd::Kind::WifiClear:
         if (net::clear_credentials()) {
             reply("WIFI_CLEAR OK");
@@ -86,8 +117,32 @@ void run_command(const cmd::Command &c)
             reply("ERR lcd display_not_ready");
         }
         break;
+    case cmd::Kind::Server: {
+        if (c.server_auto) {
+            link::set_server_auto();
+            reply("SERVER OK auto");
+        } else if (c.url[0]) {
+            if (link::set_server(c.url)) {
+                reply("SERVER OK %s", c.url);
+            } else {
+                reply("ERR server bad_url");
+            }
+        } else {
+            const link::Status ls = link::status();
+            reply("SERVER %s mode=%s link=%s connected=%s rtt=%dms", ls.url[0] ? ls.url : "none", ls.manual ? "manual" : "auto",
+                  link_logic::phase_name(ls.phase), ls.ready ? "yes" : "no", ls.rtt_ms);
+        }
+        break;
+    }
+    case cmd::Kind::Echo:
+        if (g_hooks.start_echo && g_hooks.start_echo()) {
+            reply("ECHO OK recording 4 s, then playing back");
+        } else {
+            reply("ERR echo busy_or_no_audio");
+        }
+        break;
     case cmd::Kind::Status: {
-        char json[480] = "{}";
+        char json[800] = "{}";
         if (g_hooks.status_json) {
             g_hooks.status_json(json, sizeof(json));
         }
@@ -100,7 +155,7 @@ void run_command(const cmd::Command &c)
         esp_restart();
         break;
     case cmd::Kind::Help:
-        reply("HELP wifi_set <ssid><TAB><password> | wifi_clear | tz <POSIX TZ> | lcd <1-6> | status | reboot");
+        reply("HELP wifi_set <ssid><TAB><password> | wifi_clear | tz <POSIX TZ> | lcd <1-6> | server [ws://ip:port/ws|auto] | echo | status | reboot");
         break;
     case cmd::Kind::Error:
         reply("ERR %s %s", c.err_cmd, c.err_reason);
@@ -117,7 +172,9 @@ void feed(LineBuf &lb, const uint8_t *data, int len)
                 reply("ERR cmd line_too_long");
             } else if (lb.n > 0) {
                 lb.buf[lb.n] = '\0';
-                run_command(cmd::parse_command(lb.buf));
+                const cmd::Command c = cmd::parse_command(lb.buf);
+                log_rx(c, lb.n);
+                run_command(c);
             }
             // чувствительное убираем из памяти сразу
             memset(lb.buf, 0, sizeof(lb.buf));

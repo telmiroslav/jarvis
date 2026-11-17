@@ -20,6 +20,8 @@ const char *kKeySsid = "wifi_ssid";
 const char *kKeyPass = "wifi_pass";
 const char *kKeyTz = "tz";
 const char *kKeyLcd = "lcd_cfg";
+const char *kKeySrvUrl = "srv_url";
+const char *kKeySrvManual = "srv_manual";
 
 bool g_ready = false;
 
@@ -88,17 +90,45 @@ bool get_wifi(char *ssid, size_t ssid_cap, char *pass, size_t pass_cap)
     return ok;
 }
 
-bool set_wifi(const char *ssid, const char *pass)
+SaveResult set_wifi(const char *ssid, const char *pass)
 {
+    SaveResult r;
+    if (!g_ready) {
+        r.err = ESP_ERR_INVALID_STATE;
+        r.stage = "not_init";
+        ESP_LOGE(TAG, "set_wifi: NVS is not initialised (settings::init failed at boot)");
+        return r;
+    }
     nvs_handle_t h;
-    if (!open_rw(&h)) {
-        return false;
+    esp_err_t err = nvs_open(kNs, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        r.err = err;
+        r.stage = "open";
+        ESP_LOGE(TAG, "set_wifi: nvs_open failed: %s", esp_err_to_name(err));
+        return r;
     }
-    esp_err_t err = nvs_set_str(h, kKeySsid, ssid);
-    if (err == ESP_OK) {
+    err = nvs_set_str(h, kKeySsid, ssid);
+    if (err != ESP_OK) {
+        r.err = err;
+        r.stage = "set_ssid";
+    } else {
         err = nvs_set_str(h, kKeyPass, pass);
+        if (err != ESP_OK) {
+            r.err = err;
+            r.stage = "set_pass";
+        } else {
+            err = nvs_commit(h);
+            if (err != ESP_OK) {
+                r.err = err;
+                r.stage = "commit";
+            }
+        }
     }
-    return commit_close(h, err);
+    nvs_close(h);
+    if (r.err != ESP_OK) {
+        ESP_LOGE(TAG, "set_wifi: %s failed: %s", r.stage, esp_err_to_name(r.err));
+    }
+    return r;
 }
 
 bool clear_wifi()
@@ -146,6 +176,55 @@ bool set_tz(const char *tz)
         return false;
     }
     return commit_close(h, nvs_set_str(h, kKeyTz, tz));
+}
+
+bool get_server(char *url, size_t cap, bool *manual)
+{
+    if (!g_ready || cap == 0) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (nvs_open(kNs, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    size_t n = cap;
+    bool ok = nvs_get_str(h, kKeySrvUrl, url, &n) == ESP_OK && url[0] != '\0';
+    if (ok && manual) {
+        uint8_t m = 0;
+        *manual = (nvs_get_u8(h, kKeySrvManual, &m) == ESP_OK && m != 0);
+    }
+    nvs_close(h);
+    return ok;
+}
+
+bool set_server(const char *url, bool manual)
+{
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    esp_err_t err = nvs_set_str(h, kKeySrvUrl, url);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, kKeySrvManual, manual ? 1 : 0);
+    }
+    return commit_close(h, err);
+}
+
+bool clear_server()
+{
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    esp_err_t e1 = nvs_erase_key(h, kKeySrvUrl);
+    esp_err_t e2 = nvs_erase_key(h, kKeySrvManual);
+    if (e1 == ESP_ERR_NVS_NOT_FOUND) {
+        e1 = ESP_OK;
+    }
+    if (e2 == ESP_ERR_NVS_NOT_FOUND) {
+        e2 = ESP_OK;
+    }
+    return commit_close(h, e1 != ESP_OK ? e1 : e2);
 }
 
 int get_lcd()

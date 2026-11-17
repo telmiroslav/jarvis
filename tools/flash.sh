@@ -6,7 +6,10 @@
 #   ./tools/flash.sh --erase        сначала стереть всю память платы (для самой первой прошивки)
 #   ./tools/flash.sh file x.bin     прошить локальный файл
 #   ./tools/flash.sh monitor        только смотреть лог (плата перезагрузится)
-#   ./tools/flash.sh wifi           передать плате имя Wi-Fi и пароль (спросит их сам; пароль не показывается и нигде не сохраняется)
+#   ./tools/flash.sh wifi           передать плате имя Wi-Fi и пароль (спросит их сам; пароль не показывается и нигде не сохраняется).
+#                                   Сначала по серийному порту, если не вышло, сам запишет сеть прямо в память платы (esptool)
+#   ./tools/flash.sh wifi-nvs       то же, но сразу запасным путём (запись в память платы через esptool)
+#   ./tools/flash.sh cmd status     отправить плате серийную команду (status, server auto, server ws://ip:47801/ws, echo, help)
 #
 # Переменные: PORT=/dev/ttyACM0 (порт руками), BAUD=460800 (скорость прошивки).
 # Нужны: curl (или wget), esptool, python3 + pyserial (скрипт сам скажет, чего не хватает).
@@ -35,20 +38,29 @@ warn() { printf '%s !!%s %s\n' "$C_WARN" "$C_OFF" "$*" >&2; }
 die()  { printf '%sОшибка:%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2; exit 1; }
 
 tmp=""
-cleanup() { if [[ -n "$tmp" && -d "$tmp" ]]; then rm -rf "$tmp"; fi; }
+NVS_TMP=""   # здесь на время запасного пути лежит образ NVS с паролем (каталог 0700), удаляется при любом выходе
+cleanup() {
+  if [[ -n "$NVS_TMP" && -d "$NVS_TMP" ]]; then
+    # образ с паролем сначала затираем нулями, потом удаляем
+    find "$NVS_TMP" -type f -exec sh -c 'for f; do : > "$f"; done' sh {} + 2>/dev/null || true
+    rm -rf "$NVS_TMP"
+  fi
+  if [[ -n "$tmp" && -d "$tmp" ]]; then rm -rf "$tmp"; fi
+}
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 usage() {
-  sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # --- разбор аргументов --------------------------------------------------------
 
-MODE="release"   # release | file | monitor | wifi
+MODE="release"   # release | file | monitor | wifi | wifi-nvs | cmd
 TAG=""
 FILE=""
 ERASE=0
+CMDLINE=""
 
 while (( $# )); do
   case "$1" in
@@ -56,6 +68,14 @@ while (( $# )); do
     --erase)        ERASE=1 ;;
     monitor)        MODE="monitor" ;;
     wifi)           MODE="wifi" ;;
+    wifi-nvs)       MODE="wifi-nvs" ;;
+    cmd)
+      MODE="cmd"
+      shift
+      [[ $# -gt 0 ]] || die "После cmd нужна команда: ./tools/flash.sh cmd status"
+      CMDLINE="$*"
+      break
+      ;;
     file)
       MODE="file"
       shift
@@ -87,6 +107,7 @@ check_downloader() {
 
 ESPTOOL=""
 WRITE_FLASH=""
+READ_FLASH=""
 check_esptool() {
   if command -v esptool >/dev/null 2>&1; then
     ESPTOOL="esptool"
@@ -98,8 +119,10 @@ check_esptool() {
   # esptool 5 пишет команды через дефис (write-flash), esptool 4 через подчёркивание (write_flash)
   if "$ESPTOOL" write-flash --help >/dev/null 2>&1; then
     WRITE_FLASH="write-flash"
+    READ_FLASH="read-flash"
   else
     WRITE_FLASH="write_flash"
+    READ_FLASH="read_flash"
   fi
 }
 
@@ -257,8 +280,33 @@ check_bin() {
 
 # --- прошивка -------------------------------------------------------------------------
 
+# Образ прошивки (merged) покрывает и раздел nvs: на его месте лежат байты 0xFF, и esptool стирает этот раздел.
+# Раньше из-за этого каждая прошивка забывала Wi-Fi. Поэтому образ режется по таблице разделов, которая лежит
+# внутри него самого: пишем всё до nvs и всё после, а сам nvs не трогаем. С --erase стирается всё, как и раньше.
+FLASH_FILES=()
+NVS_KEPT=0
+prepare_flash_files() {
+  FLASH_FILES=(0x0 "$BIN")
+  NVS_KEPT=0
+  (( ERASE )) && return 0
+  [[ -n "$tmp" && -d "$tmp" ]] || tmp="$(mktemp -d "${TMPDIR:-/tmp}/jarvis-flash.XXXXXX")"
+  local out lines=() a1 f1 a2 f2
+  out="$(python3 "$DIR/nvs_wifi.py" split "$BIN" "$tmp/split" 2>/dev/null)" || return 0
+  mapfile -t lines <<< "$out"
+  (( ${#lines[@]} == 2 )) || return 0
+  read -r a1 f1 <<< "${lines[0]}"
+  read -r a2 f2 <<< "${lines[1]}"
+  [[ -s "$f1" && -s "$f2" ]] || return 0
+  FLASH_FILES=("$a1" "$f1" "$a2" "$f2")
+  NVS_KEPT=1
+}
+
 flash_bin() {
   local baud first="${BAUD:-921600}" tries=() erase_args=()
+  prepare_flash_files
+  if (( NVS_KEPT )); then
+    step "Сохранённые настройки платы (Wi-Fi) не трогаю: раздел nvs пропускаю при прошивке."
+  fi
   tries=("$first")
   if [[ "$first" != "460800" ]]; then tries+=(460800); fi
   tries+=(115200)
@@ -276,7 +324,7 @@ flash_bin() {
       check_access "$PORT"
     fi
     step "Прошиваю на $baud бод. Ничего не нажимай и не отключай."
-    if "$ESPTOOL" --chip "$CHIP" -p "$PORT" -b "$baud" "$WRITE_FLASH" "${erase_args[@]}" 0x0 "$BIN"; then
+    if "$ESPTOOL" --chip "$CHIP" -p "$PORT" -b "$baud" "$WRITE_FLASH" "${erase_args[@]}" "${FLASH_FILES[@]}"; then
       return 0
     fi
   done
@@ -335,13 +383,16 @@ final_hint() {
 
 # --- Wi-Fi: передать плате сеть и пароль -----------------------------------------------------
 
-# Спрашивает имя сети и пароль (пароль не показывается), отдаёт их плате через tools/wifi_set.py и печатает результат.
-# Пароль живёт только в переменной этого процесса: не в аргументах команд (их видно в ps), не в файлах, не в ~/jarvis-logs.
-wifi_setup() {
+# Спрашивает имя сети и пароль (пароль не показывается). Результат в переменных WIFI_SSID и WIFI_PASS.
+# Пароль живёт только в переменных этого процесса: не в аргументах команд (их видно в ps), не в ~/jarvis-logs.
+# Единственный файл, куда он попадает, это образ NVS запасного пути (каталог 0700, затирается и удаляется при выходе).
+WIFI_SSID=""
+WIFI_PASS=""
+ask_wifi() {
   [[ -t 0 ]] || die "Для настройки Wi-Fi нужен обычный терминал (имя и пароль вводятся с клавиатуры)."
   echo
   echo "Плата подключается только к Wi-Fi на 2,4 ГГц (на 5 ГГц она не работает). Имя сети и пароль вводи точно, регистр букв важен."
-  local ssid="" pass="" answer="" rc=0
+  local ssid="" pass="" answer=""
   while [[ -z "$ssid" ]]; do
     read -r -p "Имя Wi-Fi (SSID): " ssid || die "Ввод прерван."
   done
@@ -356,20 +407,101 @@ wifi_setup() {
     die "Пароль Wi-Fi короче 8 символов. Запусти ещё раз и проверь пароль."
   fi
   [[ "$pass" != *$'\t'* ]] || die "В пароле не должно быть табуляции."
+  WIFI_SSID="$ssid"
+  WIFI_PASS="$pass"
+}
 
-  local pargs=(--timeout 20 --port "$PORT")
-  step "Передаю сеть плате (порт $PORT)"
+# Основной путь: команда wifi_set по серийному порту (tools/wifi_set.py). Коды: 0 подключилась, 1 сохранила, но не
+# подключилась, 2 плата не ответила, 3 проблема с портом, 4 плата отказалась сохранить, 5 неверные данные.
+wifi_via_serial() {
+  local pargs=(--timeout 20 --port "$PORT") rc=0
+  step "Передаю сеть плате по серийному порту (порт $PORT)"
   # printf встроенная команда shell: пароль не попадает в список процессов
-  printf '%s\t%s\n' "$ssid" "$pass" | python3 "$DIR/wifi_set.py" "${pargs[@]}" || rc=$?
-  unset pass
+  printf '%s\t%s\n' "$WIFI_SSID" "$WIFI_PASS" | python3 "$DIR/wifi_set.py" "${pargs[@]}" || rc=$?
+  return "$rc"
+}
+
+# Запасной путь: образ раздела NVS с этой сетью собирается здесь (tools/nvs_wifi.py), пишется в плату тем же esptool,
+# которым прошивается плата, и плата перезагружается. Сохраняются ровно те ключи, которые читает прошивка.
+# Коды: 0 подключилась, 1 записано, но не подключилась, 2 записать не получилось, 3 записано, но результата не видно.
+wifi_via_nvs() {
+  check_esptool
+  NVS_TMP="$(mktemp -d "${TMPDIR:-/tmp}/jarvis-nvs.XXXXXX")"   # права 0700 даёт сам mktemp
+  chmod 700 "$NVS_TMP"
+  local baud first="${BAUD:-460800}" tries=() ok_read=0 off="" size="" line rc=0
+
+  step "Запасной путь: пишу сеть прямо в память платы (порт $PORT)."
+  echo "   Пароль нигде не печатается; временный файл лежит в $NVS_TMP и будет затёрт и удалён."
+  tries=("$first")
+  if [[ "$first" != "115200" ]]; then tries+=(115200); fi
+
+  # 1. Где у этой платы раздел nvs: читаем таблицу разделов с неё самой
+  for baud in "${tries[@]}"; do
+    if "$ESPTOOL" --chip "$CHIP" -p "$PORT" -b "$baud" "$READ_FLASH" 0x8000 0x1000 "$NVS_TMP/ptable.bin" >"$NVS_TMP/esptool.log" 2>&1; then
+      ok_read=1
+      break
+    fi
+    warn "Не вышло прочитать таблицу разделов на $baud бод."
+    wait_port_back || true
+    check_access "$PORT"
+  done
+  if (( ! ok_read )); then
+    tail -n 5 "$NVS_TMP/esptool.log" >&2 || true
+    flash_failed_help
+    return 2
+  fi
+  line="$(python3 "$DIR/nvs_wifi.py" find-nvs "$NVS_TMP/ptable.bin" 2>/dev/null)" || {
+    warn "В таблице разделов платы нет раздела nvs (на плате чужая прошивка?). Прошей плату: ./tools/flash.sh"
+    return 2
+  }
+  read -r off size <<< "$line"
+  echo "   Раздел nvs на плате: адрес $off, размер $size."
+
+  # 2. Образ с сетью (проверяется чтением обратно)
+  if ! printf '%s\t%s\n' "$WIFI_SSID" "$WIFI_PASS" | python3 "$DIR/nvs_wifi.py" image --out "$NVS_TMP/nvs.bin" --size "$size"; then
+    warn "Образ с сетью не собрался (причина выше)."
+    return 2
+  fi
+
+  # 3. Запись и перезагрузка (esptool сам перезагружает плату после записи)
+  ok_read=0
+  for baud in "${tries[@]}"; do
+    if "$ESPTOOL" --chip "$CHIP" -p "$PORT" -b "$baud" "$WRITE_FLASH" "$off" "$NVS_TMP/nvs.bin" >"$NVS_TMP/esptool.log" 2>&1; then
+      ok_read=1
+      break
+    fi
+    warn "Не вышло записать на $baud бод."
+    wait_port_back || true
+    check_access "$PORT"
+  done
+  # Образ с паролем больше не нужен
+  : > "$NVS_TMP/nvs.bin"
+  rm -rf "$NVS_TMP"
+  NVS_TMP=""
+  if (( ! ok_read )); then
+    flash_failed_help
+    return 2
+  fi
+  ok "Сеть записана в память платы, плата перезагружается."
+
+  # 4. Ждём результата: прошивка при старте с сохранённой сетью сама печатает WIFI CONNECTED или WIFI FAIL
+  wait_port_back || true
+  python3 "$DIR/wifi_set.py" --watch --timeout 40 --port "$PORT" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 3 ;;
+  esac
+}
+
+wifi_finish() {   # wifi_finish КОД: итог и предложение показать лог
+  local rc="$1" answer=""
   echo
   case "$rc" in
     0) ok "Wi-Fi настроен. Плата запомнила сеть и подключится к ней сама после любой перезагрузки." ;;
-    2) warn "Плата не ответила." ;;
-    3) warn "С портом проблема (подробности выше)." ;;
-    *) warn "Wi-Fi не заработал (подробности выше)." ;;
+    1) warn "Сеть у платы сохранена, но подключиться не вышло (причина выше). Плата продолжает пробовать сама." ;;
+    *) warn "Wi-Fi не заработал (подробности выше). Пришли Мирославу весь вывод этого скрипта." ;;
   esac
-
   if (( rc == 0 )); then
     echo "На экране справа вверху через пару секунд появятся часы (время берётся из интернета)."
   fi
@@ -381,6 +513,28 @@ wifi_setup() {
     final_hint
   fi
   return "$rc"
+}
+
+wifi_setup() {
+  local rc=0
+  ask_wifi
+  if [[ "$MODE" == "wifi-nvs" ]]; then
+    wifi_via_nvs || rc=$?
+  else
+    wifi_via_serial || rc=$?
+    case "$rc" in
+      2|3|4)
+        echo
+        warn "По серийному порту сеть передать не вышло (код $rc). Не страшно: сейчас запишу её прямо в память платы."
+        wait_port_back || true
+        rc=0
+        wifi_via_nvs || rc=$?
+        ;;
+    esac
+  fi
+  WIFI_PASS=""
+  WIFI_SSID=""
+  wifi_finish "$rc"
 }
 
 # --- главное ----------------------------------------------------------------------------
@@ -416,7 +570,14 @@ case "$MODE" in
     pick_port
     step "Показываю лог, плата перезагрузится (Ctrl+C: выход)"
     ;;
-  wifi)
+  cmd)
+    step "Ищу плату"
+    pick_port
+    [[ "$CMDLINE" != wifi_set* ]] || die "Сеть и пароль передаются командой ./tools/flash.sh wifi."
+    python3 "$DIR/wifi_set.py" --port "$PORT" --cmd "$CMDLINE"
+    exit $?
+    ;;
+  wifi|wifi-nvs)
     step "Ищу плату"
     pick_port
     wifi_setup

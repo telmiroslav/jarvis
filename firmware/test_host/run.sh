@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Сборка и запуск тестов на обычном компьютере (нужны g++, gcc, make; для картинок ещё zlib-dev желательно, но не обязательно).
-#   ./run.sh               тесты чистой логики + картинки интерфейса в renders/
+#   ./run.sh               тесты чистой логики + проверки tools/ (Python) + картинки интерфейса в renders/
 #   ./run.sh --logic       только тесты чистой логики (секунды, LVGL не нужен)
 #   ./run.sh /путь/к/папке картинки интерфейса положить в эту папку (по умолчанию renders/ рядом)
 #
@@ -21,9 +21,24 @@ for a in "$@"; do
   esac
 done
 
+# Проверки инструментов (Python): запасной путь Wi-Fi через образ NVS и tools/wifi_set.py на «поддельной плате».
+# Без pyserial вторая проверка сама себя пропускает; самопроверка fake_server.py нужна пакету websockets.
+python_tests() {
+  command -v python3 >/dev/null 2>&1 || { echo "python3 не найден, проверки tools/ пропускаю"; return 0; }
+  python3 -I ./test_nvs_image.py
+  python3 ./test_wifi_set.py
+  # поддельный сервер: самопроверка по протоколу (нужен пакет websockets, без него пропускается)
+  if python3 -c 'import websockets' >/dev/null 2>&1; then
+    python3 ./fake_server.py --selftest | tail -n 1
+  else
+    echo "fake_server.py --selftest: нет пакета websockets, пропускаю (pip install websockets)"
+  fi
+}
+
 if (( LOGIC_ONLY )); then
   make -s OUT="$OUT" "$OUT/test_main"
   "$OUT/test_main"
+  python_tests
   exit 0
 fi
 
@@ -38,4 +53,5 @@ fi
 
 make -s -j"$(nproc)" OUT="$OUT" LVGL="$LVGL" all
 "$OUT/test_main"
+python_tests
 "$OUT/render" "$RENDERS"

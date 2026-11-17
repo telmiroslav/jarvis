@@ -11,7 +11,8 @@ LVGL_OBJS := $(patsubst $(LVGL)/%.c,$(OUT)/lvgl/%.o,$(LVGL_SRCS))
 LVGL_CFLAGS := -O2 -std=gnu11 -DLV_CONF_INCLUDE_SIMPLE -DLV_LVGL_H_INCLUDE_SIMPLE -I$(HERE) -I$(LVGL) -w
 
 WARN := -Wall -Wextra -Wpedantic
-LOGIC_SRCS := test_main.cc $(MAIN)/dsp.cc $(MAIN)/text_util.cc $(MAIN)/ui_logic.cc $(MAIN)/cmd_parse.cc $(MAIN)/net_logic.cc
+LOGIC_SRCS := test_main.cc $(MAIN)/dsp.cc $(MAIN)/text_util.cc $(MAIN)/ui_logic.cc $(MAIN)/cmd_parse.cc $(MAIN)/net_logic.cc \
+              $(MAIN)/proto.cc $(MAIN)/link_logic.cc $(MAIN)/pcm_queue.cc $(MAIN)/subtitle.cc $(MAIN)/dialog.cc $(MAIN)/face_logic.cc
 
 all: $(OUT)/test_main $(OUT)/render
 
@@ -32,7 +33,7 @@ $(OUT)/font_%.o: $(MAIN)/fonts/%.c
 	@mkdir -p $(OUT)
 	gcc -O2 -std=gnu11 -DLV_CONF_INCLUDE_SIMPLE -DLV_LVGL_H_INCLUDE_SIMPLE -I$(HERE) -I$(LVGL) -Wall -Wextra -c $< -o $@
 
-UI_CXX := ui.cc text_util.cc ui_logic.cc net_logic.cc
+UI_CXX := ui.cc text_util.cc ui_logic.cc net_logic.cc link_logic.cc subtitle.cc
 $(OUT)/render: render_main.cc $(addprefix $(MAIN)/,$(UI_CXX)) $(wildcard $(MAIN)/*.h) $(OUT)/liblvgl.a \
                $(OUT)/font_jv_font_text_18.o $(OUT)/font_jv_font_ui_14.o $(HERE)/lv_conf.h
 	@mkdir -p $(OUT)

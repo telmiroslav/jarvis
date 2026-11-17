@@ -46,9 +46,19 @@ esp_err_t init();
 
 Status status();
 
-// Сохраняет сеть (пароль пустой = открытая сеть) и начинает подключаться заново. После этого, один раз, печатает
-// строку «WIFI CONNECTED ip=... rssi=...» или «WIFI FAIL reason=...» (её ждёт tools/flash.sh wifi).
-bool set_credentials(const char *ssid, const char *pass);
+// Итог set_credentials: что сказать в ответ на wifi_set (см. net_logic::format_wifi_set_reply)
+struct SetResult {
+    net_logic::SetOutcome outcome = net_logic::SetOutcome::Ok;
+    const char *stage = "";     // для SaveFailed: на каком шаге записи в NVS случилась ошибка
+    esp_err_t err = ESP_OK;     // и какая
+};
+
+// Сохраняет сеть в NVS (пароль пустой = открытая сеть) и начинает подключаться заново. Сохранение от запуска сети
+// не зависит: если сеть ещё запускается, данные применятся, как только она запустится (так было нельзя в v0.2.0:
+// wifi_set в первые мгновения после загрузки получал «save_failed»). После этого, один раз, печатается строка
+// «WIFI CONNECTED ip=... rssi=...» или «WIFI FAIL reason=...» (её ждёт tools/flash.sh wifi).
+// Эта же пара строк печатается один раз и после загрузки платы с уже сохранённой сетью.
+SetResult set_credentials(const char *ssid, const char *pass);
 bool clear_credentials();
 
 // Часовой пояс POSIX; проверка строки на вызывающем (cmd::is_valid_posix_tz)

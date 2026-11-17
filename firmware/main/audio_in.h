@@ -75,6 +75,11 @@ public:
     bool recording() const { return rec_active_.load(); }
     size_t stop_recording();
 
+    // Получатель блоков: после каждого блока (100 мс) зовётся из задачи audio_in с отсчётами выбранного слота
+    // (int16, kSampleRate, с усилением kPcmGain). Должен быть быстрым и не ждать сеть.
+    using SinkFn = void (*)(void *ctx, const int16_t *pcm, size_t n);
+    void set_sink(SinkFn fn, void *ctx);
+
     uint32_t read_errors() const { return read_errors_.load(); }
     uint32_t blocks() const { return seq_.load(); }
 
@@ -111,6 +116,9 @@ private:
     size_t rec_cap_ = 0;
     std::atomic<size_t> rec_count_{0};
     std::atomic<bool> rec_active_{false};
+
+    std::atomic<SinkFn> sink_{nullptr};
+    std::atomic<void *> sink_ctx_{nullptr};
 
     std::atomic<uint32_t> seq_{0};
     std::atomic<uint32_t> read_errors_{0};

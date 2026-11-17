@@ -61,6 +61,7 @@ struct Ctx {
     esp_timer_handle_t retry_timer = nullptr;
     esp_netif_t *netif = nullptr;
     bool inited = false;
+    net_logic::CredsGate gate;   // порядок «wifi_set пришла» и «сеть запущена», под mu
     std::atomic<bool> time_synced{false};
     std::atomic<bool> sync_event{false};
 };
@@ -289,7 +290,9 @@ const char *state_name(State s)
     return "?";
 }
 
-esp_err_t init()
+namespace {
+
+esp_err_t init_impl()
 {
     esp_err_t err = esp_netif_init();
     if (err != ESP_OK) {
@@ -351,6 +354,12 @@ esp_err_t init()
     if (C.has_creds) {
         ESP_LOGI(TAG, "saved Wi-Fi: ssid='%s' (%s)", C.ssid, C.pass[0] ? "with password" : "open network");
         apply_wifi_config();
+        // Итог первого подключения после загрузки тоже печатаем строкой «WIFI CONNECTED» или «WIFI FAIL»: так
+        // flash.sh после записи сети прямо в память платы видит, что вышло
+        std::lock_guard<std::mutex> lock(C.mu);
+        C.provision_pending = true;
+        C.provision_deadline_ms = uptime_ms() + net_logic::kProvisionTimeoutMs;
+        C.provision_fails = 0;
     } else {
         ESP_LOGW(TAG, "no Wi-Fi saved: run ./tools/flash.sh wifi");
     }
@@ -359,9 +368,32 @@ esp_err_t init()
         ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
         return err;
     }
-    C.inited = true;
     ESP_LOGI(TAG, "Wi-Fi started (STA, country CN, hostname jarvis), time zone %s", C.tz);
     return ESP_OK;
+}
+
+}  // namespace
+
+esp_err_t init()
+{
+    const esp_err_t err = init_impl();
+    bool apply_pending = false;
+    {
+        std::lock_guard<std::mutex> lock(C.mu);
+        apply_pending = C.gate.on_init_done(err == ESP_OK);
+        C.inited = (err == ESP_OK);
+    }
+    if (apply_pending) {
+        // wifi_set успела прийти, пока сеть запускалась: данные уже в NVS и в C.ssid/C.pass, подключаемся с ними
+        ESP_LOGI(TAG, "applying Wi-Fi that arrived while the network was starting");
+        const esp_err_t e = apply_wifi_config();
+        if (e != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(e));
+        }
+        esp_wifi_disconnect();
+        schedule_retry(kRetryAfterLeaveMs);
+    }
+    return err;
 }
 
 Status status()
@@ -395,46 +427,68 @@ Status status()
     return s;
 }
 
-bool set_credentials(const char *ssid, const char *pass)
+SetResult set_credentials(const char *ssid, const char *pass)
 {
-    if (!C.inited || !ssid || !pass) {
-        return false;
+    SetResult res;
+    if (!ssid || !pass) {
+        res.outcome = net_logic::SetOutcome::SaveFailed;
+        res.stage = "args";
+        res.err = ESP_ERR_INVALID_ARG;
+        return res;
     }
-    if (!settings::set_wifi(ssid, pass)) {
-        return false;
+    // 1. Сначала запись в NVS: от запуска сети она не зависит
+    const settings::SaveResult sr = settings::set_wifi(ssid, pass);
+    if (!sr.ok()) {
+        res.outcome = net_logic::SetOutcome::SaveFailed;
+        res.stage = sr.stage;
+        res.err = sr.err;
+        return res;
     }
+    // 2. Потом передаём сети (сразу, позже или никогда, смотря где она сейчас)
+    net_logic::CredsGate::Apply how;
     {
         std::lock_guard<std::mutex> lock(C.mu);
         snprintf(C.ssid, sizeof(C.ssid), "%s", ssid);
         snprintf(C.pass, sizeof(C.pass), "%s", pass);
         C.has_creds = true;
-        C.state = State::Connecting;
-        C.attempts = 0;
-        C.last_fail = net_logic::FailKind::None;
-        C.last_reason = 0;
-        C.ip[0] = '\0';
-        C.rssi = 0;
-        C.down_since_ms = uptime_ms();
-        C.provision_pending = true;
-        C.provision_deadline_ms = uptime_ms() + net_logic::kProvisionTimeoutMs;
-        C.provision_fails = 0;
+        how = C.gate.on_saved();
+        if (how != net_logic::CredsGate::Apply::WifiDown) {
+            C.state = State::Connecting;
+            C.attempts = 0;
+            C.last_fail = net_logic::FailKind::None;
+            C.last_reason = 0;
+            C.ip[0] = '\0';
+            C.rssi = 0;
+            C.down_since_ms = uptime_ms();
+            C.provision_pending = true;
+            C.provision_deadline_ms = uptime_ms() + net_logic::kProvisionTimeoutMs;
+            C.provision_fails = 0;
+        }
+    }
+    if (how == net_logic::CredsGate::Apply::WifiDown) {
+        ESP_LOGE(TAG, "new Wi-Fi saved ssid='%s', but the Wi-Fi driver is not running (init failed): reboot the board", ssid);
+        res.outcome = net_logic::SetOutcome::WifiDown;
+        return res;
+    }
+    if (how == net_logic::CredsGate::Apply::Deferred) {
+        ESP_LOGI(TAG, "new Wi-Fi saved: ssid='%s' (%s), the network is still starting: will connect right after it", ssid,
+                 pass[0] ? "with password" : "open network");
+        return res;
     }
     const esp_err_t err = apply_wifi_config();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(err));
-        return false;
+        // Данные в NVS лежат, после перезагрузки применятся; для скрипта это не «не сохранилось»
+        ESP_LOGE(TAG, "esp_wifi_set_config failed: %s (the network is saved and will be used after a reboot)",
+                 esp_err_to_name(err));
     }
     ESP_LOGI(TAG, "new Wi-Fi saved: ssid='%s' (%s), connecting", ssid, pass[0] ? "with password" : "open network");
     esp_wifi_disconnect();   // если были на другой сети: событие ASSOC_LEAVE вернёт нас в подключение
     schedule_retry(kRetryAfterLeaveMs);
-    return true;
+    return res;
 }
 
 bool clear_credentials()
 {
-    if (!C.inited) {
-        return false;
-    }
     if (!settings::clear_wifi()) {
         return false;
     }
@@ -450,8 +504,15 @@ bool clear_credentials()
         C.attempts = 0;
         C.last_fail = net_logic::FailKind::None;
     }
-    esp_timer_stop(C.retry_timer);
-    esp_wifi_disconnect();
+    bool running;
+    {
+        std::lock_guard<std::mutex> lock(C.mu);
+        running = C.inited;
+    }
+    if (running) {
+        esp_timer_stop(C.retry_timer);
+        esp_wifi_disconnect();
+    }
     ESP_LOGI(TAG, "Wi-Fi forgotten");
     return true;
 }

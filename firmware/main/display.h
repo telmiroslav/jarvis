@@ -37,14 +37,12 @@ public:
 private:
     void set_backlight(bool on);
     esp_err_t fill_black();
-    static bool on_color_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *ctx);
 
     bool ok_ = false;
     esp_err_t init_err_ = ESP_ERR_INVALID_STATE;
     DisplaySettings settings_ = {false, false, false};
     esp_lcd_panel_io_handle_t io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
-    SemaphoreHandle_t done_sem_ = nullptr;
     SemaphoreHandle_t lock_ = nullptr;
 };
 
