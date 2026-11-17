@@ -6,6 +6,7 @@
 #   ./tools/flash.sh --erase        сначала стереть всю память платы (для самой первой прошивки)
 #   ./tools/flash.sh file x.bin     прошить локальный файл
 #   ./tools/flash.sh monitor        только смотреть лог (плата перезагрузится)
+#   ./tools/flash.sh wifi           передать плате имя Wi-Fi и пароль (спросит их сам; пароль не показывается и нигде не сохраняется)
 #
 # Переменные: PORT=/dev/ttyACM0 (порт руками), BAUD=460800 (скорость прошивки).
 # Нужны: curl (или wget), esptool, python3 + pyserial (скрипт сам скажет, чего не хватает).
@@ -39,12 +40,12 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 usage() {
-  sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # --- разбор аргументов --------------------------------------------------------
 
-MODE="release"   # release | file | monitor
+MODE="release"   # release | file | monitor | wifi
 TAG=""
 FILE=""
 ERASE=0
@@ -54,6 +55,7 @@ while (( $# )); do
     -h|--help|help) usage; exit 0 ;;
     --erase)        ERASE=1 ;;
     monitor)        MODE="monitor" ;;
+    wifi)           MODE="wifi" ;;
     file)
       MODE="file"
       shift
@@ -315,11 +317,70 @@ run_monitor() {
   trap 'exit 130' INT
 }
 
+# Как run_monitor, но плату не перезагружает: лог идёт с того места, где она сейчас
+run_monitor_noreset() {
+  local margs=(--log "$LOG")
+  if (( PORT_GIVEN )); then margs+=("$PORT"); fi
+  trap : INT
+  python3 "$DIR/monitor.py" "${margs[@]}" || true
+  trap 'exit 130' INT
+}
+
 final_hint() {
   echo
   ok "Лог сохранён в файл:"
   echo "    $LOG"
   echo "Пришли этот файл Мирославу (папка с логами: ~/jarvis-logs)."
+}
+
+# --- Wi-Fi: передать плате сеть и пароль -----------------------------------------------------
+
+# Спрашивает имя сети и пароль (пароль не показывается), отдаёт их плате через tools/wifi_set.py и печатает результат.
+# Пароль живёт только в переменной этого процесса: не в аргументах команд (их видно в ps), не в файлах, не в ~/jarvis-logs.
+wifi_setup() {
+  [[ -t 0 ]] || die "Для настройки Wi-Fi нужен обычный терминал (имя и пароль вводятся с клавиатуры)."
+  echo
+  echo "Плата подключается только к Wi-Fi на 2,4 ГГц (на 5 ГГц она не работает). Имя сети и пароль вводи точно, регистр букв важен."
+  local ssid="" pass="" answer="" rc=0
+  while [[ -z "$ssid" ]]; do
+    read -r -p "Имя Wi-Fi (SSID): " ssid || die "Ввод прерван."
+  done
+  [[ "$ssid" != *$'\t'* ]] || die "В имени сети не должно быть табуляции."
+  read -r -s -p "Пароль Wi-Fi (при вводе не виден; пусто = сеть без пароля): " pass || die "Ввод прерван."
+  echo
+  if [[ -z "$pass" ]]; then
+    read -r -p "Пароль пустой: это сеть без пароля? [y/N] " answer || die "Ввод прерван."
+    [[ "$answer" == [yYдД]* ]] || { unset pass; die "Запусти ещё раз и введи пароль."; }
+  elif (( ${#pass} < 8 )); then
+    unset pass
+    die "Пароль Wi-Fi короче 8 символов. Запусти ещё раз и проверь пароль."
+  fi
+  [[ "$pass" != *$'\t'* ]] || die "В пароле не должно быть табуляции."
+
+  local pargs=(--timeout 20 --port "$PORT")
+  step "Передаю сеть плате (порт $PORT)"
+  # printf встроенная команда shell: пароль не попадает в список процессов
+  printf '%s\t%s\n' "$ssid" "$pass" | python3 "$DIR/wifi_set.py" "${pargs[@]}" || rc=$?
+  unset pass
+  echo
+  case "$rc" in
+    0) ok "Wi-Fi настроен. Плата запомнила сеть и подключится к ней сама после любой перезагрузки." ;;
+    2) warn "Плата не ответила." ;;
+    3) warn "С портом проблема (подробности выше)." ;;
+    *) warn "Wi-Fi не заработал (подробности выше)." ;;
+  esac
+
+  if (( rc == 0 )); then
+    echo "На экране справа вверху через пару секунд появятся часы (время берётся из интернета)."
+  fi
+  read -r -p "Показать лог платы (он сохранится в $LOG_DIR)? [Y/n] " answer || answer="n"
+  if [[ "$answer" != [nNнН]* ]]; then
+    step "Показываю лог без перезагрузки платы (Ctrl+C: выход)"
+    write_log_header
+    run_monitor_noreset
+    final_hint
+  fi
+  return "$rc"
 }
 
 # --- главное ----------------------------------------------------------------------------
@@ -354,6 +415,12 @@ case "$MODE" in
     step "Ищу плату"
     pick_port
     step "Показываю лог, плата перезагрузится (Ctrl+C: выход)"
+    ;;
+  wifi)
+    step "Ищу плату"
+    pick_port
+    wifi_setup
+    exit $?
     ;;
 esac
 

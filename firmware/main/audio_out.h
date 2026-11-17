@@ -15,6 +15,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "dsp.h"
+
 namespace jarvis {
 
 class AudioOut {
@@ -31,6 +33,9 @@ public:
     bool busy() const { return busy_.load(); }
     bool wait_idle(uint32_t timeout_ms) const;
 
+    // Громкость того, что играет сейчас (по последнему куску в 20 мс), dBFS; в тишине kFloorDbfs. Для лица на экране.
+    float level_dbfs() const { return level_dbfs_.load(); }
+
     uint32_t plays() const { return plays_.load(); }
     uint32_t write_errors() const { return write_errors_.load(); }
 
@@ -45,6 +50,7 @@ private:
     const int16_t *pcm_ = nullptr;
     size_t samples_ = 0;
     std::atomic<bool> busy_{false};
+    std::atomic<float> level_dbfs_{dsp::kFloorDbfs};
     std::atomic<uint32_t> plays_{0};
     std::atomic<uint32_t> write_errors_{0};
 };

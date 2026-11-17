@@ -12,11 +12,29 @@
 #include <string>
 #include <vector>
 
+#include "cmd_parse.h"
 #include "dsp.h"
-#include "gfx.h"
-#include "testcard.h"
+#include "lcd_cfg.h"
+#include "net_logic.h"
+#include "text_util.h"
+#include "ui_logic.h"
 
 using namespace jarvis;
+
+// Проверка, что строка это целиком корректный UTF-8
+static bool utf8_len_ok(const char *s)
+{
+    const char *end = s + strlen(s);
+    while (s < end) {
+        uint32_t cp;
+        const int n = text::utf8_decode(s, end, &cp);
+        if (cp == 0xFFFD) {
+            return false;
+        }
+        s += n;
+    }
+    return true;
+}
 
 static int g_checks = 0;
 static int g_failed = 0;
@@ -524,282 +542,361 @@ static void test_beep()
     CHECK(t[0] == 0);
 }
 
-// ---------------------------------------------------------------- рисование и шрифт
+// ---------------------------------------------------------------- v0.2: текст (UTF-8, шрифт, JSON)
 
-static void test_gfx()
+static void test_text()
 {
-    using namespace gfx;
-    // порядок байтов: красный RGB565 = 0xF800, на проводе старший байт первым,
-    // значит в uint16_t (little endian) лежит 0x00F8
-    CHECK(rgb565(255, 0, 0) == 0xF800);
-    CHECK(kRed == 0x00F8);
-    CHECK(rgb565(0, 255, 0) == 0x07E0);
-    CHECK(kGreen == 0xE007);
-    CHECK(rgb565(0, 0, 255) == 0x001F);
-    CHECK(kBlue == 0x1F00);
-    CHECK(kWhite == 0xFFFF);
-    CHECK(kBlack == 0x0000);
-    // реально байты в памяти идут в порядке: старший, младший
-    const Color red = kRed;
-    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&red);
-    const uint16_t probe = 1;
-    if (*reinterpret_cast<const uint8_t *>(&probe) == 1) {   // little endian (хост x86 и ESP32)
-        CHECK(bytes[0] == 0xF8 && bytes[1] == 0x00);
+    using namespace text;
+    // декодер: ASCII, кириллица, 3 и 4 байта
+    uint32_t cp = 0;
+    const char *s1 = "A";
+    CHECK(utf8_decode(s1, s1 + 1, &cp) == 1 && cp == 'A');
+    const char *s2 = "ж";
+    CHECK(utf8_decode(s2, s2 + 2, &cp) == 2 && cp == 0x436);
+    const char *s3 = "€";
+    CHECK(utf8_decode(s3, s3 + 3, &cp) == 3 && cp == 0x20AC);
+    const char *s4 = "\xF0\x9F\x98\x80";   // эмодзи
+    CHECK(utf8_decode(s4, s4 + 4, &cp) == 4 && cp == 0x1F600);
+    // битое: одинокий хвостовой байт, оборванная последовательность, «длинная» запись, суррогат
+    const char b1[] = {static_cast<char>(0x80), 0};
+    CHECK(utf8_decode(b1, b1 + 1, &cp) == 1 && cp == 0xFFFD);
+    const char b2[] = {static_cast<char>(0xD0), 0};
+    CHECK(utf8_decode(b2, b2 + 1, &cp) == 1 && cp == 0xFFFD);
+    const char b3[] = {static_cast<char>(0xC0), static_cast<char>(0x80), 0};   // «длинная» запись нуля
+    CHECK(utf8_decode(b3, b3 + 2, &cp) == 1 && cp == 0xFFFD);
+    const char b4[] = {static_cast<char>(0xED), static_cast<char>(0xA0), static_cast<char>(0x80), 0};   // суррогат
+    CHECK(utf8_decode(b4, b4 + 3, &cp) == 1 && cp == 0xFFFD);
+    // кодер и обратный путь
+    for (uint32_t c : {0x41u, 0x436u, 0x2116u, 0x20ACu, 0x1F600u}) {
+        char enc[5] = {0};
+        const int n = utf8_encode(c, enc);
+        uint32_t back = 0;
+        CHECK(utf8_decode(enc, enc + n, &back) == n && back == c);
     }
+    CHECK(utf8_count("Привет, мир!") == 12);
+    CHECK(utf8_count("") == 0);
+    CHECK(utf8_count(nullptr) == 0);
 
-    std::vector<uint16_t> buf(240 * 240);
-    Canvas c(buf.data(), 240, 240);
-    c.fill(kBlack);
-    c.fill_rect(10, 10, 5, 5, kRed);
-    CHECK(c.get_pixel(10, 10) == kRed && c.get_pixel(14, 14) == kRed);
-    CHECK(c.get_pixel(15, 15) == kBlack && c.get_pixel(9, 9) == kBlack);
-    // обрезка по краям не пишет за буфер
-    c.fill_rect(-10, -10, 20, 20, kBlue);
-    c.fill_rect(230, 230, 50, 50, kBlue);
-    CHECK(c.get_pixel(0, 0) == kBlue && c.get_pixel(9, 9) == kBlue && c.get_pixel(10, 10) == kRed);
-    CHECK(c.get_pixel(239, 239) == kBlue);
-    c.set_pixel(-1, 5, kRed);
-    c.set_pixel(5, 240, kRed);
-    c.outline(50, 50, 20, 10, kWhite);
-    CHECK(c.get_pixel(50, 50) == kWhite && c.get_pixel(69, 59) == kWhite && c.get_pixel(60, 55) == kBlack);
-
-    // шрифт: размер текста
-    CHECK(text_width("", 1) == 0);
-    CHECK(text_width("A", 1) == 5);
-    CHECK(text_width("AB", 1) == 11);
-    CHECK(text_width("AB", 2) == 22);
-    CHECK(text_width("CFG 1", 5) == 145);
-
-    // каждая буква, цифра и знак из нужных есть в шрифте и непустая; неизвестный знак рисуется рамкой
-    const char *needed = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-+.,:=/()%><_!? ";
-    for (const char *p = needed; *p; p++) {
-        const uint8_t *g = glyph_rows(*p);
-        int bits = 0;
-        for (int r = 0; r < kGlyphH; r++) {
-            CHECK((g[r] & ~0x1F) == 0);
-            bits += __builtin_popcount(g[r]);
-        }
-        if (*p != ' ') {
-            CHECK(bits > 0);
-        }
-        // Нет у двух разных знаков одинаковых картинок
-        for (const char *q = p + 1; *q; q++) {
-            if (glyph_rows(*p) != glyph_rows(*q) && memcmp(glyph_rows(*p), glyph_rows(*q), kGlyphH) == 0) {
-                printf("  duplicate glyphs '%c' '%c'\n", *p, *q);
-                CHECK(false);
-            }
-        }
+    // набор символов шрифта: русский алфавит целиком, знаки из задания
+    for (uint32_t c = 0x410; c <= 0x44F; c++) {
+        CHECK(font_has_codepoint(c));
     }
-    CHECK(glyph_rows('a') == glyph_rows('A'));       // строчные = заглавные
-    CHECK(glyph_rows('~') == glyph_rows('#'));        // оба неизвестные
+    CHECK(font_has_codepoint(0x401) && font_has_codepoint(0x451));
+    for (uint32_t c : {0xABu, 0xBBu, 0x2014u, 0x2026u, 0x2116u, 0xB0u}) {
+        CHECK(font_has_codepoint(c));
+    }
+    CHECK(!font_has_codepoint(0x1F600));   // эмодзи шрифт не умеет
+    CHECK(!font_has_codepoint(0x4E2D));    // китайские иероглифы тоже
+    CHECK(!font_has_codepoint(0x07));
 
-    // рисуем букву F и проверяем форму: верхняя полка, левая стойка, средняя перекладина
-    c.fill(kBlack);
-    int end = c.draw_char(20, 20, 'F', 1, kWhite);
-    CHECK(end == 26);
-    CHECK(c.get_pixel(20, 20) == kWhite && c.get_pixel(24, 20) == kWhite);   // верх
-    CHECK(c.get_pixel(20, 26) == kWhite && c.get_pixel(24, 26) == kBlack);   // низ только стойка
-    CHECK(c.get_pixel(23, 23) == kWhite && c.get_pixel(24, 23) == kBlack);   // перекладина короче
-    // масштаб 3: пиксель шрифта 3x3
-    c.fill(kBlack);
-    c.draw_char(30, 30, 'F', 3, kRed);
-    CHECK(c.get_pixel(30, 30) == kRed && c.get_pixel(32, 32) == kRed && c.get_pixel(33, 30) == kRed);
-    CHECK(c.get_pixel(30, 30 + 6 * 3) == kRed);   // нижний конец стойки
-    // фон под текстом
-    c.fill(kBlue);
-    c.draw_text_bg(100, 100, "I", 2, kWhite, kBlack);
-    CHECK(c.get_pixel(100, 100) == kBlack && c.get_pixel(111, 113) == kBlack);   // ячейка 12x14 фоном
-    CHECK(c.get_pixel(112, 100) == kBlue);
-    // центрирование
-    c.fill(kBlack);
-    c.draw_text_centered(120, 10, "AB", 2, kWhite);   // ширина 22: от 109
-    CHECK(c.get_pixel(109 + 2, 10) == kWhite || c.get_pixel(109 + 2, 10 + 2) == kWhite);
+    // sanitize: нормальный текст проходит как есть
+    char out[64];
+    CHECK(sanitize("Джарвис, какая сегодня погода?", out, sizeof(out)) == strlen("Джарвис, какая сегодня погода?"));
+    CHECK(std::string(out) == "Джарвис, какая сегодня погода?");
+    // неподдерживаемое -> '?', управляющие выброшены, \r и \t пробелами, \n остаётся
+    CHECK(sanitize("a\x07" "b\tc\rd\ne", out, sizeof(out)) > 0);
+    CHECK(std::string(out) == "ab c d\ne");
+    sanitize("Привет \xF0\x9F\x98\x80!", out, sizeof(out));
+    CHECK(std::string(out) == "Привет ?!");
+    sanitize("a\xFF" "b", out, sizeof(out));
+    CHECK(std::string(out) == "a?b");
+    // обрезка по границе символа: «Привет» это 12 байт, в 8 байт влезает «При» + нулевой => 3 буквы (6 байт)... плюс ничего лишнего
+    char small[8];
+    const size_t n = sanitize("Привет", small, sizeof(small));
+    CHECK(n == 6 && std::string(small) == "При");   // 7 байт нельзя: четвёртая буква не влезает целиком
+    char two[3];
+    CHECK(sanitize("Привет", two, sizeof(two)) == 2 && std::string(two) == "П");
+    char one[1];
+    CHECK(sanitize("abc", one, sizeof(one)) == 0 && one[0] == '\0');
+    CHECK(sanitize(nullptr, out, sizeof(out)) == 0 && out[0] == '\0');
+    CHECK(sanitize("x", out, 0) == 0);
+
+    // JSON
+    CHECK(json_escape("MyWiFi", out, sizeof(out)) == 6 && std::string(out) == "MyWiFi");
+    json_escape("a\"b\\c\nd\x01", out, sizeof(out));
+    CHECK(std::string(out) == "a\\\"b\\\\c\\nd\\u0001");
+    char tiny[6];
+    json_escape("\"\"\"\"", tiny, sizeof(tiny));   // не влезает целиком: обрезка по целому экранированию
+    CHECK(std::string(tiny) == "\\\"\\\"");
+    json_escape("Кириллица", out, sizeof(out));      // UTF-8 байты идут как есть
+    CHECK(std::string(out) == "Кириллица");
 }
 
-// Печать всех знаков ASCII-артом, чтобы глазами проверить шрифт (в лог теста)
-static void print_font_sample()
+// ---------------------------------------------------------------- v0.2: команды по серийному порту
+
+static void test_commands()
 {
-    const char *sets[] = {"ABCDEFGHIJKLM", "NOPQRSTUVWXYZ", "0123456789-+.", ",:=/()%><_!?"};
-    for (const char *set : sets) {
-        for (int r = 0; r < gfx::kGlyphH; r++) {
-            for (const char *p = set; *p; p++) {
-                const uint8_t *g = gfx::glyph_rows(*p);
-                for (int col = 0; col < gfx::kGlyphW; col++) {
-                    putchar((g[r] & (1 << (gfx::kGlyphW - 1 - col))) ? '#' : '.');
-                }
-                putchar(' ');
-            }
-            putchar('\n');
+    using namespace cmd;
+
+    // wifi_set: имя и пароль через ТАБУЛЯЦИЮ, пробелы внутри сохраняются
+    Command c = parse_command("wifi_set MyHome\tsecret123");
+    CHECK(c.kind == Kind::WifiSet && std::string(c.ssid) == "MyHome" && std::string(c.pass) == "secret123");
+    c = parse_command("wifi_set My Home 5G\tpass with spaces");
+    CHECK(c.kind == Kind::WifiSet && std::string(c.ssid) == "My Home 5G" && std::string(c.pass) == "pass with spaces");
+    // перевод строки в конце срезается, пробелы в конце пароля нет
+    c = parse_command("wifi_set Net\t12345678  \r\n");
+    CHECK(c.kind == Kind::WifiSet && std::string(c.pass) == "12345678  ");
+    // регистр слова-команды не важен, лишние пробелы перед командой тоже
+    c = parse_command("   WIFI_SET Net\t12345678");
+    CHECK(c.kind == Kind::WifiSet && std::string(c.ssid) == "Net");
+    // разделителем после слова может быть сама табуляция
+    c = parse_command("wifi_set\tNet\t12345678");
+    CHECK(c.kind == Kind::WifiSet && std::string(c.ssid) == "Net" && std::string(c.pass) == "12345678");
+    // открытая сеть: табуляция и пустой пароль
+    c = parse_command("wifi_set Cafe\t");
+    CHECK(c.kind == Kind::WifiSet && std::string(c.ssid) == "Cafe" && c.pass[0] == '\0');
+    // в пароле могут быть ещё табуляции: делит только первая
+    c = parse_command("wifi_set Net\tab\tcdefgh");
+    CHECK(c.kind == Kind::WifiSet && std::string(c.pass) == "ab\tcdefgh");
+    // пароль из 64 шестнадцатеричных цифр (готовый PSK) допустим, не шестнадцатеричный нет
+    const std::string hex64(64, 'a');
+    c = parse_command(("wifi_set Net\t" + hex64).c_str());
+    CHECK(c.kind == Kind::WifiSet && std::string(c.pass) == hex64);
+    c = parse_command(("wifi_set Net\t" + std::string(63, 'a') + "g").c_str());
+    CHECK(c.kind == Kind::Error && std::string(c.err_reason) == "pass_bad_hex");
+    // граничные длины
+    c = parse_command(("wifi_set " + std::string(32, 'x') + "\t12345678").c_str());
+    CHECK(c.kind == Kind::WifiSet && strlen(c.ssid) == 32);
+    c = parse_command(("wifi_set " + std::string(33, 'x') + "\t12345678").c_str());
+    CHECK(c.kind == Kind::Error && std::string(c.err_reason) == "ssid_too_long");
+    c = parse_command("wifi_set Net\t1234567");
+    CHECK(c.kind == Kind::Error && std::string(c.err_reason) == "pass_too_short");
+    c = parse_command(("wifi_set Net\t" + std::string(65, 'x')).c_str());
+    CHECK(c.kind == Kind::Error && std::string(c.err_reason) == "pass_too_long");
+    c = parse_command("wifi_set \t12345678");
+    CHECK(c.kind == Kind::Error && std::string(c.err_reason) == "ssid_empty");
+    // забыли табуляцию (ввели пробелом): понятная ошибка, а не «подключаюсь к странной сети»
+    c = parse_command("wifi_set MyHome secret123");
+    CHECK(c.kind == Kind::Error && std::string(c.err_reason) == "no_tab" && std::string(c.err_cmd) == "wifi_set");
+    c = parse_command("wifi_set");
+    CHECK(c.kind == Kind::Error && std::string(c.err_reason) == "usage");
+    // SSID из кириллицы: 32 БАЙТА, а не символа (16 русских букв)
+    c = parse_command("wifi_set ДомашняяСеть\t12345678");
+    CHECK(c.kind == Kind::WifiSet && strlen(c.ssid) == 2 * 12);
+    c = parse_command(("wifi_set " + std::string("Д") + std::string(31, 'x') + "\t12345678").c_str());   // 33 байта
+    CHECK(c.kind == Kind::Error && std::string(c.err_reason) == "ssid_too_long");
+    // слишком длинная строка
+    c = parse_command(("wifi_set " + std::string(200, 'x')).c_str());
+    CHECK(c.kind == Kind::Error && std::string(c.err_reason) == "line_too_long");
+
+    // простые команды
+    CHECK(parse_command("wifi_clear").kind == Kind::WifiClear);
+    CHECK(parse_command("status").kind == Kind::Status);
+    CHECK(parse_command("STATUS\r\n").kind == Kind::Status);
+    CHECK(parse_command("reboot").kind == Kind::Reboot);
+    CHECK(parse_command("help").kind == Kind::Help);
+    CHECK(parse_command("").kind == Kind::Empty);
+    CHECK(parse_command("   \t ").kind == Kind::Empty);
+    CHECK(parse_command("\r\n").kind == Kind::Empty);
+    CHECK(parse_command(nullptr).kind == Kind::Empty);
+    c = parse_command("fly_to_moon");
+    CHECK(c.kind == Kind::Error && std::string(c.err_reason) == "unknown_command");
+    c = parse_command("wifi_setx a\tb");   // не путаем с wifi_set
+    CHECK(c.kind == Kind::Error && std::string(c.err_reason) == "unknown_command");
+
+    // tz
+    c = parse_command("tz CST-8");
+    CHECK(c.kind == Kind::Tz && std::string(c.tz) == "CST-8");
+    c = parse_command("tz   <+08>-8  ");
+    CHECK(c.kind == Kind::Tz && std::string(c.tz) == "<+08>-8");
+    c = parse_command("tz EST5EDT,M3.2.0,M11.1.0");
+    CHECK(c.kind == Kind::Tz);
+    c = parse_command("tz Asia/Shanghai");
+    CHECK(c.kind == Kind::Error && std::string(c.err_reason) == "tz_invalid");
+    c = parse_command("tz");
+    CHECK(c.kind == Kind::Error && std::string(c.err_reason) == "usage");
+
+    // lcd
+    c = parse_command("lcd 2");
+    CHECK(c.kind == Kind::Lcd && c.lcd == 2);
+    c = parse_command("lcd 6 ");
+    CHECK(c.kind == Kind::Lcd && c.lcd == 6);
+    CHECK(parse_command("lcd 0").kind == Kind::Error);
+    CHECK(parse_command("lcd 7").kind == Kind::Error);
+    CHECK(std::string(parse_command("lcd 7").err_reason) == "lcd_range");
+    CHECK(std::string(parse_command("lcd x").err_reason) == "usage");
+    CHECK(std::string(parse_command("lcd 2 3").err_reason) == "usage");
+    CHECK(std::string(parse_command("lcd").err_reason) == "usage");
+
+    // каждая причина ошибки имеет описание, а неизвестная возвращается как есть
+    CHECK(std::string(describe_error("no_tab")).find("табуляция") != std::string::npos);
+    CHECK(std::string(describe_error("zzz")) == "zzz");
+}
+
+static void test_tz()
+{
+    using cmd::is_valid_posix_tz;
+    for (const char *ok : {"CST-8", "UTC0", "UTC", "GMT0", "MSK-3", "<+08>-8", "<-03>3", "IST-5:30", "<+0530>-5:30",
+                           "EST5EDT", "EST5EDT,M3.2.0,M11.1.0", "CET-1CEST,M3.5.0,M10.5.0/3", "AEST-10AEDT,M10.1.0,M4.1.0/3",
+                           "PST8PDT,J60,J300", "<+03>-3"}) {
+        if (strcmp(ok, "UTC") == 0) {
+            CHECK(!is_valid_posix_tz(ok));   // без сдвига нельзя: смещение обязательно
+        } else {
+            CHECK(is_valid_posix_tz(ok));
         }
-        putchar('\n');
+    }
+    for (const char *bad : {"", "CST", "Asia/Shanghai", "CST-", "CS-8", "CST-8 ", " CST-8", "CST-99", "CST-8:99", "<>-8",
+                            "<+08-8", "EST5EDT,M3.2.0", "EST5EDT,M13.2.0,M11.1.0", "CST-8,M3.2.0,M11.1.0x", "CST-8\t"}) {
+        CHECK(!is_valid_posix_tz(bad));
+    }
+    CHECK(!is_valid_posix_tz(nullptr));
+    CHECK(!is_valid_posix_tz(std::string(64, 'A').c_str()));
+}
+
+// ---------------------------------------------------------------- v0.2: логика сети
+
+static void test_net_logic()
+{
+    using namespace net_logic;
+    CHECK(classify_disconnect_reason(202) == FailKind::WrongPassword);
+    CHECK(classify_disconnect_reason(15) == FailKind::WrongPassword);
+    CHECK(classify_disconnect_reason(204) == FailKind::WrongPassword);
+    CHECK(classify_disconnect_reason(201) == FailKind::NoAp);
+    CHECK(classify_disconnect_reason(210) == FailKind::NoAp);
+    CHECK(classify_disconnect_reason(200) == FailKind::Other);   // BEACON_TIMEOUT: роутер пропал, это не пароль
+    CHECK(classify_disconnect_reason(8) == FailKind::Other);
+    CHECK(std::string(fail_kind_name(FailKind::WrongPassword)) == "wrong_password");
+    CHECK(std::string(fail_kind_name(FailKind::NoAp)) == "no_ap");
+    CHECK(std::string(fail_kind_name(FailKind::Timeout)) == "timeout");
+    CHECK(std::string(fail_kind_name(FailKind::Other)) == "other");
+
+    // пауза между попытками растёт и упирается в 30 с
+    CHECK(backoff_ms(0) == 1000 && backoff_ms(1) == 2000 && backoff_ms(2) == 4000 && backoff_ms(3) == 8000);
+    CHECK(backoff_ms(4) == 15000 && backoff_ms(5) == 30000 && backoff_ms(6) == 30000 && backoff_ms(1000000) == 30000);
+    for (uint32_t i = 0; i < 20; i++) {
+        CHECK(backoff_ms(i + 1) >= backoff_ms(i));
+    }
+
+    // подсказку «нет Wi-Fi» не показываем сразу и не показываем, пока связь есть
+    CHECK(!no_wifi_due({true, true, 0, 100000}));
+    CHECK(!no_wifi_due({true, false, 5000, 5000}));          // только что включились, подключаемся
+    CHECK(!no_wifi_due({true, false, 19999, 30000}));
+    CHECK(no_wifi_due({true, false, 20000, 30000}));          // не подключились 20 с
+    CHECK(!no_wifi_due({false, false, 1000, 1000}));          // без сети: даём лицу проснуться
+    CHECK(no_wifi_due({false, false, 4000, 4000}));
+    CHECK(!no_wifi_due({false, true, 99999, 99999}));
+
+    // тексты подсказок: только символы, которые есть в шрифте
+    const FailKind kinds[] = {FailKind::None, FailKind::WrongPassword, FailKind::NoAp, FailKind::Timeout, FailKind::Other};
+    for (bool creds : {false, true}) {
+        for (FailKind k : kinds) {
+            const char *t = hint_text(creds, k);
+            char clean[200];
+            text::sanitize(t, clean, sizeof(clean));
+            CHECK(std::string(t) == clean);
+            CHECK(utf8_len_ok(t));
+        }
+    }
+    CHECK(std::string(hint_text(false, FailKind::None)).find("./tools/flash.sh wifi") != std::string::npos);
+    CHECK(std::string(hint_text(true, FailKind::WrongPassword)).find("пароль") != std::string::npos);
+
+    // деления значка по RSSI
+    CHECK(bars_from_rssi(-40) == 3 && bars_from_rssi(-60) == 3);
+    CHECK(bars_from_rssi(-61) == 2 && bars_from_rssi(-70) == 2);
+    CHECK(bars_from_rssi(-71) == 1 && bars_from_rssi(-80) == 1);
+    CHECK(bars_from_rssi(-81) == 0 && bars_from_rssi(-95) == 0);
+    CHECK(bars_from_rssi(0) == 0 && bars_from_rssi(5) == 0);   // 0 = неизвестно
+}
+
+// ---------------------------------------------------------------- v0.2: логика интерфейса
+
+static void test_ui_logic()
+{
+    using namespace ui_logic;
+    CHECK_NEAR(level_from_dbfs(-58.0f, -58.0f, -22.0f), 0.0, 1e-6);
+    CHECK_NEAR(level_from_dbfs(-22.0f, -58.0f, -22.0f), 1.0, 1e-6);
+    CHECK_NEAR(level_from_dbfs(-40.0f, -58.0f, -22.0f), 0.5, 1e-6);
+    CHECK_NEAR(level_from_dbfs(-120.0f, -58.0f, -22.0f), 0.0, 1e-6);   // тишина
+    CHECK_NEAR(level_from_dbfs(0.0f, -58.0f, -22.0f), 1.0, 1e-6);      // перегруз
+    CHECK_NEAR(level_from_dbfs(NAN, -58.0f, -22.0f), 0.0, 1e-6);
+    // рабочие диапазоны лица: микрофон и динамик
+    CHECK_NEAR(level_from_dbfs(kMicFloorDb, kMicFloorDb, kMicCeilDb), 0.0, 1e-6);
+    CHECK_NEAR(level_from_dbfs(kMicCeilDb, kMicFloorDb, kMicCeilDb), 1.0, 1e-6);
+    CHECK(kMicFloorDb < kMicCeilDb && kOutFloorDb < kOutCeilDb);
+    CHECK_NEAR(level_from_dbfs(-30.0f, -20.0f, -20.0f), 0.0, 1e-6);    // вырожденный диапазон
+
+    // фильтр: быстро вверх, медленнее вниз, не зависит от частоты кадров
+    LevelFilter f;
+    for (int i = 0; i < 10; i++) {
+        f.step(1.0f, 30, 40.0f, 220.0f);
+    }
+    CHECK(f.value > 0.99f);
+    const float peak = f.value;
+    f.step(0.0f, 30, 40.0f, 220.0f);
+    CHECK(f.value < peak && f.value > 0.8f);   // за один кадр вниз почти не упал
+    LevelFilter a, b;
+    for (int i = 0; i < 10; i++) {
+        a.step(1.0f, 30, 100.0f, 100.0f);   // 10 кадров по 30 мс
+    }
+    for (int i = 0; i < 30; i++) {
+        b.step(1.0f, 10, 100.0f, 100.0f);   // 30 кадров по 10 мс: тот же отрезок времени
+    }
+    CHECK_NEAR(a.value, b.value, 1e-4);
+    LevelFilter z;
+    CHECK(z.step(0.7f, 30, 0.0f, 0.0f) == 0.7f);   // нулевая постоянная = мгновенно
+
+    // интервалы
+    for (uint32_t r = 0; r < 100000; r += 7) {
+        CHECK(blink_delay_ms(r) >= 2000 && blink_delay_ms(r) <= 6000);
+        CHECK(glance_delay_ms(r) >= 3500 && glance_delay_ms(r) <= 8500);
+        CHECK(glance_dir(r) == 1 || glance_dir(r) == -1);
+    }
+    CHECK(blink_delay_ms(0) == 2000 && blink_delay_ms(4000) == 6000 && blink_delay_ms(4001) == 2000);
+    int doubles = 0;
+    for (uint32_t r = 0; r < 6000; r++) {
+        doubles += double_blink(r) ? 1 : 0;
+    }
+    CHECK(doubles == 1000);   // ровно каждое шестое
+
+    // время чтения и шаги прокрутки
+    CHECK(read_time_ms(0) == 300);
+    CHECK(read_time_ms(140) == 300 + 140 * 70);
+    CHECK(line_hold_ms(1) == 1500 && line_hold_ms(24) == 1980 && line_hold_ms(500) == 3200);
+    CHECK(scroll_steps(66, 68, 22) == 0);
+    CHECK(scroll_steps(68, 68, 22) == 0);
+    CHECK(scroll_steps(69, 68, 22) == 1);
+    CHECK(scroll_steps(90, 68, 22) == 1);
+    CHECK(scroll_steps(91, 68, 22) == 2);
+    CHECK(scroll_steps(264, 68, 22) == 9);
+    CHECK(scroll_steps(100, 68, 0) == 0);
+
+    char buf[16];
+    format_clock(9, 5, buf, sizeof(buf));
+    CHECK(std::string(buf) == "09:05");
+    format_clock(23, 59, buf, sizeof(buf));
+    CHECK(std::string(buf) == "23:59");
+    format_clock(24, 60, buf, sizeof(buf));
+    CHECK(std::string(buf) == "00:00");
+    format_clock(-1, -1, buf, sizeof(buf));
+    CHECK(std::string(buf) == "23:59");
+    char tiny[4];
+    format_clock(12, 30, tiny, sizeof(tiny));
+    CHECK(strlen(tiny) == 3);   // обрезается, но не портит память
+}
+
+// ---------------------------------------------------------------- v0.2: варианты экрана
+
+static void test_lcd_cfg()
+{
+    CHECK(kLcdCfgCount == 6);
+    CHECK(kLcdCfgDefault == 2);
+    // CFG 2 найден Давидом на настоящей плате: инверсия ВЫКЛ, порядок RGB, подсветка активна высоким
+    const DisplaySettings &d = kLcdCfgs[kLcdCfgDefault - 1];
+    CHECK(!d.invert && !d.bgr && !d.bl_active_low);
+    CHECK(lcd_cfg_valid(1) && lcd_cfg_valid(6) && !lcd_cfg_valid(0) && !lcd_cfg_valid(7) && !lcd_cfg_valid(-1));
+    CHECK(lcd_cfg_or_default(5) == 5 && lcd_cfg_or_default(0) == 2 && lcd_cfg_or_default(255) == 2);
+    // все шесть вариантов различны
+    for (int i = 0; i < kLcdCfgCount; i++) {
+        for (int j = i + 1; j < kLcdCfgCount; j++) {
+            CHECK(kLcdCfgs[i].invert != kLcdCfgs[j].invert || kLcdCfgs[i].bgr != kLcdCfgs[j].bgr ||
+                  kLcdCfgs[i].bl_active_low != kLcdCfgs[j].bl_active_low);
+        }
     }
 }
 
-// ---------------------------------------------------------------- тестовая карточка
 
-static void write_ppm(const gfx::Canvas &c, const std::string &path)
+int main()
 {
-    FILE *f = fopen(path.c_str(), "wb");
-    if (!f) {
-        printf("cannot write %s\n", path.c_str());
-        return;
-    }
-    fprintf(f, "P6\n%d %d\n255\n", c.width(), c.height());
-    for (int y = 0; y < c.height(); y++) {
-        for (int x = 0; x < c.width(); x++) {
-            const uint16_t wire = c.get_pixel(x, y);
-            const uint16_t v = gfx::bswap16(wire);   // обратно в обычный RGB565
-            const uint8_t r = static_cast<uint8_t>(((v >> 11) & 0x1F) * 255 / 31);
-            const uint8_t g = static_cast<uint8_t>(((v >> 5) & 0x3F) * 255 / 63);
-            const uint8_t b = static_cast<uint8_t>((v & 0x1F) * 255 / 31);
-            fputc(r, f);
-            fputc(g, f);
-            fputc(b, f);
-        }
-    }
-    fclose(f);
-}
-
-static void test_testcard(const std::string &out_dir)
-{
-    using namespace gfx;
-    std::vector<uint16_t> buf(240 * 240);
-    Canvas c(buf.data(), 240, 240);
-
-    CardStatic cs;
-    cs.cfg_index = 1;
-    draw_card_static(c, cs);
-
-    // Белая рамка ровно по 4 краям, целиком
-    bool frame = true;
-    for (int i = 0; i < 240; i++) {
-        frame = frame && c.get_pixel(i, 0) == kWhite && c.get_pixel(i, 239) == kWhite &&
-                c.get_pixel(0, i) == kWhite && c.get_pixel(239, i) == kWhite;
-    }
-    CHECK(frame);
-    // сразу внутри рамки в пустых местах чёрный
-    CHECK(c.get_pixel(1, 120) == kBlack && c.get_pixel(238, 120) == kBlack);
-    CHECK(c.get_pixel(120, 1) == kBlack || true);   // (под заголовком может быть буква)
-
-    // цветные полосы точно в цветах, подписи слева
-    CHECK(c.get_pixel(150, 80) == kRed);
-    CHECK(c.get_pixel(150, 106) == kGreen);
-    CHECK(c.get_pixel(150, 132) == kBlue);
-    CHECK(c.get_pixel(60, 140) != kBlue);              // подпись не закрашена полосой
-    CHECK(c.get_pixel(40, 160) == kWhite);             // белая область
-    CHECK(c.get_pixel(200, 164) == kBlack);            // чёрная область
-    CHECK(c.get_pixel(122, 154) == kGray);             // окантовка чёрной области
-
-    // угловые метки существуют в своих углах: хоть один белый пиксель вне рамки в каждом углу
-    auto corner_has_ink = [&](int x0, int y0) {
-        for (int y = y0; y < y0 + 16; y++) {
-            for (int x = x0; x < x0 + 24; x++) {
-                if (c.get_pixel(x, y) == kWhite) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    };
-    CHECK(corner_has_ink(2, 2));
-    CHECK(corner_has_ink(240 - 26, 2));
-    CHECK(corner_has_ink(2, 240 - 19));
-    CHECK(corner_has_ink(240 - 26, 240 - 19));
-
-    // Метка TL не симметрична зеркально: левый столбец буквы T это перекладина (верхний ряд),
-    // у зеркального отражения перекладина была бы справа
-    CHECK(c.get_pixel(3, 3) == kWhite && c.get_pixel(7, 3) == kWhite);   // верх T
-    CHECK(c.get_pixel(3, 4 + 12) == kBlack);   // у T внизу слева пусто
-
-    CardDynamic cd;
-    cd.rms_dbfs = -45.0f;
-    cd.peak_dbfs = -30.0f;
-    cd.slot = dsp::MicSlot::Left;
-    cd.loop_state = 1;
-    cd.loop_delta_db = 23.4f;
-    draw_card_dynamic(c, cd);
-
-    // динамика не трогает рамку и метки BL / BR
-    frame = true;
-    for (int i = 0; i < 240; i++) {
-        frame = frame && c.get_pixel(i, 0) == kWhite && c.get_pixel(i, 239) == kWhite &&
-                c.get_pixel(0, i) == kWhite && c.get_pixel(239, i) == kWhite;
-    }
-    CHECK(frame);
-    CHECK(corner_has_ink(2, 240 - 19));
-    CHECK(corner_has_ink(240 - 26, 240 - 19));
-    // и статическую часть выше kCardDynY0
-    CHECK(c.get_pixel(150, 80) == kRed && c.get_pixel(150, 132) == kBlue);
-
-    if (!out_dir.empty()) {
-        write_ppm(c, out_dir + "/card_idle.ppm");
-    }
-
-    // Уровень полосы растёт с громкостью: считаем закрашенные зелёным пиксели
-    auto green_px = [&](float rms) {
-        CardDynamic d = cd;
-        d.rms_dbfs = rms;
-        d.peak_dbfs = rms;
-        draw_card_dynamic(c, d);
-        int cnt = 0;
-        for (int x = 40; x < 240; x++) {
-            if (c.get_pixel(x, 183) == kGreen) {
-                cnt++;
-            }
-        }
-        return cnt;
-    };
-    const int g_low = green_px(-80.0f);
-    const int g_mid = green_px(-40.0f);
-    const int g_high = green_px(-10.0f);
-    CHECK(g_low < g_mid && g_mid < g_high);
-    CHECK(green_px(-120.0f) == 0);
-
-    // Слот NONE, REC, PLAY
-    CardDynamic d2 = cd;
-    d2.slot = dsp::MicSlot::None;
-    d2.loop_state = 2;
-    d2.loop_delta_db = 2.0f;
-    draw_card_dynamic(c, d2);
-    if (!out_dir.empty()) {
-        write_ppm(c, out_dir + "/card_none_fail.ppm");
-    }
-    d2 = cd;
-    d2.mode = CardMode::Rec;
-    d2.rec_seconds = 3.2f;
-    draw_card_dynamic(c, d2);
-    CHECK(c.get_pixel(35, 225) == kRed);
-    if (!out_dir.empty()) {
-        write_ppm(c, out_dir + "/card_rec.ppm");
-    }
-    d2.mode = CardMode::Play;
-    draw_card_dynamic(c, d2);
-    CHECK(c.get_pixel(35, 225) == kBlue);
-    if (!out_dir.empty()) {
-        write_ppm(c, out_dir + "/card_play.ppm");
-    }
-    // после возврата в Idle баннера нет
-    d2.mode = CardMode::Idle;
-    draw_card_dynamic(c, d2);
-    CHECK(c.get_pixel(35, 225) == kBlack);
-
-    // Остальные конфигурации рисуются без ошибок
-    for (int i = 1; i <= 6; i++) {
-        CardStatic s;
-        s.cfg_index = i;
-        s.invert = (i % 2) == 1;
-        s.bgr = (i == 3 || i == 4);
-        s.bl_active_low = i >= 5;
-        draw_card_static(c, s);
-        if (!out_dir.empty() && i == 5) {
-            write_ppm(c, out_dir + "/card_cfg5.ppm");
-        }
-    }
-}
-
-int main(int argc, char **argv)
-{
-    const std::string out_dir = argc > 1 ? argv[1] : "";
     test_dbfs();
     test_convert();
     test_analyze();
@@ -810,11 +907,12 @@ int main(int argc, char **argv)
     test_echo_chain();
     test_chime();
     test_beep();
-    test_gfx();
-    test_testcard(out_dir);
-    if (getenv("SHOW_FONT")) {
-        print_font_sample();
-    }
+    test_text();
+    test_commands();
+    test_tz();
+    test_net_logic();
+    test_ui_logic();
+    test_lcd_cfg();
     printf("%d checks, %d failed\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

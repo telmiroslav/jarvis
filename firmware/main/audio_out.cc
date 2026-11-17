@@ -124,6 +124,9 @@ void AudioOut::run()
                 stereo[2 * i] = v;
                 stereo[2 * i + 1] = v;
             }
+            // Громкость куска (до конца записи; хвост тишины не в счёт)
+            const size_t real = pos < total ? ((total - pos) < n ? (total - pos) : n) : 0;
+            level_dbfs_.store(real > 0 ? dsp::rms_dbfs_i16(pcm + pos, real) : dsp::kFloorDbfs);
             size_t written = 0;
             const esp_err_t err = i2s_channel_write(tx_, stereo, n * 2 * sizeof(int16_t), &written, kWriteTimeoutMs);
             if (err != ESP_OK) {
@@ -135,6 +138,7 @@ void AudioOut::run()
             }
             pos += n;
         }
+        level_dbfs_.store(dsp::kFloorDbfs);
         plays_.fetch_add(1);
         busy_.store(false);
     }

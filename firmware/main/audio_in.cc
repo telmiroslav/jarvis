@@ -24,8 +24,16 @@ esp_err_t AudioIn::init()
 {
     init_err_ = ESP_FAIL;
 
-    words_ = static_cast<int32_t *>(heap_caps_malloc(kBlockFrames * 2 * sizeof(int32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    pcm_ = static_cast<int16_t *>(heap_caps_malloc(kBlockFrames * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    // Буферы под блок в 100 мс (16 КБ). Это обычные буферы для копии из DMA, внутренняя память им не нужна:
+    // сначала PSRAM (внутренней мало, её делят Wi-Fi и экран), а если PSRAM нет, то внутренняя.
+    words_ = static_cast<int32_t *>(heap_caps_malloc(kBlockFrames * 2 * sizeof(int32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!words_) {
+        words_ = static_cast<int32_t *>(heap_caps_malloc(kBlockFrames * 2 * sizeof(int32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
+    pcm_ = static_cast<int16_t *>(heap_caps_malloc(kBlockFrames * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!pcm_) {
+        pcm_ = static_cast<int16_t *>(heap_caps_malloc(kBlockFrames * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
     rec_mutex_ = xSemaphoreCreateMutex();
     if (!words_ || !pcm_ || !rec_mutex_) {
         ESP_LOGE(TAG, "out of memory for audio_in buffers");

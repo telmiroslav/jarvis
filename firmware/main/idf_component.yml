@@ -1,3 +1,6 @@
 dependencies:
   idf: ">=5.5"
-  espressif/led_strip: "^3.0.0"
+  espressif/led_strip: "3.1.1"
+  # LVGL 9 и обвязка под esp_lcd: версии закреплены, чтобы сборка на GitHub была такой же, как у нас
+  lvgl/lvgl: "9.4.0"
+  espressif/esp_lvgl_port: "2.7.2"

@@ -11,7 +11,6 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_st7789.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 
 #include "board.h"
 
@@ -22,10 +21,13 @@ namespace {
 const char *TAG = "display";
 
 constexpr spi_host_device_t kSpiHost = SPI2_HOST;
-constexpr int kSpiHz = 40 * 1000 * 1000;   // если на длинных проводах мусор, снизить до 20 МГц
+constexpr int kSpiHz = 40 * 1000 * 1000;   // проверено на плате Давида; если на длинных проводах мусор, снизить до 20 МГц
+constexpr int kFillRows = 24;              // строк за одну DMA-передачу при заливке чёрным
 
 }  // namespace
 
+// Вызывается из прерывания по окончании передачи цвета. Работает только пока идёт начальная заливка:
+// потом LVGL (esp_lvgl_port) ставит своё обратное обращение на то же место.
 bool IRAM_ATTR Display::on_color_done(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t *, void *ctx)
 {
     Display *self = static_cast<Display *>(ctx);
@@ -40,7 +42,26 @@ void Display::set_backlight(bool on)
     gpio_set_level(PIN_LCD_BL, high ? 1 : 0);
 }
 
-esp_err_t Display::init(const DisplaySettings &s)
+esp_err_t Display::fill_black()
+{
+    const size_t bytes = static_cast<size_t>(kFillRows) * kWidth * sizeof(uint16_t);
+    void *buf = heap_caps_calloc(1, bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!buf) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t err = ESP_OK;
+    for (int y = 0; y < kHeight && err == ESP_OK; y += kFillRows) {
+        const int rows = (kHeight - y) < kFillRows ? (kHeight - y) : kFillRows;
+        err = esp_lcd_panel_draw_bitmap(panel_, 0, y, kWidth, y + rows, buf);
+        if (err == ESP_OK && xSemaphoreTake(done_sem_, pdMS_TO_TICKS(500)) != pdTRUE) {
+            err = ESP_ERR_TIMEOUT;
+        }
+    }
+    heap_caps_free(buf);
+    return err;
+}
+
+esp_err_t Display::init(const DisplaySettings &s, size_t max_transfer_bytes)
 {
     settings_ = s;
     init_err_ = ESP_FAIL;
@@ -57,26 +78,13 @@ esp_err_t Display::init(const DisplaySettings &s)
     }
     set_backlight(false);
 
-    const size_t fb_bytes = static_cast<size_t>(kWidth) * kHeight * sizeof(uint16_t);
-    fb_ = static_cast<uint16_t *>(heap_caps_calloc(1, fb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    fb_in_psram_ = (fb_ != nullptr);
-    if (!fb_) {
-        fb_ = static_cast<uint16_t *>(heap_caps_calloc(1, fb_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-        if (fb_) {
-            ESP_LOGW(TAG, "framebuffer in internal RAM (PSRAM not available)");
-        }
-    }
-    const size_t bounce_bytes = static_cast<size_t>(kBandRows) * kWidth * sizeof(uint16_t);
-    bounce_ = static_cast<uint16_t *>(heap_caps_malloc(bounce_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     done_sem_ = xSemaphoreCreateCounting(4, 0);
     lock_ = xSemaphoreCreateMutex();
-    if (!fb_ || !bounce_ || !done_sem_ || !lock_) {
-        ESP_LOGE(TAG, "out of memory: framebuffer=%p bounce=%p sem=%p lock=%p", static_cast<void *>(fb_),
-                 static_cast<void *>(bounce_), static_cast<void *>(done_sem_), static_cast<void *>(lock_));
+    if (!done_sem_ || !lock_) {
+        ESP_LOGE(TAG, "out of memory: sem=%p lock=%p", static_cast<void *>(done_sem_), static_cast<void *>(lock_));
         init_err_ = ESP_ERR_NO_MEM;
         return init_err_;
     }
-    canvas_.attach(fb_, kWidth, kHeight);
 
     spi_bus_config_t bus = {};
     bus.sclk_io_num = PIN_LCD_SCLK;
@@ -84,7 +92,7 @@ esp_err_t Display::init(const DisplaySettings &s)
     bus.miso_io_num = -1;
     bus.quadwp_io_num = -1;
     bus.quadhd_io_num = -1;
-    bus.max_transfer_sz = static_cast<int>(bounce_bytes);
+    bus.max_transfer_sz = static_cast<int>(max_transfer_bytes);
     err = spi_bus_initialize(kSpiHost, &bus, SPI_DMA_CH_AUTO);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "spi_bus_initialize(SPI2) failed: %s", esp_err_to_name(err));
@@ -97,7 +105,7 @@ esp_err_t Display::init(const DisplaySettings &s)
     io_cfg.dc_gpio_num = PIN_LCD_DC;
     io_cfg.spi_mode = 0;
     io_cfg.pclk_hz = kSpiHz;
-    io_cfg.trans_queue_depth = 4;
+    io_cfg.trans_queue_depth = 10;
     io_cfg.on_color_trans_done = &Display::on_color_done;
     io_cfg.user_ctx = this;
     io_cfg.lcd_cmd_bits = 8;
@@ -112,7 +120,7 @@ esp_err_t Display::init(const DisplaySettings &s)
     esp_lcd_panel_dev_config_t panel_cfg = {};
     panel_cfg.reset_gpio_num = PIN_LCD_RST;
     panel_cfg.rgb_ele_order = s.bgr ? LCD_RGB_ELEMENT_ORDER_BGR : LCD_RGB_ELEMENT_ORDER_RGB;
-    panel_cfg.data_endian = LCD_RGB_DATA_ENDIAN_BIG;   // старший байт RGB565 первым; байты переставляет gfx
+    panel_cfg.data_endian = LCD_RGB_DATA_ENDIAN_BIG;   // как в v0.1 (проверено); байты RGB565 переставляет LVGL (swap_bytes)
     panel_cfg.bits_per_pixel = 16;
     err = esp_lcd_new_panel_st7789(io_, &panel_cfg, &panel_);
     if (err != ESP_OK) {
@@ -133,27 +141,24 @@ esp_err_t Display::init(const DisplaySettings &s)
         return err;
     }
 
-    // Чёрный кадр в память панели, потом включаем отображение и подсветку
-    canvas_.fill(gfx::kBlack);
-    ok_ = true;   // flush() уже можно
-    err = flush();
+    // Чёрный кадр в память панели, потом включаем отображение и подсветку (иначе мелькнёт мусор после сброса)
+    err = fill_black();
     if (err == ESP_OK) {
         err = esp_lcd_panel_disp_on_off(panel_, true);
     }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "first flush / display on failed: %s", esp_err_to_name(err));
-        ok_ = false;
+        ESP_LOGE(TAG, "first fill / display on failed: %s", esp_err_to_name(err));
         init_err_ = err;
         return err;
     }
     set_backlight(true);
 
+    ok_ = true;
     init_err_ = ESP_OK;
-    ESP_LOGI(TAG, "ST7789 init OK: SPI2 %d MHz mode 0, 240x240 RGB565, framebuffer in %s, invert=%s order=%s "
-                  "backlight=%s, full flush %u us",
-             kSpiHz / 1000000, fb_in_psram_ ? "PSRAM" : "internal RAM", s.invert ? "ON" : "OFF",
-             s.bgr ? "BGR" : "RGB", s.bl_active_low ? "ACTIVE_LOW" : "ACTIVE_HIGH",
-             static_cast<unsigned>(last_full_flush_us_));
+    ESP_LOGI(TAG, "ST7789 init OK: SPI2 %d MHz mode 0, 240x240 RGB565, invert=%s order=%s backlight=%s, "
+                  "max transfer %u bytes",
+             kSpiHz / 1000000, s.invert ? "ON" : "OFF", s.bgr ? "BGR" : "RGB",
+             s.bl_active_low ? "ACTIVE_LOW" : "ACTIVE_HIGH", static_cast<unsigned>(max_transfer_bytes));
     return ESP_OK;
 }
 
@@ -175,48 +180,6 @@ esp_err_t Display::apply(const DisplaySettings &s)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "apply settings failed: %s", esp_err_to_name(err));
     }
-    return err;
-}
-
-esp_err_t Display::flush() { return flush_rows(0, kHeight); }
-
-esp_err_t Display::flush_rows(int y0, int y1)
-{
-    if (!ok_) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (y0 < 0) {
-        y0 = 0;
-    }
-    if (y1 > kHeight) {
-        y1 = kHeight;
-    }
-    if (y0 >= y1) {
-        return ESP_OK;
-    }
-
-    xSemaphoreTake(lock_, portMAX_DELAY);
-    const int64_t t0 = esp_timer_get_time();
-    esp_err_t err = ESP_OK;
-    for (int y = y0; y < y1 && err == ESP_OK; y += kBandRows) {
-        const int rows = (y1 - y) < kBandRows ? (y1 - y) : kBandRows;
-        memcpy(bounce_, fb_ + static_cast<size_t>(y) * kWidth, static_cast<size_t>(rows) * kWidth * sizeof(uint16_t));
-        err = esp_lcd_panel_draw_bitmap(panel_, 0, y, kWidth, y + rows, bounce_);
-        if (err == ESP_OK && xSemaphoreTake(done_sem_, pdMS_TO_TICKS(500)) != pdTRUE) {
-            err = ESP_ERR_TIMEOUT;
-        }
-    }
-    if (err != ESP_OK) {
-        if (flush_errors_.fetch_add(1) == 0) {
-            ESP_LOGE(TAG, "flush rows %d..%d failed: %s (further failures are only counted)", y0, y1,
-                     esp_err_to_name(err));
-        }
-        while (xSemaphoreTake(done_sem_, 0) == pdTRUE) {
-        }
-    } else if (y0 == 0 && y1 == kHeight) {
-        last_full_flush_us_ = static_cast<uint32_t>(esp_timer_get_time() - t0);
-    }
-    xSemaphoreGive(lock_);
     return err;
 }
 
