@@ -1,0 +1,146 @@
+"""Распознавание речи: faster-whisper. Принимает numpy-массив (не файл), чтобы не зависеть от av/ffmpeg."""
+from __future__ import annotations
+
+import logging
+import os
+import re
+import time
+from dataclasses import dataclass
+
+import numpy as np
+
+from .audio import pcm16_to_float, rms_db
+from .config import Settings
+
+log = logging.getLogger("jarvis.stt")
+
+# Типичные «галлюцинации» Whisper на тишине и шуме (русский): такие фразы считаем пустой речью.
+_JUNK = re.compile(
+    r"(субтитры\s+(сделал|создавал|подогнал)|редактор субтитров|корректор\s+[а-я]\.|продолжение следует|"
+    r"спасибо за просмотр|подписывайтесь на канал|dimatorzok|ставьте лайк)", re.I)
+
+
+@dataclass
+class SttResult:
+    text: str
+    language: str = "ru"
+    audio_s: float = 0.0
+    ms: float = 0.0
+    reason: str = ""  # почему пусто: "short" | "silence" | "no_speech" | "junk" | ""
+
+
+def clean_transcript(text: str) -> str:
+    t = re.sub(r"\s+", " ", text).strip()
+    if not any(c.isalnum() for c in t):
+        return ""
+    if _JUNK.search(t):
+        return ""
+    return t
+
+
+def _cuda_available() -> bool:
+    try:
+        import ctranslate2
+
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+class WhisperSTT:
+    def __init__(self, settings: Settings):
+        self.s = settings
+        self.model = None
+        self.device = "cpu"
+        self.compute = "int8"
+        self.beam = 1
+
+    def load(self) -> None:
+        if self.s.hf_offline:
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        # torch грузим первым: он подтягивает CUDA-библиотеки (cuBLAS/cuDNN) из своего пакета, они же нужны CTranslate2
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            pass
+        from faster_whisper import WhisperModel
+
+        dev = self.s.stt_device
+        if dev == "auto":
+            dev = "cuda" if _cuda_available() else "cpu"
+        compute = self.s.stt_compute
+        if compute == "auto":
+            compute = "int8"
+            if dev == "cuda":
+                try:
+                    import torch
+
+                    total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+                except Exception:
+                    total_gb = 6.0
+                # На 6 ГБ вместе с OmniVoice нужна экономия: int8_float16 вдвое легче, точность почти та же
+                compute = "float16" if total_gb >= 9 else "int8_float16"
+        self.device, self.compute = dev, compute
+        self.beam = self.s.stt_beam or (5 if dev == "cuda" else 1)
+        t0 = time.perf_counter()
+        kw = {}
+        if dev == "cpu":
+            kw["cpu_threads"] = min(os.cpu_count() or 4, 8)
+        try:
+            self.model = WhisperModel(self.s.stt_model, device=dev, compute_type=compute, **kw)
+        except Exception as e:
+            if self.s.hf_offline and ("offline" in str(e).lower() or "cache" in str(e).lower()
+                                      or "couldn't find" in str(e).lower() or "not find" in str(e).lower()):
+                raise RuntimeError(
+                    f"Модель распознавания «{self.s.stt_model}» не скачана. Запусти ./server/install.sh ещё раз "
+                    f"(он докачает модели)."
+                ) from e
+            raise
+        log.info("STT: %s на %s (%s), загрузка %.1f с", self.s.stt_model, dev, compute, time.perf_counter() - t0)
+
+    def transcribe(self, pcm16: bytes | np.ndarray, sample_rate: int = 16000) -> SttResult:
+        """Блокирующий вызов (запускать в отдельном потоке). pcm16: int16 little-endian или float32 в [-1, 1]."""
+        t0 = time.perf_counter()
+        audio = pcm16_to_float(pcm16) if isinstance(pcm16, (bytes, bytearray, memoryview)) else np.asarray(pcm16, np.float32)
+        dur = len(audio) / sample_rate
+        if dur < self.s.min_utterance_s:
+            return SttResult("", audio_s=dur, ms=(time.perf_counter() - t0) * 1000, reason="short")
+        audio = audio - float(np.mean(audio))
+        if rms_db(audio) < -62.0:  # цифровая тишина: Whisper зря не гоняем
+            return SttResult("", audio_s=dur, ms=(time.perf_counter() - t0) * 1000, reason="silence")
+        segments, info = self.model.transcribe(
+            audio,
+            language="ru",
+            task="transcribe",
+            beam_size=self.beam,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 600, "speech_pad_ms": 250},
+            condition_on_previous_text=False,
+            temperature=[0.0, 0.3],
+            without_timestamps=True,
+            initial_prompt=self.s.stt_prompt or None,
+            no_speech_threshold=0.6,
+            log_prob_threshold=-1.0,
+        )
+        parts: list[str] = []
+        for seg in segments:  # генератор: сама работа идёт здесь
+            if getattr(seg, "no_speech_prob", 0.0) > 0.7 and getattr(seg, "avg_logprob", 0.0) < -1.0:
+                continue
+            parts.append(seg.text)
+        text = clean_transcript(" ".join(parts))
+        ms = (time.perf_counter() - t0) * 1000
+        return SttResult(text, language=getattr(info, "language", "ru"), audio_s=dur, ms=ms,
+                         reason="" if text else "no_speech")
+
+    def warmup(self) -> None:
+        """Прогон на секунде шума: прогревает CUDA-ядра."""
+        rng = np.random.default_rng(1)
+        noise = (rng.standard_normal(16000) * 0.02).astype(np.float32)
+        t0 = time.perf_counter()
+        try:
+            segs, _ = self.model.transcribe(noise, language="ru", beam_size=self.beam, vad_filter=False,
+                                            without_timestamps=True, max_new_tokens=4)
+            list(segs)
+        except Exception as e:  # прогрев не критичен
+            log.warning("прогрев STT не удался: %s", e)
+        log.info("STT прогрет за %.2f с", time.perf_counter() - t0)

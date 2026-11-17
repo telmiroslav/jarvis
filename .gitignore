@@ -22,3 +22,8 @@ voice_lab/work/
 # Записи голоса Мирослава (личные данные)
 voice_lab/ref/
 voice_lab/clone/out/
+
+# Сервер: тесты, вывод fake_board, архив голоса (личные данные)
+.pytest_cache/
+fake_board_out/
+jarvis_voice*.zip

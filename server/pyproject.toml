@@ -1,0 +1,11 @@
+[project]
+name = "jarvis-server"
+version = "0.1.0"
+description = "Мозг голосового помощника Jarvis: сервер для платы ESP32-S3"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::SyntaxWarning", "ignore::DeprecationWarning"]

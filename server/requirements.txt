@@ -1,0 +1,17 @@
+# Прямые зависимости сервера Jarvis (для человека). Установщик ставит ТОЧНЫЕ версии из requirements.lock.
+# torch и torchaudio ставятся отдельно с индекса CUDA 12.8 (https://download.pytorch.org/whl/cu128), как в voice_lab.
+torch==2.8.0
+torchaudio==2.8.0
+omnivoice==0.2.1          # голос (k2-fsa/OmniVoice); его зависимости ниже, gradio и обучение не нужны
+pydub==0.25.1             # omnivoice импортирует при загрузке
+transformers==5.15.1
+accelerate==1.14.0
+faster-whisper==1.2.1     # распознавание речи
+ctranslate2==4.9.0        # движок faster-whisper; CUDA-библиотеки берёт у PyTorch
+google-genai==3.4.0       # Gemini
+websockets==17.4
+numpy==2.2.6
+scipy==1.17.1
+soundfile==0.14.0
+num2words==0.5.14
+huggingface-hub==1.33.0
