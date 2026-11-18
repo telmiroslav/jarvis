@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <mutex>
+#include <new>
 #include <stdio.h>
 #include <string.h>
 
@@ -24,6 +25,8 @@
 #include "mic_stream.h"
 #include "session.h"
 #include "settings.h"
+#include "time_util.h"
+#include "wake_perf.h"
 
 namespace jarvis {
 namespace wake {
@@ -32,28 +35,51 @@ namespace {
 
 const char *TAG = "wake";
 
-// ---- задачи
-constexpr int kFeedPrio = 4;      // ниже LVGL (5), связи (6, 7), звука (11, 12) и Wi-Fi: слово никому не мешает
-constexpr int kFetchPrio = 4;
-constexpr int kAfePrio = 4;       // внутренняя задача AFE (WakeNet, VAD)
+// ---- задачи, ядра и приоритеты
+//
+// Что на самом деле считает и где. В ESP-SR 2.6.1 для ESP32-S3 у AFE нет внутренней задачи (в его библиотеках нет ни одного
+// вызова xTaskCreate*; проверено по символам libesp_audio_front_end.a). feed() только кладёт кадр в кольцо AFE (50 кадров,
+// 1,6 с; если кольцо полно, кадр НЕ принимается и в лог идёт «Ringbuffer of AFE(FEED) is full»), а VAD (vadnet1) и WakeNet9
+// считаются целиком внутри fetch_with_delay(), в вызвавшей задаче. Весь расчёт (порядка половины ядра) это wake_fetch.
+// Поля afe_perferred_core / afe_perferred_priority для одного микрофона без SE/BSS ничего не значат.
+//
+// Кто работает на ядре 0: Wi-Fi 23, esp_timer 22, события 20, lwIP (tiT) 18 (всё это коротко и вытесняет всех), audio_in 12,
+// audio_out 11, websocket 7, link 6 (без привязки к ядру, лёгкие), wake_feed 4 (коротко: копия 1 КБ и запись в кольцо),
+// консоль 3, главный цикл main 1 (кнопка, разговор, лицо, решения слова) и IDLE0.
+// На ядре 1 стоит LVGL с приоритетом 5, а при LISTENING он рисует ~33 кадра/с и забирает почти всё ядро. В v0.4.0 fetch
+// был там с приоритетом 4: ему не доставалось процессора, кольцо AFE переполнялось, а потом он «догонял» без передышки и
+// вешал IDLE1 (task_wdt). Поэтому:
+//   - fetch на ядре 0. Приоритет 1, как у главного цикла: всё важнее (Wi-Fi, звук, связь) вытесняет его в любом случае, а
+//     главный цикл делит с ним ядро по кругу (квант 1 мс) и ждёт не дольше мс. Приоритет выше главного цикла дал бы
+//     «догоняющему» fetch право занимать ядро до kBusyYieldUs подряд, и кнопка, разговор и лицо вставали бы на это время;
+//   - fetch никогда не крутится вхолостую (на пустой результат ждёт 10 мс) и после kBusyYieldUs непрерывной работы
+//     отдаёт процессор на тик (vTaskDelay(1)): IDLE0 получает время, сторожевой таймер задач не срабатывает; кольцо AFE и
+//     наше кольцо (1 с) за это время копят кадры;
+//   - feed остаётся на ядре 0 с приоритетом 4: он должен успевать подать кадр сразу, как пришёл блок микрофона.
+constexpr int kFeedPrio = 4;
+constexpr int kFetchPrio = 1;
 constexpr int kFeedCore = 0;
-constexpr int kFetchCore = 1;
-constexpr int kAfeCore = 0;
+constexpr int kFetchCore = 0;
+constexpr int kAfeConfigCore = 0;     // afe_perferred_core / afe_perferred_priority ни на что не влияют (задачи у AFE нет);
+constexpr int kAfeConfigPrio = 4;     // оставлены такими же, как в v0.4.0
 constexpr uint32_t kFeedStack = 4096;
 constexpr uint32_t kFetchStack = 4096;
+constexpr uint32_t kFetchWaitMs = 500;        // сколько fetch ждёт кадр в пустом кольце
+constexpr uint32_t kFetchIdleMs = 10;         // пауза, если fetch вернулся ни с чем
+constexpr uint32_t kBusyYieldUs = 200000;     // столько непрерывной работы fetch, потом отдаёт процессор на тик
 
 // ---- память: проверка до и после создания AFE. Внутренней памяти мало (Wi-Fi, экран, звук делят около 200 КБ), а ей ещё
 // нужно хватить на WebSocket (около 10 КБ при каждом переподключении). Не хватает: слово не включаем, остальное живёт.
 // Цифры подобраны по документации ESP-SR (AFE одного микрофона без AEC: порядка 25-45 КБ внутренней памяти, остальное в
 // PSRAM) плюс два стека wake по 4 КБ; на железе не проверены, поэтому всё пишется в лог (строки «memory ...»).
 constexpr size_t kMinInternalBeforeBytes = 64 * 1024;
-constexpr size_t kMinLargestBlockBytes = 12 * 1024;   // внутренняя задача AFE берёт стек на 8 КБ одним куском
+constexpr size_t kMinLargestBlockBytes = 12 * 1024;   // рабочие буферы моделей берутся крупными кусками (задач у AFE нет)
 constexpr size_t kMinInternalAfterBytes = 20 * 1024;
 constexpr size_t kMinPsramBytes = 1536 * 1024;
 
 constexpr size_t kRingSamples = 16384;                     // кольцо блоков микрофона, 1,02 с (степень двойки)
 constexpr size_t kPreRollMax = static_cast<size_t>(wake_logic::ms_to_samples(wake_logic::kPreRollMs)) + 64;
-constexpr uint32_t kStatPeriodMs = 60000;
+constexpr uint32_t kStatPeriodMs = 30000;
 constexpr uint32_t kGuardClearMs = 30000;                  // через столько работы сторож запуска снимается
 constexpr uint32_t kRejectLogGapMs = 3000;
 
@@ -105,7 +131,7 @@ struct Ctx {
     // уровень микрофона
     float last_rms_db = dsp::kFloorDbfs;     // по последнему блоку, шкала как у mic30s
     float last_peak_db = dsp::kFloorDbfs;
-    double period_sum_sq = 0.0;              // за 60 с (для строки WAKE stat)
+    double period_sum_sq = 0.0;              // за период WAKE stat
     double period_peak = 0.0;
     uint32_t period_blocks = 0;
 
@@ -119,6 +145,31 @@ struct Ctx {
     std::atomic<uint32_t> fetch_timeouts{0};
     std::atomic<float> last_volume{-120.0f};
     Detection det;                           // под mu
+
+    // ---- усиление звука для движка (только в AFE; на сервер звук идёт как был)
+    std::atomic<float> gain_lin{1.0f};
+    int gain_db = 0;                         // под ctl_mu
+
+    // ---- измерения (wake_perf.h)
+    // Время подачи каждого кадра (мкс, младшие 32 бита) по номеру кадра: feed пишет, fetch читает. Кольцо AFE 50 кадров < 64.
+    std::atomic<uint32_t> feed_ts_us[64];
+    std::mutex perf_mu;                      // защищает три накопителя ниже (пишут feed и fetch, читает главный цикл)
+    wake_perf::FrameAcc acc_period;          // с последней строки WAKE stat
+    wake_perf::FrameAcc acc_rec;             // с начала текущей записи по слову
+    wake_perf::FrameAcc acc_total;           // с загрузки
+    // Снимки счётчиков задач и последние готовые строки: PSRAM (около 4 КБ), трогает только главный цикл и консоль под ctl_mu
+    struct PerfBufs {
+        TaskStatus_t st[wake_perf::kMaxTasks];
+        wake_perf::Snapshot base_period;     // начало периода WAKE stat
+        wake_perf::Snapshot base_rec;        // начало записи по слову
+        wake_perf::Snapshot cur;
+        char period_frames[200];
+        char period_cpu[160];
+        char rec_head[48];
+        char rec_frames[200];
+        char rec_cpu[160];
+    };
+    PerfBufs *pb = nullptr;
 
     // ---- автомат и настройки (под ctl_mu)
     std::mutex ctl_mu;
@@ -195,43 +246,73 @@ void ring_read(int64_t from, size_t n, int16_t *dst)
 
 // ---- задачи
 
+inline uint32_t now_us32() { return static_cast<uint32_t>(esp_timer_get_time()); }
+
+// Мкс от b до a; если b позже a (метку поставила другая задача чуть позже), 0. Знаковая арифметика, как timeutil::elapsed
+inline uint32_t sub_us(uint32_t a, uint32_t b)
+{
+    const int32_t d = static_cast<int32_t>(a - b);
+    return d > 0 ? static_cast<uint32_t>(d) : 0u;
+}
+
 void feed_task(void *)
 {
     const size_t chunk = static_cast<size_t>(C.feed_chunk);
     uint32_t last_overrun_log = 0;
+    bool held = false;   // в feed_buf лежит кадр, который AFE не принял (кольцо полно): подаём его снова первым
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
         for (;;) {
-            bool got = false;
-            int64_t skipped = 0;
-            {
-                std::lock_guard<std::mutex> lock(C.mu);
-                const int64_t lag = C.ring_w - C.feed_pos;
-                if (lag > static_cast<int64_t>(kRingSamples)) {
-                    // движок не успевает: самые старые отсчёты в кольце уже затёрты, прыгаем к живому звуку
-                    C.feed_pos = C.ring_w - static_cast<int64_t>(2 * chunk);
-                    skipped = lag;
+            if (!held) {
+                bool got = false;
+                int64_t skipped = 0;
+                {
+                    std::lock_guard<std::mutex> lock(C.mu);
+                    const int64_t lag = C.ring_w - C.feed_pos;
+                    if (lag > static_cast<int64_t>(kRingSamples)) {
+                        // движок не успевает: самые старые отсчёты в кольце уже затёрты, прыгаем к живому звуку
+                        C.feed_pos = C.ring_w - static_cast<int64_t>(2 * chunk);
+                        skipped = lag;
+                    }
+                    if (C.ring_w - C.feed_pos >= static_cast<int64_t>(chunk)) {
+                        ring_read(C.feed_pos, chunk, C.feed_buf);
+                        C.feed_pos += static_cast<int64_t>(chunk);
+                        got = true;
+                    }
                 }
-                if (C.ring_w - C.feed_pos >= static_cast<int64_t>(chunk)) {
-                    ring_read(C.feed_pos, chunk, C.feed_buf);
-                    C.feed_pos += static_cast<int64_t>(chunk);
-                    got = true;
+                if (skipped > 0) {
+                    // лог вне замка: под ним стоял бы звук с микрофона
+                    const uint32_t n = C.ring_overruns.fetch_add(1) + 1;
+                    const uint32_t now = uptime_ms();
+                    if (n == 1 || timeutil::elapsed(now, last_overrun_log) > 10000) {
+                        last_overrun_log = now;
+                        ESP_LOGW(TAG, "the engine cannot keep up with the microphone: skipped %d ms of audio (overruns so far: %u)",
+                                 static_cast<int>(skipped * 1000 / wake_logic::kSampleRate), static_cast<unsigned>(n));
+                    }
                 }
+                if (!got) {
+                    break;
+                }
+                // Усиление только для движка (кольцо и звук серверу остаются как были)
+                const float gain = C.gain_lin.load();
+                if (gain != 1.0f) {
+                    dsp::scale_i16_sat(C.feed_buf, chunk, gain);
+                }
+                held = true;
             }
-            if (skipped > 0) {
-                // лог вне замка: под ним стоял бы звук с микрофона
-                const uint32_t n = C.ring_overruns.fetch_add(1) + 1;
-                const uint32_t now = uptime_ms();
-                if (n == 1 || now - last_overrun_log > 10000) {
-                    last_overrun_log = now;
-                    ESP_LOGW(TAG, "the engine cannot keep up with the microphone: skipped %d ms of audio (overruns so far: %u)",
-                             static_cast<int>(skipped * 1000 / wake_logic::kSampleRate), static_cast<unsigned>(n));
-                }
-            }
-            if (!got) {
+            // Метка времени кадра идёт ДО feed(): fetch может забрать кадр, как только feed() положит его в кольцо
+            C.feed_ts_us[C.fed_frames.load() & 63].store(now_us32());
+            if (C.afe->feed(C.afe_data, C.feed_buf) <= 0) {
+                // Кольцо AFE полно: кадр не принят (feed() сам уже отдал процессор на тик, а библиотека написала в лог
+                // «Ringbuffer of AFE(FEED) is full»). Считаем и пробуем снова со следующим блоком микрофона; кадр не теряем
+                // и счётчик fed_frames не трогаем, иначе «подано минус получено» навсегда разойдётся с кольцом
+                std::lock_guard<std::mutex> lock(C.perf_mu);
+                C.acc_period.ring_full++;
+                C.acc_rec.ring_full++;
+                C.acc_total.ring_full++;
                 break;
             }
-            C.afe->feed(C.afe_data, C.feed_buf);
+            held = false;
             C.fed_frames.fetch_add(1);
         }
     }
@@ -240,29 +321,61 @@ void feed_task(void *)
 void fetch_task(void *)
 {
     uint32_t last_err_log = 0;
+    uint32_t run_start_us = now_us32();   // с какого момента fetch непрерывно занят, не ожидая кадра
     for (;;) {
-        afe_fetch_result_t *res = C.afe->fetch_with_delay(C.afe_data, pdMS_TO_TICKS(500));
+        if (!C.run.load()) {
+            // «wake off»: звук в движок не подаём. fetch не зовём: на пустом кольце библиотека каждые 500 мс пишет в лог
+            // «Ringbuffer of AFE is empty»
+            vTaskDelay(pdMS_TO_TICKS(100));
+            run_start_us = now_us32();
+            continue;
+        }
+        const uint32_t fed0 = C.fed_frames.load();
+        const uint32_t got0 = C.fetched_frames.load();   // номер кадра, который сейчас придёт
+        const uint32_t t0 = now_us32();
+        afe_fetch_result_t *res = C.afe->fetch_with_delay(C.afe_data, pdMS_TO_TICKS(kFetchWaitMs));
+        const uint32_t t1 = now_us32();
         if (!res || res->ret_value == ESP_ERR_TIMEOUT) {
             C.fetch_timeouts.fetch_add(1);
+            vTaskDelay(pdMS_TO_TICKS(kFetchIdleMs));   // библиотека могла вернуться сразу: не крутим цикл вхолостую
+            run_start_us = now_us32();
             continue;
         }
         if (res->ret_value == ESP_FAIL) {
             // Библиотека так сообщает и о пустом кольце (звук не подавали за 500 мс: микрофон молчит), и о настоящей поломке.
             // Пока мы сами ничего не подали, это просто тайм-аут.
-            if (C.fed_frames.load() <= C.fetched_frames.load()) {
+            if (wake_perf::pending_frames(C.fed_frames.load(), C.fetched_frames.load()) == 0) {
                 C.fetch_timeouts.fetch_add(1);
+                vTaskDelay(pdMS_TO_TICKS(kFetchIdleMs));
+                run_start_us = now_us32();
                 continue;
             }
             const uint32_t n = C.afe_errors.fetch_add(1) + 1;
             const uint32_t now = uptime_ms();
-            if (n == 1 || now - last_err_log > 10000) {
+            if (n == 1 || timeutil::elapsed(now, last_err_log) > 10000) {
                 last_err_log = now;
                 ESP_LOGE(TAG, "AFE fetch failed with frames waiting (count %u)", static_cast<unsigned>(n));
             }
             vTaskDelay(pdMS_TO_TICKS(20));   // не крутим цикл вхолостую при поломке
+            run_start_us = now_us32();
             continue;
         }
+
+        // Измерения. Время обработки кадра: от момента, когда кадр был готов (подан) и мы уже вызвали fetch, до результата;
+        // ожидание подачи (пустое кольцо) сюда не входит. Задержка: от подачи кадра до результата (растёт, когда fetch
+        // не получает процессор, и показывает отставание от микрофона).
+        const uint32_t since_feed = sub_us(t1, C.feed_ts_us[got0 & 63].load());
+        const uint32_t in_call = sub_us(t1, t0);
+        const uint32_t proc_us = in_call < since_feed ? in_call : since_feed;
         C.fetched_frames.fetch_add(1);
+        const uint32_t backlog = wake_perf::pending_frames(C.fed_frames.load(), got0 + 1);
+        {
+            std::lock_guard<std::mutex> lock(C.perf_mu);
+            C.acc_period.add(proc_us, since_feed, backlog);
+            C.acc_rec.add(proc_us, since_feed, backlog);
+            C.acc_total.add(proc_us, since_feed, backlog);
+        }
+
         C.vad_frames.fetch_add(1);
         if (res->vad_state == VAD_SPEECH) {
             C.vad_speech.fetch_add(1);
@@ -271,15 +384,30 @@ void fetch_task(void *)
         if (res->wakeup_state == WAKENET_DETECTED) {
             std::lock_guard<std::mutex> lock(C.mu);
             const int64_t in_afe = static_cast<int64_t>(C.fed_frames.load()) - static_cast<int64_t>(C.fetched_frames.load());
-            const int64_t backlog = (in_afe > 0 ? in_afe : 0) * C.feed_chunk;
+            const int64_t backlog_samples = (in_afe > 0 ? in_afe : 0) * C.feed_chunk;
             C.det.pending = true;
-            C.det.afe_pos = C.feed_pos - backlog;
+            C.det.afe_pos = C.feed_pos - backlog_samples;
             C.det.model_idx = res->wakenet_model_index;
             C.det.word_idx = res->wake_word_index;
             C.det.word_len = res->wake_word_length;
             C.det.volume = res->data_volume;
             C.det.backlog_ms = static_cast<int>((C.ring_w - C.det.afe_pos) * 1000 / wake_logic::kSampleRate);
             C.det.count++;
+        }
+
+        // Долгая непрерывная работа (догоняем отставание): отдаём процессор на тик, чтобы IDLE этого ядра и главный цикл
+        // получили время (task_wdt). Пока ждали кадра (кольцо было пустым к началу вызова), отсчёт начинается заново.
+        if (wake_perf::pending_frames(fed0, got0) == 0) {
+            run_start_us = t1;
+        } else if (sub_us(t1, run_start_us) >= kBusyYieldUs) {
+            {
+                std::lock_guard<std::mutex> lock(C.perf_mu);
+                C.acc_period.yields++;
+                C.acc_rec.yields++;
+                C.acc_total.yields++;
+            }
+            vTaskDelay(1);
+            run_start_us = now_us32();
         }
     }
 }
@@ -296,6 +424,82 @@ const char *state_text(wake_logic::State s, const char *blocker, char *buf, size
     return buf;
 }
 
+// ---- измерения (всё ниже зовётся под ctl_mu: из главного цикла и консоли)
+
+// Снимок счётчиков задач FreeRTOS. false: нет буфера или задач больше, чем помещается (тогда CPU просто не показываем)
+bool take_snapshot(wake_perf::Snapshot *out)
+{
+    if (!C.pb) {
+        return false;
+    }
+    uint32_t total = 0;
+    const UBaseType_t n = uxTaskGetSystemState(C.pb->st, wake_perf::kMaxTasks, &total);
+    out->valid = false;
+    if (n == 0) {
+        return false;
+    }
+    out->n = 0;
+    for (UBaseType_t i = 0; i < n && i < wake_perf::kMaxTasks; i++) {
+        out->t[i].id = static_cast<uint32_t>(C.pb->st[i].xTaskNumber);
+        out->t[i].run_us = static_cast<uint32_t>(C.pb->st[i].ulRunTimeCounter);
+        out->t[i].group = wake_perf::classify_task(C.pb->st[i].pcTaskName);
+        out->n++;
+    }
+    out->total_us = total;
+    out->valid = true;
+    return true;
+}
+
+// Забирает накопленное за период WAKE stat и начинает новый период (накопители кадров и снимок задач)
+void perf_period_take(wake_perf::FrameAcc *acc, wake_perf::CpuShare *share)
+{
+    {
+        std::lock_guard<std::mutex> lock(C.perf_mu);
+        *acc = C.acc_period;
+        C.acc_period.clear();
+    }
+    *share = wake_perf::CpuShare();
+    if (C.pb && take_snapshot(&C.pb->cur)) {
+        *share = wake_perf::cpu_share(C.pb->base_period, C.pb->cur);
+        C.pb->base_period = C.pb->cur;
+    }
+}
+
+void perf_rec_begin()
+{
+    {
+        std::lock_guard<std::mutex> lock(C.perf_mu);
+        C.acc_rec.clear();
+    }
+    if (C.pb) {
+        take_snapshot(&C.pb->base_rec);
+    }
+}
+
+// Строка «WAKE perf» после конца записи по слову (rec_ms: сколько она шла)
+void perf_rec_end(uint32_t rec_ms)
+{
+    wake_perf::FrameAcc a;
+    {
+        std::lock_guard<std::mutex> lock(C.perf_mu);
+        a = C.acc_rec;
+    }
+    wake_perf::CpuShare share;
+    if (C.pb && take_snapshot(&C.pb->cur)) {
+        share = wake_perf::cpu_share(C.pb->base_rec, C.pb->cur);
+    }
+    char f[200];
+    char c[160];
+    wake_perf::format_frames(a, f, sizeof(f));
+    wake_perf::format_cpu(share, c, sizeof(c));
+    ESP_LOGI(TAG, "WAKE perf: recording %u ms | %s | %s", static_cast<unsigned>(rec_ms), f, c);
+    if (C.pb) {
+        snprintf(C.pb->rec_head, sizeof(C.pb->rec_head), "last_rec (%u ms)", static_cast<unsigned>(rec_ms));
+        snprintf(C.pb->rec_frames, sizeof(C.pb->rec_frames), "%s", f);
+        snprintf(C.pb->rec_cpu, sizeof(C.pb->rec_cpu), "%s", c);
+    }
+}
+
 void do_stop(const wake_logic::Out &o, uint32_t now, uint32_t rec_ms)
 {
     {
@@ -310,6 +514,7 @@ void do_stop(const wake_logic::Out &o, uint32_t now, uint32_t rec_ms)
         C.didnt_hear_set = true;
         C.didnt_hear_until = now + wake_logic::kDidntHearMs;
     }
+    perf_rec_end(rec_ms);
 }
 
 void do_start(const Detection &d, const wake_logic::Out &o, uint32_t now)
@@ -319,6 +524,7 @@ void do_start(const Detection &d, const wake_logic::Out &o, uint32_t now)
         ESP_LOGW(TAG, "WAKE detected but the dialog is not idle any more: recording not started");
         return;
     }
+    perf_rec_begin();
     const bool beep = o.beep && C.beep && C.out && C.out->ok() && !C.out->busy();
     int pre_ms = 0;
     int since_ms = 0;
@@ -390,17 +596,29 @@ void print_stat(uint32_t now)
     const uint32_t d_vad = vad - C.stat_prev_vad;
     const uint32_t d_sp = vsp - C.stat_prev_vad_speech;
     const unsigned armed_s = (st.armed_ms - C.stat_prev.armed_ms) / 1000;
+    wake_perf::FrameAcc acc;
+    wake_perf::CpuShare share;
+    perf_period_take(&acc, &share);
+    char pf[200];
+    char pc[160];
+    wake_perf::format_frames(acc, pf, sizeof(pf));
+    wake_perf::format_cpu(share, pc, sizeof(pc));
+    if (C.pb) {
+        snprintf(C.pb->period_frames, sizeof(C.pb->period_frames), "%s", pf);
+        snprintf(C.pb->period_cpu, sizeof(C.pb->period_cpu), "%s", pc);
+    }
     ESP_LOGI(TAG,
              "WAKE stat: armed %us of %us | words +%u (total %u) ignored +%u no_speech +%u | mic avg %.1f peak %.1f dBFS | VAD "
-             "speech %u%% | frames +%u dropped %u/%u | heap %u KB (min %u KB) PSRAM %u KB | state %s",
-             armed_s, static_cast<unsigned>((now - C.stat_at_ms) / 1000), static_cast<unsigned>(st.detections - C.stat_prev.detections),
+             "speech %u%% | frames +%u dropped %u/%u | heap %u KB (min %u KB) PSRAM %u KB | state %s | gain %d dB | %s | %s",
+             armed_s, static_cast<unsigned>(timeutil::elapsed(now, C.stat_at_ms) / 1000), static_cast<unsigned>(st.detections - C.stat_prev.detections),
              static_cast<unsigned>(st.detections), static_cast<unsigned>(st.rejected - C.stat_prev.rejected),
              static_cast<unsigned>(st.nospeech_stops - C.stat_prev.nospeech_stops), static_cast<double>(avg_db),
              static_cast<double>(peak_db), d_vad ? static_cast<unsigned>(d_sp * 100 / d_vad) : 0u,
              static_cast<unsigned>(frames - C.stat_prev_frames), static_cast<unsigned>(C.ring_overruns.load()),
              static_cast<unsigned>(C.afe_errors.load()), static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024),
-             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024), wake_logic::state_name(C.machine.state()));
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024), wake_logic::state_name(C.machine.state()),
+             C.gain_db, pf, pc);
     C.stat_prev = st;
     C.stat_prev_frames = frames;
     C.stat_prev_vad = vad;
@@ -423,8 +641,11 @@ bool init(AudioOut *out)
     C.run.store(ws.enabled);
     C.machine.set_beep(ws.beep);
     C.machine.set_silence_ms(ws.silence_ms);
-    ESP_LOGI(TAG, "settings: wake %s, beep %s, silence %u ms, threshold %s", ws.enabled ? "on" : "off", ws.beep ? "on" : "off",
-             static_cast<unsigned>(C.machine.silence_ms()), ws.threshold > 0.0f ? "set by hand" : "model default");
+    C.gain_db = wake_logic::gain_valid(ws.gain_db) ? ws.gain_db : 0;
+    C.gain_lin.store(wake_logic::gain_db_to_linear(C.gain_db));
+    ESP_LOGI(TAG, "settings: wake %s, beep %s, silence %u ms, threshold %s, gain %d dB", ws.enabled ? "on" : "off",
+             ws.beep ? "on" : "off", static_cast<unsigned>(C.machine.silence_ms()),
+             ws.threshold > 0.0f ? "set by hand" : "model default", C.gain_db);
 
     if (!ws.enabled) {
         // Выключено командой wake off: движок вообще не запускаем (ни памяти, ни процессора, ни риска). Включить: wake on + reboot
@@ -468,6 +689,13 @@ bool init(AudioOut *out)
     }
     memset(C.ring, 0, kRingSamples * sizeof(int16_t));
     wake_logic::generate_wake_beep(C.beep, AudioOut::kSampleRate);
+    // Буфер измерений (снимки задач и готовые строки, около 4 КБ) в PSRAM; не нашлось, то без загрузки процессора по задачам
+    void *pbmem = heap_caps_calloc(1, sizeof(Ctx::PerfBufs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (pbmem) {
+        C.pb = new (pbmem) Ctx::PerfBufs();
+    } else {
+        ESP_LOGW(TAG, "no PSRAM for the performance buffers: the CPU share per task will not be shown");
+    }
 
     // Модели из раздела model (srmodels.bin на 0x820000)
     C.models = esp_srmodel_init("model");
@@ -522,16 +750,16 @@ bool init(AudioOut *out)
     cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
     cfg->afe_linear_gain = 1.0f;
     cfg->debug_init = false;
-    cfg->afe_perferred_core = kAfeCore;
-    cfg->afe_perferred_priority = kAfePrio;
+    cfg->afe_perferred_core = kAfeConfigCore;        // в ESP-SR 2.6.1 для одного микрофона внутренней задачи нет: поля не работают
+    cfg->afe_perferred_priority = kAfeConfigPrio;
     cfg = afe_config_check(cfg);
     if (!cfg) {
         settings::set_wake_guard(false);
         return fail("afe_config", "afe_config_check returned NULL");
     }
-    ESP_LOGI(TAG, "AFE config: wakenet=%s vad=%s mode=low_cost type=SR 1 mic, no AEC/NS/AGC/SE, alloc=more PSRAM, AFE core %d prio %d",
-             cfg->wakenet_model_name ? cfg->wakenet_model_name : "NONE", cfg->vad_model_name ? cfg->vad_model_name : "webrtc",
-             kAfeCore, kAfePrio);
+    ESP_LOGI(TAG, "AFE config: wakenet=%s vad=%s mode=low_cost type=SR 1 mic, no AEC/NS/AGC/SE, alloc=more PSRAM; the AFE has no task "
+                  "of its own, VAD and WakeNet run inside fetch() in the wake_fetch task",
+             cfg->wakenet_model_name ? cfg->wakenet_model_name : "NONE", cfg->vad_model_name ? cfg->vad_model_name : "webrtc");
     afe_config_print(cfg);
 
     C.afe = esp_afe_handle_from_config(cfg);
@@ -601,11 +829,13 @@ bool init(AudioOut *out)
     log_memory("with the wake tasks running");
     ESP_LOGI(TAG,
              "WAKE ready: word \"Jarvis\" (%s), VAD %s, threshold %.3f%s, silence end %u ms, no-speech timeout %u s, cap %u s, "
-             "resume delay %u ms, beep %s, wake %s | tasks: feed core %d prio %d, fetch core %d prio %d",
+             "resume delay %u ms, beep %s, wake %s, gain %d dB (engine only) | tasks: feed core %d prio %d, fetch core %d prio %d "
+             "(VAD + WakeNet run in fetch)",
              C.model_name, C.vad_name, static_cast<double>(C.thr_now), C.thr_custom ? " (set by hand)" : " (model default)",
              static_cast<unsigned>(C.machine.silence_ms()), static_cast<unsigned>(wake_logic::kNoSpeechMs / 1000),
              static_cast<unsigned>(wake_logic::kMaxRecordMs / 1000), static_cast<unsigned>(wake_logic::kResumeMs),
-             C.machine.beep() ? "on" : "off", C.enabled ? "on" : "OFF in settings", kFeedCore, kFeedPrio, kFetchCore, kFetchPrio);
+             C.machine.beep() ? "on" : "off", C.enabled ? "on" : "OFF in settings", C.gain_db, kFeedCore, kFeedPrio, kFetchCore,
+             kFetchPrio);
     return true;
 }
 
@@ -685,6 +915,7 @@ void tick(uint32_t now, const Env &env)
         std::lock_guard<std::mutex> g(C.mu);
         C.gate.stop();
         ESP_LOGI(TAG, "WAKE end: the recording was ended by %s", sv.button_down ? "the BOOT button" : "the dialog (link lost?)");
+        perf_rec_end(rec_ms);
     }
 
     // Движок: речь по VAD и слово
@@ -745,14 +976,21 @@ void tick(uint32_t now, const Env &env)
         ESP_LOGI(TAG, "wake word engine has been running for %u s: start guard cleared", static_cast<unsigned>(kGuardClearMs / 1000));
     }
 
-    // Раз в 60 с, пока на взводе (или стояли на взводе за этот период)
+    // Раз в 30 с, если за период стояли на взводе или была запись по слову (иначе тихо, но новый период всё равно начинаем)
     if (!C.stat_started) {
         C.stat_started = true;
         C.stat_at_ms = now;
-    } else if (now - C.stat_at_ms >= kStatPeriodMs) {
-        if (C.ok && (C.machine.stats().armed_ms - C.stat_prev.armed_ms) > 0) {
+        wake_perf::FrameAcc a;
+        wake_perf::CpuShare sh;
+        perf_period_take(&a, &sh);   // начало первого периода: запоминаем снимок задач
+    } else if (timeutil::elapsed(now, C.stat_at_ms) >= kStatPeriodMs) {
+        const wake_logic::Stats &ms = C.machine.stats();
+        if (C.ok && ((ms.armed_ms - C.stat_prev.armed_ms) > 0 || ms.detections != C.stat_prev.detections)) {
             print_stat(now);
         } else {
+            wake_perf::FrameAcc a;
+            wake_perf::CpuShare sh;
+            perf_period_take(&a, &sh);
             C.stat_at_ms = now;
         }
     }
@@ -785,7 +1023,9 @@ Status status(uint32_t now)
         s.beep = C.machine.beep();
         s.silence_ms = C.machine.silence_ms();
         s.stats = C.machine.stats();
-        s.last_ago_s = s.stats.have_last ? static_cast<int>((now - s.stats.last_detect_ms) / 1000) : -1;
+        // метку последнего слова поставил главный цикл, часы вызывающего могли быть взяты чуть раньше: elapsed, не разность
+        s.last_ago_s = s.stats.have_last ? static_cast<int>(timeutil::elapsed(now, s.stats.last_detect_ms) / 1000) : -1;
+        s.gain_db = C.gain_db;
     }
     {
         std::lock_guard<std::mutex> lock(C.mu);
@@ -800,6 +1040,32 @@ Status status(uint32_t now)
     const uint32_t vad = C.vad_frames.load();
     s.speech_pct = vad ? C.vad_speech.load() * 100u / vad : 0u;
     return s;
+}
+
+PerfInfo perf_info()
+{
+    PerfInfo p;
+    wake_perf::FrameAcc t;
+    {
+        std::lock_guard<std::mutex> lock(C.perf_mu);
+        t = C.acc_total;
+    }
+    if (t.frames) {
+        snprintf(p.since_boot, sizeof(p.since_boot),
+                 "fetch max %.1f ms/frame, avg %.1f, lag max %.0f ms, backlog max %u/%u frames, slow %u of %u frames, ring full %u, yields %u",
+                 static_cast<double>(t.proc_max_ms()), static_cast<double>(t.proc_avg_ms()), static_cast<double>(t.lag_max_ms()),
+                 static_cast<unsigned>(t.backlog_max), static_cast<unsigned>(wake_perf::kRingFrames), static_cast<unsigned>(t.slow),
+                 static_cast<unsigned>(t.frames), static_cast<unsigned>(t.ring_full), static_cast<unsigned>(t.yields));
+    }
+    std::lock_guard<std::mutex> lock(C.ctl_mu);
+    if (C.pb) {
+        snprintf(p.period_frames, sizeof(p.period_frames), "%s", C.pb->period_frames);
+        snprintf(p.period_cpu, sizeof(p.period_cpu), "%s", C.pb->period_cpu);
+        snprintf(p.rec_head, sizeof(p.rec_head), "%s", C.pb->rec_head);
+        snprintf(p.rec_frames, sizeof(p.rec_frames), "%s", C.pb->rec_frames);
+        snprintf(p.rec_cpu, sizeof(p.rec_cpu), "%s", C.pb->rec_cpu);
+    }
+    return p;
 }
 
 // ---------------------------------------------------------------- настройки
@@ -855,6 +1121,20 @@ bool set_threshold(float thr)
     }
     ESP_LOGI(TAG, "wake threshold %.3f by command%s%s", static_cast<double>(thr == 0.0f ? C.thr_default : thr),
              thr == 0.0f ? " (model default)" : "", saved ? " (saved)" : " (NOT saved: NVS write failed)");
+    return saved;
+}
+
+bool set_gain_db(int db)
+{
+    if (!wake_logic::gain_valid(db)) {
+        return false;
+    }
+    const bool saved = settings::set_wake_gain_db(db);
+    std::lock_guard<std::mutex> lock(C.ctl_mu);
+    C.gain_db = db;
+    C.gain_lin.store(wake_logic::gain_db_to_linear(db));   // feed_task подхватывает со следующего кадра
+    ESP_LOGI(TAG, "wake gain %d dB (x%.2f, engine only) by command%s", db, static_cast<double>(wake_logic::gain_db_to_linear(db)),
+             saved ? " (saved)" : " (NOT saved: NVS write failed)");
     return saved;
 }
 

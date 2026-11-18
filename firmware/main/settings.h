@@ -45,20 +45,23 @@ bool clear_server();
 int get_lcd();
 bool set_lcd(int n);
 
-// Слово «Джарвис» (wake.cc, консоль: wake on|off, wake beep on|off, wake thr <число>, wake silence <мс>).
+// Слово «Джарвис» (wake.cc, консоль: wake on|off, wake beep on|off, wake thr <число>, wake silence <мс>, wake gain <дБ>).
 // Ключи в NVS: wake_on, wake_beep (по умолчанию включены), wake_thr (порог*10000, 0 = стандартный для модели),
-// wake_sil (пауза после речи, мс; 0 = 800 по умолчанию).
+// wake_sil (пауза после речи, мс; 0 = 800 по умолчанию), wake_gain (усиление звука для движка слова, целые дБ 0..18, по
+// умолчанию 0).
 struct WakeSettings {
     bool enabled = true;
     bool beep = true;
     float threshold = 0.0f;       // 0 = стандартный порог модели
     uint32_t silence_ms = 800;
+    int gain_db = 0;              // усиление звука только для движка слова
 };
 WakeSettings get_wake();
 bool set_wake_enabled(bool on);
 bool set_wake_beep(bool on);
 bool set_wake_threshold(float thr);         // 0 = вернуть стандартный; иначе 0,40..0,9999
 bool set_wake_silence_ms(uint32_t ms);
+bool set_wake_gain_db(int db);              // 0..18
 // Сторож запуска движка слова: ставится перед созданием AFE и снимается через 30 с работы. Если плата упала за это время,
 // при следующем запуске движок не поднимается (кнопка работает), пока не отправят «wake on» и не перезагрузят плату.
 bool get_wake_guard();

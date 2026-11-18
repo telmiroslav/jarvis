@@ -21,6 +21,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "time_util.h"
+
 namespace jarvis {
 namespace wake_logic {
 
@@ -57,6 +59,10 @@ constexpr uint32_t kMaxSinceEdgeMs = 250;     // сколько мс назад 
 // Порог слова задаёт разработчик движка (0,40..0,9999). Хранится в NVS как число*10000, 0 = стандартный для модели.
 constexpr float kThresholdMin = 0.40f;
 constexpr float kThresholdMax = 0.9999f;
+
+// Усиление звука, который идёт ТОЛЬКО в движок слова (на сервер звук уходит как был): целые децибелы. Для тихого микрофона.
+constexpr int kGainMinDb = 0;
+constexpr int kGainMaxDb = 18;
 
 // Подсказки на экране (в Idle). Тексты русские, глифы « » и кириллица есть в шрифте.
 constexpr const char *kHintArmed = "Скажи «Джарвис»";
@@ -140,7 +146,7 @@ public:
     bool armed() const { return state_ == State::Armed; }
     bool recording() const { return state_ == State::Recording; }
     bool speech_started() const { return speech_started_; }
-    uint32_t recording_ms(uint32_t now) const { return state_ == State::Recording ? now - rec_start_ : 0; }
+    uint32_t recording_ms(uint32_t now) const { return state_ == State::Recording ? timeutil::elapsed(now, rec_start_) : 0; }
     const char *blocker() const { return blocker_; }
     const Stats &stats() const { return stats_; }
 
@@ -223,6 +229,10 @@ bool parse_model_thresholds(const char *info, float *thr90, float *thr95);
 
 // Порог в допустимых пределах kThresholdMin..kThresholdMax
 bool thr_valid(float t);
+
+// Усиление в допустимых пределах kGainMinDb..kGainMaxDb и его линейный множитель 10^(db/20) (db вне пределов зажимается)
+bool gain_valid(int db);
+float gain_db_to_linear(int db);
 
 }  // namespace wake_logic
 }  // namespace jarvis

@@ -3,12 +3,16 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "time_util.h"
+
 namespace jarvis {
 namespace dialog {
 
 namespace {
-// now >= t с учётом переполнения 32-битных миллисекунд
-bool reached(uint32_t now, uint32_t t) { return static_cast<int32_t>(now - t) >= 0; }
+// now >= t с учётом переполнения 32-битных миллисекунд; elapsed(now, t) = мс от t до now, а если метка t позже now (её
+// поставила сетевая задача уже после того, как главный цикл взял now), то 0, а не ~4 миллиарда. Подробности в time_util.h.
+using timeutil::elapsed;
+using timeutil::reached;
 }  // namespace
 
 const char *phase_name(Phase p)
@@ -177,7 +181,7 @@ Out Dialog::on_tick(uint32_t now, bool playback_drained)
     Out o;
 
     // Удержание: пора начинать запись
-    if (pressed_ && !hold_fired_ && now - press_ms_ >= kHoldMs) {
+    if (pressed_ && !hold_fired_ && elapsed(now, press_ms_) >= kHoldMs) {
         hold_fired_ = true;
         if (!link_) {
             o.no_link = true;
@@ -200,7 +204,7 @@ Out Dialog::on_tick(uint32_t now, bool playback_drained)
 
     switch (phase_) {
     case Phase::Listening:
-        if (now - listen_ms_ >= kMaxListenMs) {
+        if (elapsed(now, listen_ms_) >= kMaxListenMs) {
             o.listen_stop = true;
             listen_wake_ = false;
             phase_ = Phase::Thinking;
@@ -209,7 +213,7 @@ Out Dialog::on_tick(uint32_t now, bool playback_drained)
         }
         break;
     case Phase::Thinking:
-        if (now - last_server_ms_ > kThinkTimeoutMs) {
+        if (elapsed(now, last_server_ms_) > kThinkTimeoutMs) {
             // сервер молчит: сообщаем, просим его бросить и показываем ошибку
             snprintf(err_msg_, sizeof(err_msg_), "%s", "Нет ответа от ноутбука.");
             phase_ = Phase::Error;
@@ -222,10 +226,10 @@ Out Dialog::on_tick(uint32_t now, bool playback_drained)
     case Phase::Speaking:
         if (audio_open_ && audio_ended_ && playback_drained) {
             to_idle(now, &o);
-        } else if (audio_open_ && !audio_ended_ && now - last_audio_ms_ > kSpeakStallMs) {
+        } else if (audio_open_ && !audio_ended_ && elapsed(now, last_audio_ms_) > kSpeakStallMs) {
             o.stop_playback = true;   // звук встал и конца нет: не висим в SPEAKING
             to_idle(now, &o);
-        } else if (!audio_open_ && now - last_server_ms_ > kSpeakStallMs) {
+        } else if (!audio_open_ && elapsed(now, last_server_ms_) > kSpeakStallMs) {
             to_idle(now, &o);
         }
         break;

@@ -17,6 +17,7 @@
 //   wake beep on | wake beep off   писк после слова
 //   wake thr <0.40..0.9999>|default  порог срабатывания (меньше = чувствительнее, больше ложных)
 //   wake silence <300..3000>       пауза в мс после речи, которая считается концом фразы (по умолчанию 800)
+//   wake gain <0..18>              усиление в дБ (целые) звука, который идёт в движок слова; для тихого микрофона (по умолчанию 0)
 //   echo                           диагностика звука: запись 4 с с микрофона и воспроизведение
 //   status                         одна строка состояния
 //   reboot                         перезагрузка
@@ -31,7 +32,7 @@ namespace cmd {
 
 enum class Kind { Empty, WifiSet, WifiClear, Tz, Lcd, Server, Echo, Wake, Status, Reboot, Help, Error };
 
-enum class WakeOp { Status, On, Off, BeepOn, BeepOff, Threshold, Silence };
+enum class WakeOp { Status, On, Off, BeepOn, BeepOff, Threshold, Silence, Gain };
 
 constexpr size_t kMaxSsid = 32;      // байт, предел стандарта 802.11
 constexpr size_t kMaxPass = 64;      // 8..63 символа или ровно 64 шестнадцатеричные цифры
@@ -50,6 +51,7 @@ struct Command {
     WakeOp wake_op = WakeOp::Status;     // Kind::Wake
     float wake_thr = 0.0f;               // Kind::Wake, Threshold: 0 = default (стандартный порог модели)
     uint32_t wake_ms = 0;                // Kind::Wake, Silence
+    int wake_gain_db = 0;                // Kind::Wake, Gain
     // для Kind::Error: имя команды (или "cmd") и причина, обе строки статические, без пробелов
     const char *err_cmd = "cmd";
     const char *err_reason = "";

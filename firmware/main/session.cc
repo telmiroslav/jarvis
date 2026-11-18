@@ -197,12 +197,16 @@ bool wake_end(uint32_t at_ms, bool no_speech)
     return true;
 }
 
-void tick(uint32_t at_ms)
+void tick()
 {
     const bool drained = playback::drained();
     {
         std::lock_guard<std::mutex> lock(S.mu);
-            const dialog::Phase before = S.dlg.phase();
+        // Часы читаем здесь, уже под замком, как и обработчики сообщений сервера (on_message, on_audio, on_ready): тогда метка
+        // тика не может оказаться раньше метки сообщения, принятого, пока главный цикл ждал замок. Время, взятое главным
+        // циклом в начале прохода, под нагрузкой отставало и обрывало ответ (v0.4.0: «звук не приходил 49 суток»).
+        const uint32_t at_ms = now_ms();
+        const dialog::Phase before = S.dlg.phase();
         apply(S.dlg.on_tick(at_ms, drained));
         if (S.dlg.phase() != before) {
             ESP_LOGI(TAG, "dialog: %s -> %s", dialog::phase_name(before), dialog::phase_name(S.dlg.phase()));

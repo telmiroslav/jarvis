@@ -1,17 +1,20 @@
 #include "wake_logic.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "dsp.h"
+#include "time_util.h"
 
 namespace jarvis {
 namespace wake_logic {
 
 namespace {
 
-// now >= t с учётом переполнения 32-битных миллисекунд
-bool reached(uint32_t now, uint32_t t) { return static_cast<int32_t>(now - t) >= 0; }
+// now >= t с учётом переполнения 32-битных миллисекунд (и elapsed(): мс от t до now, метка из будущего = 0, см. time_util.h)
+using timeutil::elapsed;
+using timeutil::reached;
 
 int64_t max64(int64_t a, int64_t b) { return a > b ? a : b; }
 int64_t min64(int64_t a, int64_t b) { return a < b ? a : b; }
@@ -108,14 +111,14 @@ Out Machine::finish(StopReason r, uint32_t now)
 
 Out Machine::check_recording(uint32_t now)
 {
-    if (now - rec_start_ >= kMaxRecordMs) {
+    if (elapsed(now, rec_start_) >= kMaxRecordMs) {
         return finish(StopReason::MaxLength, now);
     }
     if (!speech_started_) {
-        if (now - rec_start_ >= kNoSpeechMs) {
+        if (elapsed(now, rec_start_) >= kNoSpeechMs) {
             return finish(StopReason::NoSpeech, now);
         }
-    } else if (now - last_speech_ >= silence_ms_) {
+    } else if (elapsed(now, last_speech_) >= silence_ms_) {
         return finish(StopReason::Silence, now);
     }
     return Out();
@@ -124,7 +127,7 @@ Out Machine::check_recording(uint32_t now)
 Out Machine::on_tick(const Cond &c, uint32_t now)
 {
     if (have_tick_ && state_ == State::Armed) {
-        stats_.armed_ms += now - last_tick_;
+        stats_.armed_ms += elapsed(now, last_tick_);
     }
     have_tick_ = true;
     last_tick_ = now;
@@ -165,7 +168,7 @@ Out Machine::on_tick(const Cond &c, uint32_t now)
             ok_valid_ = true;
             ok_since_ = now;
         }
-        state_ = (now - ok_since_ >= kResumeMs) ? State::Armed : State::Resuming;
+        state_ = (elapsed(now, ok_since_) >= kResumeMs) ? State::Armed : State::Resuming;
     }
     return Out();
 }
@@ -298,6 +301,19 @@ const char *idle_hint(bool wake_on_and_ready, bool didnt_hear_active)
 }
 
 bool thr_valid(float t) { return t >= kThresholdMin && t <= kThresholdMax; }
+
+bool gain_valid(int db) { return db >= kGainMinDb && db <= kGainMaxDb; }
+
+float gain_db_to_linear(int db)
+{
+    if (db < kGainMinDb) {
+        db = kGainMinDb;
+    }
+    if (db > kGainMaxDb) {
+        db = kGainMaxDb;
+    }
+    return powf(10.0f, static_cast<float>(db) / 20.0f);
+}
 
 bool parse_model_thresholds(const char *info, float *thr90, float *thr95)
 {

@@ -127,6 +127,9 @@ float rms_dbfs_i16(const int16_t *buf, size_t n);
 // Возвращает применённое усиление в дБ (0 для тишины).
 float normalize_peak(int16_t *buf, size_t n, float target_dbfs, float max_gain_db);
 
+// Умножает буфер на gain (линейное усиление) с насыщением по int16, на месте. gain <= 0 даёт тишину. gain == 1: без изменений.
+void scale_i16_sat(int16_t *buf, size_t n, float gain);
+
 // Плавное нарастание в начале и затухание в конце (fade_samples отсчётов), чтобы не щёлкало.
 void apply_fade(int16_t *buf, size_t n, size_t fade_samples);
 

@@ -410,7 +410,9 @@ Status status()
         s.last_fail = C.last_fail;
         s.last_reason = C.last_reason;
         s.attempts = C.attempts;
-        s.down_ms = C.down_since_ms == 0 ? 0 : static_cast<uint32_t>(uptime_ms() - C.down_since_ms);
+        // Часы читаем под замком, но метку могла поставить другая задача чуть позже: отрицательное «сколько мс нет связи» = 0
+        const int64_t down = C.down_since_ms == 0 ? 0 : uptime_ms() - C.down_since_ms;
+        s.down_ms = down > 0 ? static_cast<uint32_t>(down) : 0u;
     }
     s.time_synced = C.time_synced.load();
     if (s.state == State::Connected) {

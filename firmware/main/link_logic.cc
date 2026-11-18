@@ -6,6 +6,8 @@
 #include <string.h>
 #include <strings.h>
 
+#include "time_util.h"
+
 namespace jarvis {
 namespace link_logic {
 
@@ -369,7 +371,7 @@ Actions Fsm::on_pong(uint32_t now)
 {
     Actions a;
     if (ping_sent_ != 0) {
-        rtt_ms_ = static_cast<int>(now - ping_sent_);
+        rtt_ms_ = static_cast<int>(timeutil::elapsed(now, ping_sent_));
         ping_sent_ = 0;
     }
     return a;
@@ -384,35 +386,38 @@ Actions Fsm::tick(uint32_t now)
     case Phase::NoUrl:
         break;
     case Phase::Connecting:
-        if (now - phase_since_ > kConnectTimeoutMs) {
+        if (timeutil::elapsed(now, phase_since_) > kConnectTimeoutMs) {
             fail(now, &a);
         }
         break;
     case Phase::Handshake:
-        if (now - phase_since_ > kWelcomeTimeoutMs) {
+        if (timeutil::elapsed(now, phase_since_) > kWelcomeTimeoutMs) {
             fail(now, &a);
         }
         break;
     case Phase::Ready:
+        // Пока связь есть, поиск не идёт, а срок следующего не должен стареть: через 24 суток знаковое сравнение
+        // reached() сочло бы его «ещё не наступившим». После потери связи поиск начинается сразу, как и раньше.
+        next_discover_ = now;
         if (ping_sent_ != 0) {
-            if (now - ping_sent_ > kPongTimeoutMs) {
+            if (timeutil::elapsed(now, ping_sent_) > kPongTimeoutMs) {
                 fail(now, &a);
             }
-        } else if (now - last_tx_ >= kPingEveryMs) {
+        } else if (timeutil::elapsed(now, last_tx_) >= kPingEveryMs) {
             a.send_ping = true;
             ping_sent_ = now ? now : 1;
             last_tx_ = now;
         }
         break;
     case Phase::Backoff:
-        if (now >= backoff_until_) {
+        if (timeutil::reached(now, backoff_until_)) {
             enter(Phase::Connecting, now);
             a.connect = true;
         }
         break;
     }
     // Поиск идёт, пока связи нет (и после каждой потери), но не при адресе, заданном руками
-    if (!manual_ && phase_ != Phase::Ready && now >= next_discover_) {
+    if (!manual_ && phase_ != Phase::Ready && timeutil::reached(now, next_discover_)) {
         a.discover = true;
         next_discover_ = now + kDiscoverEveryMs;
     }
@@ -421,7 +426,7 @@ Actions Fsm::tick(uint32_t now)
 
 uint32_t Fsm::down_ms(uint32_t now) const
 {
-    return down_since_ == 0 ? 0 : now - down_since_;
+    return down_since_ == 0 ? 0 : timeutil::elapsed(now, down_since_);
 }
 
 // ---------------------------------------------------------------- подсказка

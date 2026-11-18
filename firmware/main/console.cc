@@ -113,16 +113,31 @@ void run_wake(const cmd::Command &c)
         } else {
             snprintf(last, sizeof(last), "never");
         }
-        reply("WAKE %s state=%s engine=%s model=%s thr=%s default_thr=%.3f beep=%s silence_ms=%u detections=%u ignored=%u speech_stops=%u "
+        reply("WAKE %s state=%s engine=%s model=%s thr=%s default_thr=%.3f beep=%s gain_db=%d silence_ms=%u detections=%u ignored=%u speech_stops=%u "
               "false_stops=%u cap_stops=%u button_stops=%u last=%s mic=%.1fdBFS peak=%.1fdBFS frames=%u dropped=%u/%u speech=%u%% "
               "chunk=%d",
               s.enabled ? "on" : "off", state, s.available ? "running" : s.why, s.model, thr, static_cast<double>(s.thr_default), s.beep ? "on" : "off",
-              static_cast<unsigned>(s.silence_ms), static_cast<unsigned>(s.stats.detections), static_cast<unsigned>(s.stats.rejected),
+              s.gain_db, static_cast<unsigned>(s.silence_ms), static_cast<unsigned>(s.stats.detections), static_cast<unsigned>(s.stats.rejected),
               static_cast<unsigned>(s.stats.silence_stops), static_cast<unsigned>(s.stats.nospeech_stops),
               static_cast<unsigned>(s.stats.cap_stops), static_cast<unsigned>(s.stats.button_stops), last,
               static_cast<double>(s.mic_rms_dbfs), static_cast<double>(s.mic_peak_dbfs), static_cast<unsigned>(s.frames),
               static_cast<unsigned>(s.ring_overruns), static_cast<unsigned>(s.afe_errors), static_cast<unsigned>(s.speech_pct),
               s.feed_chunk);
+        if (s.available) {
+            // Измерения движка: каждая строка короче 200 символов (./tools/flash.sh cmd обрезает длиннее)
+            const wake::PerfInfo p = wake::perf_info();
+            if (p.since_boot[0]) {
+                reply("WAKE perf since_boot: %s", p.since_boot);
+            }
+            if (p.period_frames[0]) {
+                reply("WAKE perf last_30s: %s", p.period_frames);
+                reply("WAKE perf last_30s: %s", p.period_cpu);
+            }
+            if (p.rec_frames[0]) {
+                reply("WAKE perf %s: %s", p.rec_head, p.rec_frames);
+                reply("WAKE perf %s: %s", p.rec_head, p.rec_cpu);
+            }
+        }
         break;
     }
     case WakeOp::On:
@@ -164,6 +179,13 @@ void run_wake(const cmd::Command &c)
     case WakeOp::Silence:
         if (wake::set_silence_ms(c.wake_ms)) {
             reply("WAKE OK silence %u", static_cast<unsigned>(c.wake_ms));
+        } else {
+            reply("ERR wake save_failed");
+        }
+        break;
+    case WakeOp::Gain:
+        if (wake::set_gain_db(c.wake_gain_db)) {
+            reply("WAKE OK gain %d dB (only for the wake word engine, the audio to the server is unchanged)", c.wake_gain_db);
         } else {
             reply("ERR wake save_failed");
         }
@@ -250,7 +272,7 @@ void run_command(const cmd::Command &c)
         break;
     case cmd::Kind::Help:
         reply("HELP wifi_set <ssid><TAB><password> | wifi_clear | tz <POSIX TZ> | lcd <1-6> | server [ws://ip:port/ws|auto] | "
-              "wake [on|off|beep on|beep off|thr <0.40-0.9999|default>|silence <300-3000 ms>] | echo | status | reboot");
+              "wake [on|off|beep on|beep off|thr <0.40-0.9999|default>|silence <300-3000 ms>|gain <0-18 dB>] | echo | status | reboot");
         break;
     case cmd::Kind::Error:
         reply("ERR %s %s", c.err_cmd, c.err_reason);

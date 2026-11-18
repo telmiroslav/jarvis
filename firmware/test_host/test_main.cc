@@ -23,8 +23,10 @@
 #include "proto.h"
 #include "subtitle.h"
 #include "text_util.h"
+#include "time_util.h"
 #include "ui_logic.h"
 #include "wake_logic.h"
+#include "wake_perf.h"
 
 using namespace jarvis;
 
@@ -801,6 +803,22 @@ static void test_commands_wake()
     CHECK(c.kind == Kind::Wake && c.wake_ms == 300);
     c = cmd::parse_command("wake silence 3000");
     CHECK(c.kind == Kind::Wake && c.wake_ms == 3000);
+    // усиление звука для движка: целые дБ 0..18
+    c = cmd::parse_command("wake gain 6");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::Gain && c.wake_gain_db == 6);
+    c = cmd::parse_command("  WAKE  Gain   0 ");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::Gain && c.wake_gain_db == 0);
+    c = cmd::parse_command("wake gain 18");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::Gain && c.wake_gain_db == 18);
+    for (const char *b : {"wake gain 19", "wake gain -1", "wake gain 100"}) {
+        c = cmd::parse_command(b);
+        CHECK(c.kind == Kind::Error && strcmp(c.err_cmd, "wake") == 0 && strcmp(c.err_reason, "gain_range") == 0);
+    }
+    for (const char *b : {"wake gain", "wake gain x", "wake gain 6.5", "wake gain 6 7", "wake gain 6db"}) {
+        c = cmd::parse_command(b);
+        CHECK(c.kind == Kind::Error && strcmp(c.err_cmd, "wake") == 0 && strcmp(c.err_reason, "usage") == 0);
+    }
+    CHECK(strlen(cmd::describe_error("gain_range")) > 10 && strcmp(cmd::describe_error("gain_range"), "gain_range") != 0);
     c = cmd::parse_command("wake silence 299");
     CHECK(c.kind == Kind::Error && strcmp(c.err_reason, "silence_range") == 0);
     c = cmd::parse_command("wake silence 3001");
@@ -2944,6 +2962,386 @@ static void test_wake_flow()
 
 // ---------------------------------------------------------------- wifi_set и порядок запуска сети
 
+// ---------------------------------------------------------------- метки времени из разных задач (баг v0.4.0: ответ обрывался)
+
+static void test_timeutil()
+{
+    using timeutil::elapsed;
+    using timeutil::reached;
+    CHECK(elapsed(1000, 400) == 600 && elapsed(1000, 1000) == 0);
+    CHECK(elapsed(1000, 1005) == 0);                  // метка позже now: 0, а не ~4 млрд
+    CHECK(elapsed(1000, 1000 + 0x40000000u) == 0);
+    CHECK(elapsed(5, 0xFFFFFFF0u) == 21);             // через переполнение счётчика
+    CHECK(elapsed(100u + 0x7fffffffu, 100u) == 0x7fffffffu);   // самая давняя метка, которую можно отличить: 24,8 суток
+    CHECK(elapsed(100u + 0x80000000u, 100u) == 0);             // старше неотличима от «будущей»: тоже 0 (тайм-аутам в секунды всё равно)
+    CHECK(reached(1000, 1000) && reached(1001, 1000) && !reached(999, 1000));
+    CHECK(reached(5, 0xFFFFFFF0u) && !reached(0xFFFFFFF0u, 5));
+}
+
+// Доводит автомат до Thinking: связь, зажали BOOT на 0,3 с, отпустили (t после вызова = момент отпускания)
+static void dialog_to_thinking(dialog::Dialog &d, Rec &r, uint32_t &t)
+{
+    r.add(d.on_link(true, t));
+    r.add(d.on_press(t));
+    run_ticks(d, r, t, 300);
+    r.add(d.on_release(t));
+}
+
+// Главный цикл берёт «сейчас» (T) и только потом зовёт on_tick(T), а за это время сетевая задача приняла сообщения с метками
+// T+1..T+5. start подбирается и так, чтобы счётчик мс переполнялся посреди сценария.
+static void check_dialog_future_stamps(uint32_t start)
+{
+    using dialog::Phase;
+    using proto::ServerState;
+
+    // Точная последовательность из лога платы: state speaking, audio_start, первый кадр звука с меткой позже тика
+    {
+        dialog::Dialog d;
+        Rec r;
+        uint32_t t = start;
+        dialog_to_thinking(d, r, t);
+        run_ticks(d, r, t, 3000);
+        CHECK(d.phase() == Phase::Thinking);
+        const uint32_t T = t;                                  // главный цикл взял now
+        r.add(d.on_server_state(ServerState::Speaking, nullptr, T + 1));
+        const dialog::Out as = d.on_audio_start(T + 5);
+        CHECK(as.begin_playback && d.phase() == Phase::Speaking);
+        CHECK(d.on_audio_data(T + 5));
+        const dialog::Out o = d.on_tick(T, false);             // ... и только теперь зовёт on_tick со старым now
+        CHECK(d.phase() == Phase::Speaking);                   // раньше: SPEAKING -> IDLE через 0,3 с после audio_start
+        CHECK(!o.stop_playback && !o.any());
+        CHECK(d.accept_audio());
+        // дальше обычные тики и звук идут дальше
+        t = T;
+        for (int i = 0; i < 200; i++) {
+            t += 10;
+            CHECK(d.on_audio_data(t + 3));                     // звук всегда чуть «впереди» тика
+            const dialog::Out ot = d.on_tick(t, false);
+            CHECK(d.phase() == Phase::Speaking && !ot.stop_playback);
+        }
+        // настоящий обрыв звука по-прежнему ловится: kSpeakStallMs без кадров, а audio_end нет
+        Rec r2;
+        run_ticks(d, r2, t, dialog::kSpeakStallMs - 100);
+        CHECK(d.phase() == Phase::Speaking && r2.stop_playback == 0);
+        run_ticks(d, r2, t, 300);
+        CHECK(d.phase() == Phase::Idle && r2.stop_playback == 1);
+    }
+
+    // То же, когда audio_start ещё не пришёл (только state speaking с меткой позже тика)
+    {
+        dialog::Dialog d;
+        Rec r;
+        uint32_t t = start;
+        dialog_to_thinking(d, r, t);
+        const uint32_t T = t + 50;
+        r.add(d.on_server_state(ServerState::Speaking, nullptr, T + 4));
+        CHECK(d.phase() == Phase::Speaking);
+        const dialog::Out o = d.on_tick(T, false);
+        CHECK(d.phase() == Phase::Speaking && !o.any());
+    }
+
+    // Тайм-аут «сервер молчит после listen_stop»: метка последнего слова сервера позже тика не должна его вызывать
+    {
+        dialog::Dialog d;
+        Rec r;
+        uint32_t t = start;
+        dialog_to_thinking(d, r, t);
+        run_ticks(d, r, t, 2000);
+        const uint32_t T = t;
+        r.add(d.on_server_state(ServerState::Thinking, nullptr, T + 5));
+        CHECK(d.accept_text(T + 6));                           // и текст: touch() тоже ставит метку позже
+        const dialog::Out o = d.on_tick(T, false);
+        CHECK(d.phase() == Phase::Thinking && !o.abort && !o.stop_playback);   // раньше: ERROR «Нет ответа от ноутбука»
+        // настоящее молчание сервера ловится как раньше
+        t = T + 6;
+        Rec r2;
+        run_ticks(d, r2, t, dialog::kThinkTimeoutMs - 100);
+        CHECK(d.phase() == Phase::Thinking && r2.abort == 0);
+        run_ticks(d, r2, t, 300);
+        CHECK(d.phase() == Phase::Error && r2.abort == 1);
+    }
+
+    // Предел записи (kMaxListenMs): запись началась словом с меткой позже тика
+    {
+        dialog::Dialog d;
+        uint32_t T = start;
+        d.on_link(true, T);
+        const dialog::Out w = d.on_wake_start(T + 5);
+        CHECK(w.listen_start && d.phase() == Phase::Listening);
+        const dialog::Out o = d.on_tick(T, false);
+        CHECK(d.phase() == Phase::Listening && !o.listen_stop);   // раньше: сразу «15 с прошло», listen_stop и THINKING
+        // настоящий предел работает
+        Rec r;
+        uint32_t t = T + 5;
+        run_ticks(d, r, t, dialog::kMaxListenMs - 100);
+        CHECK(d.phase() == Phase::Listening && r.listen_stop == 0);
+        run_ticks(d, r, t, 300);
+        CHECK(d.phase() == Phase::Thinking && r.listen_stop == 1);
+    }
+
+    // Удержание BOOT (kHoldMs): нажатие с меткой позже тика не должно сразу стать записью
+    {
+        dialog::Dialog d;
+        uint32_t T = start;
+        d.on_link(true, T);
+        const dialog::Out p = d.on_press(T + 5);
+        CHECK(p.capture_begin);
+        dialog::Out o = d.on_tick(T, false);
+        CHECK(!o.listen_start && d.phase() == Phase::Idle);       // раньше: запись начиналась мгновенно
+        Rec r;
+        uint32_t t = T + 5;
+        run_ticks(d, r, t, dialog::kHoldMs - 20);
+        CHECK(r.listen_start == 0);
+        run_ticks(d, r, t, 40);
+        CHECK(r.listen_start == 1 && d.phase() == Phase::Listening);
+    }
+}
+
+static void test_time_skew()
+{
+    // Диалог: и без переполнения, и когда счётчик мс переполняется посреди сценария
+    check_dialog_future_stamps(1000);
+    check_dialog_future_stamps(0xFFFFFFFFu - 2500u);
+    check_dialog_future_stamps(0xFFFFFFFFu - 20000u);
+
+    // Связь с сервером: любая отправка (on_tx) другой задачей ставит метку чуть позже now главного цикла связи
+    {
+        using namespace link_logic;
+        const char *URL = "ws://192.168.1.5:47801/ws";
+        Fsm f;
+        f.on_wifi(true, 0);
+        f.set_url(URL, false, 0);
+        f.on_ws_connected(10);
+        f.on_welcome(20);
+        f.on_tx(5000 + 5);
+        CHECK(!f.tick(5000).send_ping);   // раньше: «10 с без трафика» и лишний ping при каждой отправке listen_start/abort
+        f.on_tx(25000 + 5);
+        CHECK(!f.tick(25000).send_ping);
+        // ping и pong: pong с меткой чуть раньше ping не даёт отрицательный rtt
+        Actions a = f.tick(40000);
+        CHECK(a.send_ping);
+        f.on_pong(39999);
+        CHECK(f.rtt_ms() == 0);
+
+        // Адрес задан другой задачей (команда server) уже после того, как задача связи взяла now: подключение не отказ
+        Fsm g;
+        g.on_wifi(true, 1000);
+        g.set_url(URL, false, 1005);
+        CHECK(g.phase() == Phase::Connecting);
+        a = g.tick(1000);
+        CHECK(!a.disconnect && g.phase() == Phase::Connecting);   // раньше: «подключение не открылось за 8 с» сразу
+        a = g.tick(1005 + kConnectTimeoutMs);
+        CHECK(!a.disconnect);
+        a = g.tick(1005 + kConnectTimeoutMs + 1);
+        CHECK(a.disconnect && g.phase() == Phase::Backoff);
+        // Welcome: то же самое
+        Fsm h;
+        h.on_wifi(true, 0);
+        h.set_url(URL, false, 0);
+        h.on_ws_connected(2005);
+        CHECK(!h.tick(2000).disconnect && h.phase() == Phase::Handshake);
+        // down_ms с меткой потери связи позже now: 0
+        Fsm k;
+        k.on_wifi(true, 1000);
+        CHECK(k.down_ms(1000) == 0);
+        k.on_wifi(false, 3000);
+        k.on_wifi(true, 3005);
+        CHECK(k.down_ms(3000) == 0 && k.down_ms(3105) == 100);
+        // Через 25 суток связи без потерь (срок поиска не стареет): после обрыва поиск начинается сразу, как и раньше
+        Fsm m;
+        m.on_wifi(true, 0);
+        m.set_url(URL, false, 0);
+        m.on_ws_connected(10);
+        m.on_welcome(20);
+        uint32_t tt = 0;
+        const uint32_t day25 = 25u * 24u * 3600u * 1000u;
+        while (tt < day25) {
+            tt += 5u * 3600u * 1000u;   // раз в 5 часов
+            m.on_tx(tt - 1);
+            m.tick(tt);
+        }
+        CHECK(m.ready());
+        Actions lost = m.on_ws_disconnected(tt + 10);
+        CHECK(lost.disconnect && m.phase() == Phase::Backoff);
+        Actions nx = m.tick(tt + 20);
+        CHECK(nx.discover);
+    }
+
+    // Слово: автомат слова тоже не должен считать «прошло 49 суток» из-за меток из будущего
+    {
+        using namespace wake_logic;
+        Machine m;
+        uint32_t t = 1000;
+        Cond c = all_ok_cond();
+        m.on_tick(c, t);
+        wake_run(m, c, t, kResumeMs + 20);
+        CHECK(m.armed());
+        const uint32_t armed0 = m.stats().armed_ms;
+        m.on_tick(c, t - 5);                               // часы вызова чуть позади предыдущего
+        CHECK(m.stats().armed_ms - armed0 < 100);          // раньше: +4 млрд мс «на взводе»
+        const Out d = m.on_detect(t + 5);                  // метка начала записи чуть позже следующего тика
+        CHECK(d.start && m.recording());
+        CHECK(m.recording_ms(t) == 0);
+        Cond cl = c;
+        cl.dialog_idle = false;
+        cl.dialog_listening = true;
+        const Out o = m.on_tick(cl, t);
+        CHECK(!o.stop && m.recording());                   // раньше: MaxLength сразу
+    }
+}
+
+// ---------------------------------------------------------------- измерения движка слова и усиление
+
+static void test_wake_perf()
+{
+    using namespace wake_perf;
+
+    // pending_frames: подано минус получено, не отрицательно, с переполнением счётчика
+    CHECK(pending_frames(10, 4) == 6 && pending_frames(4, 4) == 0 && pending_frames(4, 5) == 0);
+    CHECK(pending_frames(3, 0xFFFFFFFEu) == 5);
+
+    // FrameAcc
+    FrameAcc a;
+    CHECK(a.frames == 0 && a.proc_avg_ms() == 0.0f);
+    a.add(10000, 12000, 0);
+    a.add(30000, 64000, 2);
+    a.add(40000, 640000, 20);      // дольше 32 мс = медленнее реального времени
+    CHECK(a.frames == 3 && a.slow == 1);
+    CHECK_NEAR(a.proc_avg_ms(), 26.666, 0.01);
+    CHECK_NEAR(a.proc_max_ms(), 40.0, 1e-4);
+    CHECK_NEAR(a.lag_max_ms(), 640.0, 1e-4);
+    CHECK(a.backlog_max == 20);
+    FrameAcc b;
+    b.add(5000, 1000, 1);
+    b.ring_full = 3;
+    b.yields = 2;
+    merge(&a, b);
+    CHECK(a.frames == 4 && a.ring_full == 3 && a.yields == 2 && a.proc_max_us == 40000 && a.backlog_max == 20 && a.slow == 1);
+    a.clear();
+    CHECK(a.frames == 0 && a.proc_max_us == 0 && a.ring_full == 0);
+    // граница: ровно 32 мс не считается медленным
+    a.add(32000, 32000, 0);
+    CHECK(a.slow == 0);
+    a.add(32001, 32001, 0);
+    CHECK(a.slow == 1);
+
+    // Названия задач
+    CHECK(classify_task("wake_fetch") == Group::Fetch && classify_task("wake_feed") == Group::Feed);
+    CHECK(classify_task("taskLVGL") == Group::Lvgl && classify_task("main") == Group::Main);
+    CHECK(classify_task("link") == Group::Link && classify_task("websocket_task") == Group::Link);
+    CHECK(classify_task("audio_in") == Group::Audio && classify_task("audio_out") == Group::Audio);
+    CHECK(classify_task("wifi") == Group::Wifi && classify_task("tiT") == Group::Wifi);
+    CHECK(classify_task("IDLE0") == Group::Idle0 && classify_task("IDLE1") == Group::Idle1);
+    CHECK(classify_task("esp_timer") == Group::Other && classify_task("console") == Group::Other && classify_task(nullptr) == Group::Other);
+    for (size_t g = 0; g < kGroupCount; g++) {
+        CHECK(strcmp(group_name(static_cast<Group>(g)), "?") != 0);
+    }
+
+    // Доли процессора между снимками: окно 1 с, fetch 600 мс, LVGL 700 мс, IDLE0 300 мс, IDLE1 250 мс
+    Snapshot p, c;
+    p.valid = c.valid = true;
+    p.total_us = 5000000;
+    c.total_us = 6000000;
+    p.n = 5;
+    p.t[0] = {1, 100000, Group::Fetch};
+    p.t[1] = {2, 200000, Group::Lvgl};
+    p.t[2] = {3, 3000000, Group::Idle0};
+    p.t[3] = {4, 3500000, Group::Idle1};
+    p.t[4] = {5, 10000, Group::Other};
+    c.n = 7;
+    c.t[0] = {1, 700000, Group::Fetch};
+    c.t[1] = {2, 900000, Group::Lvgl};
+    c.t[2] = {3, 3300000, Group::Idle0};
+    c.t[3] = {4, 3750000, Group::Idle1};
+    c.t[4] = {5, 40000, Group::Other};
+    c.t[5] = {6, 20000, Group::Other};     // создана внутри окна: считается с нуля
+    c.t[6] = {7, 30000, Group::Link};
+    CpuShare s = cpu_share(p, c);
+    CHECK(s.valid && s.window_ms == 1000);
+    CHECK_NEAR(s.pct[static_cast<size_t>(Group::Fetch)], 60.0, 1e-3);
+    CHECK_NEAR(s.pct[static_cast<size_t>(Group::Lvgl)], 70.0, 1e-3);
+    CHECK_NEAR(s.pct[static_cast<size_t>(Group::Idle0)], 30.0, 1e-3);
+    CHECK_NEAR(s.pct[static_cast<size_t>(Group::Idle1)], 25.0, 1e-3);
+    CHECK_NEAR(s.pct[static_cast<size_t>(Group::Other)], 5.0, 1e-3);   // (40-10) + 20 мс
+    CHECK_NEAR(s.pct[static_cast<size_t>(Group::Link)], 3.0, 1e-3);
+    CHECK_NEAR(s.pct[static_cast<size_t>(Group::Feed)], 0.0, 1e-6);
+    // переполнение 32-битных счётчиков мкс посреди окна
+    p.total_us = 0xFFFFFF00u;
+    c.total_us = 0xFFFFFF00u + 1000000u;
+    p.t[0].run_us = 0xFFFFFFF0u;
+    c.t[0].run_us = 0xFFFFFFF0u + 500000u;
+    s = cpu_share(p, c);
+    CHECK(s.valid && fabsf(s.pct[static_cast<size_t>(Group::Fetch)] - 50.0f) < 0.01f);
+    // не годятся: нет снимков, окно короче мс, окно «в прошлое»
+    Snapshot inv;
+    CHECK(!cpu_share(inv, c).valid && !cpu_share(p, inv).valid);
+    Snapshot c2 = c;
+    c2.total_us = p.total_us + 500;
+    CHECK(!cpu_share(p, c2).valid);
+    c2.total_us = p.total_us - 1000;
+    CHECK(!cpu_share(p, c2).valid);
+
+    // Текст
+    char buf[256];
+    FrameAcc f;
+    f.add(11300, 64000, 2);
+    f.add(29000, 640000, 20);
+    f.ring_full = 15;
+    size_t n = format_frames(f, buf, sizeof(buf));
+    CHECK(n == strlen(buf) && strstr(buf, "fetch avg 20.1 max 29.0 ms/frame") != nullptr);
+    CHECK(strstr(buf, "slow 0 of 2") != nullptr && strstr(buf, "lag max 640 ms") != nullptr);
+    CHECK(strstr(buf, "AFE backlog max 20/50 frames (640 ms)") != nullptr && strstr(buf, "ring full 15") != nullptr);
+    n = format_frames(FrameAcc(), buf, sizeof(buf));
+    CHECK(strcmp(buf, "fetch: no frames") == 0 && n == strlen(buf));
+    n = format_cpu(s, buf, sizeof(buf));
+    CHECK(n == strlen(buf) && strncmp(buf, "cpu% fetch 50 feed 0 lvgl 70 main 0 link 3 audio 0 wifi 0 other 5 | idle0 30 idle1 25", 40) == 0);
+    CHECK(strstr(buf, "| idle0 30 idle1 25") != nullptr);
+    n = format_cpu(s, buf, sizeof(buf), true);
+    CHECK(strncmp(buf, "cpu%=fetch:50,feed:0,lvgl:70,", 29) == 0 && strstr(buf, ",idle0:30,idle1:25") != nullptr && strchr(buf, ' ') == nullptr);
+    format_cpu(CpuShare(), buf, sizeof(buf));
+    CHECK(strcmp(buf, "cpu% n/a") == 0);
+    format_cpu(CpuShare(), buf, sizeof(buf), true);
+    CHECK(strcmp(buf, "cpu%=n/a") == 0);
+    // короткий буфер: обрезается, всегда с нулём и без выхода за границы (ASan проверит)
+    for (size_t cap = 0; cap < 40; cap++) {
+        char small[48];
+        memset(small, 'x', sizeof(small));
+        const size_t w1 = format_cpu(s, small, cap);
+        CHECK(cap == 0 ? small[0] == 'x' : (w1 < cap && small[w1] == '\0'));
+        const size_t w2 = format_frames(f, small, cap);
+        CHECK(cap == 0 ? true : (w2 < cap && small[w2] == '\0'));
+    }
+}
+
+static void test_wake_gain()
+{
+    using namespace wake_logic;
+    // допустимые значения и множители 10^(дБ/20)
+    CHECK(gain_valid(0) && gain_valid(6) && gain_valid(18) && !gain_valid(-1) && !gain_valid(19));
+    CHECK_NEAR(gain_db_to_linear(0), 1.0, 1e-6);
+    CHECK_NEAR(gain_db_to_linear(6), 1.9953, 1e-3);
+    CHECK_NEAR(gain_db_to_linear(12), 3.9811, 1e-3);
+    CHECK_NEAR(gain_db_to_linear(18), 7.9433, 1e-3);
+    CHECK_NEAR(gain_db_to_linear(99), gain_db_to_linear(18), 1e-6);   // вне пределов зажимается
+    CHECK_NEAR(gain_db_to_linear(-5), 1.0, 1e-6);
+
+    // усиление блока с насыщением, на месте
+    int16_t buf[6] = {0, 1000, -1000, 20000, -20000, 32767};
+    dsp::scale_i16_sat(buf, 6, 1.0f);
+    CHECK(buf[1] == 1000 && buf[5] == 32767);                          // gain 1: без изменений
+    dsp::scale_i16_sat(buf, 6, gain_db_to_linear(6));
+    CHECK(buf[0] == 0 && buf[1] == 1995 && buf[2] == -1995);           // +6 дБ = x1.995
+    CHECK(buf[3] == 32767 && buf[4] == -32768 && buf[5] == 32767);     // насыщение вместо переполнения (без смены знака)
+    int16_t quiet[4] = {100, -100, 3, -3};
+    dsp::scale_i16_sat(quiet, 4, gain_db_to_linear(18));
+    CHECK(quiet[0] == 794 && quiet[1] == -794 && quiet[2] == 24 && quiet[3] == -24);
+    dsp::scale_i16_sat(quiet, 0, 2.0f);                                // пустой блок ничего не ломает
+    dsp::scale_i16_sat(nullptr, 4, 2.0f);
+    int16_t z[2] = {5, -5};
+    dsp::scale_i16_sat(z, 2, 0.0f);
+    CHECK(z[0] == 0 && z[1] == 0);
+}
+
 static void test_creds_gate()
 {
     using Gate = net_logic::CredsGate;
@@ -3137,6 +3535,10 @@ int main()
     test_wake_logic();
     test_wake_dialog();
     test_wake_flow();
+    test_timeutil();
+    test_time_skew();
+    test_wake_perf();
+    test_wake_gain();
     test_ui_logic();
     test_lcd_cfg();
     printf("%d checks, %d failed\n", g_checks, g_failed);

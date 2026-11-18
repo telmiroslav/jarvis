@@ -12,7 +12,7 @@ LVGL_CFLAGS := -O2 -std=gnu11 -DLV_CONF_INCLUDE_SIMPLE -DLV_LVGL_H_INCLUDE_SIMPL
 
 WARN := -Wall -Wextra -Wpedantic
 LOGIC_SRCS := test_main.cc $(MAIN)/dsp.cc $(MAIN)/text_util.cc $(MAIN)/ui_logic.cc $(MAIN)/cmd_parse.cc $(MAIN)/net_logic.cc \
-              $(MAIN)/proto.cc $(MAIN)/link_logic.cc $(MAIN)/pcm_queue.cc $(MAIN)/subtitle.cc $(MAIN)/dialog.cc $(MAIN)/face_logic.cc $(MAIN)/wake_logic.cc
+              $(MAIN)/proto.cc $(MAIN)/link_logic.cc $(MAIN)/pcm_queue.cc $(MAIN)/subtitle.cc $(MAIN)/dialog.cc $(MAIN)/face_logic.cc $(MAIN)/wake_logic.cc $(MAIN)/wake_perf.cc
 
 all: $(OUT)/test_main $(OUT)/render
 

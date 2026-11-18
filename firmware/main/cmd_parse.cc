@@ -220,6 +220,22 @@ Command parse_wake(const char *a)
         c.wake_ms = static_cast<uint32_t>(v);
         return c;
     }
+    if (word_eq(w, wl, "gain")) {
+        if (*arg == '\0') {
+            return make_error("wake", "usage");
+        }
+        char *endp = nullptr;
+        const long v = strtol(arg, &endp, 10);
+        if (endp == arg || *endp != '\0') {
+            return make_error("wake", "usage");
+        }
+        if (v < 0 || v > 18) {
+            return make_error("wake", "gain_range");
+        }
+        c.wake_op = WakeOp::Gain;
+        c.wake_gain_db = static_cast<int>(v);
+        return c;
+    }
     return make_error("wake", "usage");
 }
 
@@ -443,6 +459,7 @@ const char *describe_error(const char *reason)
         {"bad_url", "адрес сервера должен выглядеть так: ws://192.168.1.5:47801/ws (или server auto)"},
         {"thr_range", "порог слова от 0.40 до 0.9999 (или default); меньше = чувствительнее"},
         {"silence_range", "пауза после речи в миллисекундах, от 300 до 3000"},
+        {"gain_range", "усиление для слова в децибелах, целое число от 0 до 18"},
     };
     for (const Item &it : kItems) {
         if (strcmp(it.key, reason) == 0) {

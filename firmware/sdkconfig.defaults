@@ -74,3 +74,9 @@ CONFIG_SR_NSN_WEBRTC=y
 #     звук), поэтому оставлен 32 КБ по умолчанию; при старте движок напишет «Data cache recommends 64KB», это нормально.
 #     Если на плате не хватит процессора (в логе WAKE stat видно потерю кадров), включить CONFIG_ESP32S3_DATA_CACHE_64KB=y.
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
+# Загрузка процессора по задачам (счётчики времени FreeRTOS, uxTaskGetSystemState): строки «WAKE perf» и «WAKE stat» показывают,
+# сколько ядра съедают wake_fetch, LVGL, Wi-Fi и остальные (wake_perf.h). Цена: около 0,8 КБ кода в переключении задач
+# (внутренняя память) и по 12 байт на каждую задачу, то есть порядка 1 КБ; буферы измерений (около 4 КБ) лежат в PSRAM.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y

@@ -27,6 +27,7 @@ const char *kKeyWakeOn = "wake_on";
 const char *kKeyWakeBeep = "wake_beep";
 const char *kKeyWakeThr = "wake_thr";
 const char *kKeyWakeSil = "wake_sil";
+const char *kKeyWakeGain = "wake_gain";
 const char *kKeyWakeGuard = "wake_guard";
 
 bool g_ready = false;
@@ -290,6 +291,9 @@ WakeSettings get_wake()
             w.silence_ms = u16;
         }
     }
+    if (nvs_get_u8(h, kKeyWakeGain, &u8) == ESP_OK && wake_logic::gain_valid(u8)) {
+        w.gain_db = u8;   // мусор в NVS игнорируем: останется 0
+    }
     nvs_close(h);
     return w;
 }
@@ -335,6 +339,18 @@ bool set_wake_silence_ms(uint32_t ms)
         return false;
     }
     return commit_close(h, nvs_set_u16(h, kKeyWakeSil, static_cast<uint16_t>(ms)));
+}
+
+bool set_wake_gain_db(int db)
+{
+    if (!wake_logic::gain_valid(db)) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u8(h, kKeyWakeGain, static_cast<uint8_t>(db)));
 }
 
 bool get_wake_guard()

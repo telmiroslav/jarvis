@@ -1180,7 +1180,7 @@ void main_loop()
             }
             ignore_press = false;
         }
-        session::tick(static_cast<uint32_t>(now));
+        session::tick();
 
         // Слово «Джарвис»: условия, запись по слову, конец фразы. BOOT всегда главнее (решает dialog)
         {

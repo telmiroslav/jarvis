@@ -1,6 +1,7 @@
 #include "dsp.h"
 
 #include <math.h>
+#include <string.h>
 
 namespace jarvis {
 namespace dsp {
@@ -231,6 +232,20 @@ float normalize_peak(int16_t *buf, size_t n, float target_dbfs, float max_gain_d
         buf[i] = sat16(static_cast<int64_t>(lrintf(static_cast<float>(buf[i]) * gain)));
     }
     return gain_db;
+}
+
+void scale_i16_sat(int16_t *buf, size_t n, float gain)
+{
+    if (!buf || n == 0 || gain == 1.0f) {
+        return;
+    }
+    if (!(gain > 0.0f)) {
+        memset(buf, 0, n * sizeof(int16_t));
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        buf[i] = sat16(static_cast<int64_t>(lrintf(static_cast<float>(buf[i]) * gain)));
+    }
 }
 
 void apply_fade(int16_t *buf, size_t n, size_t fade_samples)
