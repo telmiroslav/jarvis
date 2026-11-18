@@ -41,7 +41,7 @@ def test_allowed_nets_narrow():
 
 
 def test_message_builders_match_protocol_md():
-    assert json.loads(P.welcome("0.2.0")) == {"type": "welcome", "proto": 1, "server": "0.2.0", "tts_rate": 24000}
+    assert json.loads(P.welcome("0.3.0")) == {"type": "welcome", "proto": 1, "server": "0.3.0", "tts_rate": 24000}
     assert json.loads(P.state("thinking")) == {"type": "state", "state": "thinking"}
     assert json.loads(P.state("error", "Нет связи")) == {"type": "state", "state": "error", "msg": "Нет связи"}
     assert "msg" not in json.loads(P.state("idle", "ignored"))
@@ -80,3 +80,9 @@ def test_listen_start_with_wake_mode_parses():
     assert m.type == "listen_start" and P.parse_listen_mode(m.data.get("mode")) == ("wake", True)
     m = P.parse_client_message('{"type":"listen_start"}')
     assert P.parse_listen_mode(m.data.get("mode")) == ("ptt", True)
+
+
+def test_follow_is_a_known_listen_mode():
+    assert P.parse_listen_mode("follow") == ("follow", True)
+    assert P.parse_listen_mode(" Follow ") == ("follow", True)
+    assert P.parse_listen_mode("follow!") == ("follow_", False)  # метка безопасна для лога, но режим не тот

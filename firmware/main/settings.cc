@@ -24,7 +24,11 @@ const char *kKeyLcd = "lcd_cfg";
 const char *kKeySrvUrl = "srv_url";
 const char *kKeySrvManual = "srv_manual";
 const char *kKeyWakeOn = "wake_on";
-const char *kKeyWakeBeep = "wake_beep";
+const char *kKeyWakeBeep = "wake_beep";          // булев до v0.4.1
+const char *kKeyWakeBeepLevel = "wake_beepl";   // уровень 0..5 с v0.4.2
+const char *kKeyWakeFollow = "wake_follow";
+const char *kKeyWakeBarge = "wake_barge";
+const char *kKeyWakeBargeThr = "wake_bthr";
 const char *kKeyWakeThr = "wake_thr";
 const char *kKeyWakeSil = "wake_sil";
 const char *kKeyWakeGain = "wake_gain";
@@ -276,10 +280,27 @@ WakeSettings get_wake()
     if (nvs_get_u8(h, kKeyWakeOn, &u8) == ESP_OK) {
         w.enabled = (u8 != 0);
     }
-    if (nvs_get_u8(h, kKeyWakeBeep, &u8) == ESP_OK) {
-        w.beep = (u8 != 0);
+    {
+        // Уровень писка. Новый ключ главнее, иначе старый булев: 0 -> 0, не 0 -> уровень по умолчанию (wake_logic.h)
+        uint8_t lv = 0, old = 0;
+        const bool has_level = nvs_get_u8(h, kKeyWakeBeepLevel, &lv) == ESP_OK;
+        const bool has_old = nvs_get_u8(h, kKeyWakeBeep, &old) == ESP_OK;
+        w.beep_level = wake_logic::beep_level_from_saved(has_level, lv, has_old, old);
+    }
+    if (nvs_get_u8(h, kKeyWakeBarge, &u8) == ESP_OK) {
+        w.barge = (u8 != 0);
     }
     uint16_t u16 = 0;
+    {
+        const bool has = nvs_get_u16(h, kKeyWakeFollow, &u16) == ESP_OK;
+        w.follow_ms = wake_logic::follow_from_saved(has, u16);   // нет ключа или мусор: 6000
+    }
+    if (nvs_get_u16(h, kKeyWakeBargeThr, &u16) == ESP_OK && u16 != 0) {
+        const float t = static_cast<float>(u16) / 10000.0f;
+        if (wake_logic::thr_valid(t)) {
+            w.barge_thr = t;
+        }
+    }
     if (nvs_get_u16(h, kKeyWakeThr, &u16) == ESP_OK && u16 != 0) {
         const float t = static_cast<float>(u16) / 10000.0f;
         if (wake_logic::thr_valid(t)) {
@@ -307,13 +328,54 @@ bool set_wake_enabled(bool on)
     return commit_close(h, nvs_set_u8(h, kKeyWakeOn, on ? 1 : 0));
 }
 
-bool set_wake_beep(bool on)
+bool set_wake_beep_level(int level)
+{
+    if (!wake_logic::beep_level_valid(level)) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    esp_err_t err = nvs_set_u8(h, kKeyWakeBeepLevel, static_cast<uint8_t>(level));
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, kKeyWakeBeep, level > 0 ? 1 : 0);   // старый ключ: откат на v0.4.1 понимает, включён ли писк
+    }
+    return commit_close(h, err);
+}
+
+bool set_wake_follow_ms(uint32_t ms)
+{
+    if (!wake_logic::follow_valid(ms)) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u16(h, kKeyWakeFollow, static_cast<uint16_t>(ms)));
+}
+
+bool set_wake_barge(bool on)
 {
     nvs_handle_t h;
     if (!open_rw(&h)) {
         return false;
     }
-    return commit_close(h, nvs_set_u8(h, kKeyWakeBeep, on ? 1 : 0));
+    return commit_close(h, nvs_set_u8(h, kKeyWakeBarge, on ? 1 : 0));
+}
+
+bool set_wake_barge_thr(float thr)
+{
+    if (thr != 0.0f && !wake_logic::thr_valid(thr)) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    const uint16_t v = thr == 0.0f ? 0 : static_cast<uint16_t>(thr * 10000.0f + 0.5f);
+    return commit_close(h, nvs_set_u16(h, kKeyWakeBargeThr, v));
 }
 
 bool set_wake_threshold(float thr)

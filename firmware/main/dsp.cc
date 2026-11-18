@@ -80,7 +80,7 @@ int16_t s24_to_pcm16(int32_t s24, int gain)
 // ------------------------------------------------------------------ анализ блока
 
 void analyze_block(const int32_t *words, size_t frames, DcBlocker *dc, int out_slot, int gain,
-                   int16_t *pcm_out, BlockStats *stats)
+                   int16_t *pcm_out, BlockStats *stats, int16_t *pcm_out2, int gain2)
 {
     int64_t sum_sq[2] = {0, 0};
     int32_t peak[2] = {0, 0};
@@ -105,6 +105,9 @@ void analyze_block(const int32_t *words, size_t frames, DcBlocker *dc, int out_s
             }
             if (pcm_out && s == out_slot) {
                 pcm_out[i] = s24_to_pcm16(yi, gain);
+            }
+            if (pcm_out2 && s == out_slot) {
+                pcm_out2[i] = s24_to_pcm16(yi, gain2);
             }
         }
     }

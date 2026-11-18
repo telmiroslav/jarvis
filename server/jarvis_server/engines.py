@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -34,7 +35,22 @@ class Engines:
         return await asyncio.get_running_loop().run_in_executor(self._stt_pool, self.stt.transcribe, pcm16)
 
     async def run_tts(self, text: str) -> np.ndarray:
-        return await asyncio.get_running_loop().run_in_executor(self._tts_pool, self.tts.synth, text)
+        """Синтез в потоке. Если ждущую задачу отменили (abort, новая запись, обрыв связи), синтез в потоке прерывается
+        на ближайшем шаге модели: поток один, и иначе следующая фраза ждала бы, пока досчитается уже ненужная."""
+        cancel = threading.Event()
+        fut = asyncio.get_running_loop().run_in_executor(self._tts_pool, self._tts_job, text, cancel)
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            cancel.set()
+            raise
+
+    def _tts_job(self, text: str, cancel: threading.Event) -> np.ndarray:
+        self.tts.cancel_event = cancel
+        try:
+            return self.tts.synth(text)
+        finally:
+            self.tts.cancel_event = None
 
     def shutdown(self) -> None:
         self._stt_pool.shutdown(wait=False, cancel_futures=True)

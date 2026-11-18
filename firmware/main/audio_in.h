@@ -79,9 +79,16 @@ public:
     // (int16, kSampleRate, с усилением kPcmGain). Должен быть быстрым и не ждать сеть.
     using SinkFn = void (*)(void *ctx, const int16_t *pcm, size_t n);
     void set_sink(SinkFn fn, void *ctx);
-    // Второй получатель, независимый от первого: все блоки подряд, пока он установлен (слово «Джарвис», wake.cc). Те же
-    // отсчёты и те же требования: быстро, не ждать сеть. Зовётся после sink.
-    void set_tap(SinkFn fn, void *ctx);
+    // Второй получатель, независимый от первого: все блоки подряд, пока он установлен (слово «Джарвис», wake.cc). Получает два
+    // блока одной длины: pcm (как у sink, это уходит серверу) и engine_pcm (для движка слова; обычно тот же указатель, а пока
+    // задано другое усиление set_engine_gain(), отдельная копия из тех же 24 бит). Те же требования: быстро, не ждать сеть.
+    // Зовётся после sink.
+    using TapFn = void (*)(void *ctx, const int16_t *pcm, const int16_t *engine_pcm, size_t n);
+    void set_tap(TapFn fn, void *ctx);
+    // Усиление копии для движка (целое, kPcmGain по умолчанию = та же копия, что у сервера). Пока звучит ответ, wake.cc ставит
+    // kPcmGain / 4: динамик у самого микрофона срезает int16 при усилении 4, а при 1 не срезает. Действует со следующего блока.
+    void set_engine_gain(int gain) { engine_gain_.store(gain < 1 ? 1 : gain); }
+    int engine_gain() const { return engine_gain_.load(); }
 
     uint32_t read_errors() const { return read_errors_.load(); }
     uint32_t blocks() const { return seq_.load(); }
@@ -98,6 +105,7 @@ private:
 
     int32_t *words_ = nullptr;     // kBlockFrames * 2 слова
     int16_t *pcm_ = nullptr;       // kBlockFrames отсчётов выбранного слота
+    int16_t *pcm_eng_ = nullptr;   // они же с усилением для движка (только когда оно не kPcmGain; нет памяти: копии нет)
     dsp::DcBlocker dc_[2];
 
     mutable portMUX_TYPE lock_ = portMUX_INITIALIZER_UNLOCKED;
@@ -122,8 +130,9 @@ private:
 
     std::atomic<SinkFn> sink_{nullptr};
     std::atomic<void *> sink_ctx_{nullptr};
-    std::atomic<SinkFn> tap_{nullptr};
+    std::atomic<TapFn> tap_{nullptr};
     std::atomic<void *> tap_ctx_{nullptr};
+    std::atomic<int> engine_gain_{kPcmGain};
 
     std::atomic<uint32_t> seq_{0};
     std::atomic<uint32_t> read_errors_{0};

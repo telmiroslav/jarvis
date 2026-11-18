@@ -16,6 +16,7 @@
 #include "dialog.h"
 #include "dsp.h"
 #include "face_logic.h"
+#include "heap_logic.h"
 #include "lcd_cfg.h"
 #include "link_logic.h"
 #include "net_logic.h"
@@ -2285,7 +2286,7 @@ static void test_wake_logic()
         m.on_detect(t);
         c.dialog_idle = false;
         c.dialog_listening = true;
-        wake_run(m, c, t, 400);
+        wake_run(m, c, t, kSettleBeepMs + 50);
         m.on_speech(t);
         Out o;
         for (int i = 0; i < 200 && !o.stop; i++) {
@@ -2394,7 +2395,8 @@ static void test_wake_logic()
         std::vector<int16_t> b(n, 7);
         generate_wake_beep(b.data(), rate);
         CHECK_NEAR(dsp::peak_dbfs_i16(b.data(), n), kBeepPeakDbfs, 0.1);
-        CHECK(kBeepPeakDbfs <= -15.0f);   // тихий
+        CHECK(kBeepPeakDbfs >= -10.0f && kBeepPeakDbfs <= -6.0f);   // v0.4.2: слышно в комнате с людьми, около -8 дБ
+        CHECK_NEAR(kBeepPeakDbfs, beep_level_dbfs(kBeepLevelDefault), 1e-6);
         CHECK(b[0] == 0 && b[n - 1] == 0);
         // тишина между тонами (10 мс)
         const size_t tone = dsp::beep_length(rate, 55);
@@ -2420,7 +2422,9 @@ static void test_wake_logic()
         for (size_t i = 1; i < n; i++) {
             max_jump = std::max(max_jump, abs(static_cast<int32_t>(b[i]) - static_cast<int32_t>(b[i - 1])));
         }
-        CHECK(max_jump < 2200);
+        // скачок между соседними отсчётами не больше, чем даёт сам синус верхнего тона (амплитуда * 2 pi f / fs), с запасом 5%
+        const double amp = 32768.0 * pow(10.0, kBeepPeakDbfs / 20.0);
+        CHECK(max_jump < amp * 2.0 * M_PI * kBeepFreqBHz / rate * 1.05);
         // не длиннее задуманного: 120 мс
         CHECK(n * 1000 / rate == kBeepMs);
     }
@@ -2468,9 +2472,17 @@ static void test_wake_logic()
 // Что делает разговор: счётчики и состояние
 struct WRec {
     int listen_start = 0, listen_wake = 0, listen_stop = 0, abort = 0, capture_begin = 0, capture_cancel = 0, clear_texts = 0,
-        stop_playback = 0, begin_playback = 0;
+        stop_playback = 0, begin_playback = 0, listen_follow = 0, barge = 0;
+    std::vector<proto::OutMsg> sent;   // сообщения серверу в порядке отправки (dialog::out_messages)
     void add(const dialog::Out &o)
     {
+        proto::OutMsg m[3];
+        const int n = dialog::out_messages(o, m);
+        for (int i = 0; i < n; i++) {
+            sent.push_back(m[i]);
+        }
+        listen_follow += o.listen_follow;
+        barge += o.barge;
         listen_start += o.listen_start;
         listen_wake += o.listen_wake;
         listen_stop += o.listen_stop;
@@ -2653,6 +2665,9 @@ struct WakeSim {
     bool drained = true;          // динамик доиграл
     bool speech = false;          // VAD в этом кадре видит речь
     bool detect = false;          // AFE сообщил слово
+    bool stale_word = false;      // слово сказано ещё до начала ответа (хвост вопроса)
+    uint32_t follow_run_ms = 0;   // сколько мс подряд VAD видит речь, начавшуюся после открытия окна follow
+    int follow_starts = 0, barges = 0;
     int starts = 0, stops = 0, nospeech = 0, beeps = 0, refused_starts = 0;
     int ignored = 0;
     const char *last_reject = "";
@@ -2673,8 +2688,12 @@ struct WakeSim {
         c.link_ready = d.link_ready();
         c.dialog_idle = d.phase() == dialog::Phase::Idle;
         c.dialog_listening = d.phase() == dialog::Phase::Listening;
+        c.dialog_answering = d.phase() == dialog::Phase::Thinking || d.phase() == dialog::Phase::Speaking;
+        c.dialog_speaking = d.phase() == dialog::Phase::Speaking;
+        c.dialog_names_self = d.names_self();
         c.button_down = d.pressed();
         c.diag_busy = diag;
+        c.answers_done = d.answers_done();
         return c;
     }
     void step(uint32_t ms)
@@ -2694,20 +2713,35 @@ struct WakeSim {
             }
             if (detect) {
                 detect = false;
-                const wake_logic::Out x = m.on_detect(t);
+                const wake_logic::Out x = m.on_detect(t, stale_word);
                 if (x.start) {
-                    const dialog::Out a = d.on_wake_start(t);
+                    const dialog::Out a = x.barge ? d.on_barge(t) : d.on_wake_start(t);
                     if (!a.listen_start) {
                         m.on_start_refused(t);
                         refused_starts++;
                     } else {
                         r.add(a);
                         starts++;
+                        barges += x.barge;
                         beeps += x.beep;
                     }
                 } else if (x.rejected) {
                     ignored++;
                     last_reject = x.reject_why;
+                }
+            }
+            if (follow_run_ms > 0 && m.follow_open()) {
+                const wake_logic::Out x = m.on_follow_speech(t, follow_run_ms);
+                if (x.start) {
+                    const dialog::Out a = d.on_wake_start(t, true);
+                    if (!a.listen_start) {
+                        m.on_start_refused(t);
+                        refused_starts++;
+                    } else {
+                        r.add(a);
+                        follow_starts++;
+                        beeps += x.beep;
+                    }
                 }
             }
         }
@@ -2722,8 +2756,10 @@ static void test_wake_flow()
     using wake_logic::StopReason;
 
     // ---- весь разговор по слову: слово, фраза, пауза, ответ, снова на взводе
+    // (перебивание голосом выключено: тогда слово во время ответа игнорируется, как в v0.4.0; с ним см. test_barge_flow)
     {
         WakeSim s;
+        s.m.set_barge(false);
         CHECK(s.m.armed() && s.d.phase() == Phase::Idle);
         s.detect = true;
         s.step(10);
@@ -3504,6 +3540,1527 @@ static void test_lcd_cfg()
 }
 
 
+// ---------------------------------------------------------------- v0.4.2
+
+static void test_commands_v042()
+{
+    using cmd::Kind;
+    using cmd::WakeOp;
+    cmd::Command c;
+    // громкость писка: on/off остаются псевдонимами
+    c = cmd::parse_command("wake beep on");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::BeepOn);
+    c = cmd::parse_command("wake beep off");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::BeepOff);
+    for (int lv = 0; lv <= 5; lv++) {
+        char line[32];
+        snprintf(line, sizeof(line), "wake beep %d", lv);
+        c = cmd::parse_command(line);
+        CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::BeepLevel && c.wake_beep_level == lv);
+    }
+    c = cmd::parse_command("  WAKE  Beep   3 ");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::BeepLevel && c.wake_beep_level == 3);
+    for (const char *b : {"wake beep 6", "wake beep -1", "wake beep 100"}) {
+        c = cmd::parse_command(b);
+        CHECK(c.kind == Kind::Error && strcmp(c.err_cmd, "wake") == 0 && strcmp(c.err_reason, "beep_range") == 0);
+    }
+    for (const char *b : {"wake beep", "wake beep x", "wake beep 2.5", "wake beep 3 4", "wake beep 3x", "wake beep maybe"}) {
+        c = cmd::parse_command(b);
+        CHECK(c.kind == Kind::Error && strcmp(c.err_cmd, "wake") == 0 && strcmp(c.err_reason, "usage") == 0);
+    }
+    // окно «договорить без слова»
+    for (uint32_t ms : {0u, 2000u, 6000u, 15000u}) {
+        char line[32];
+        snprintf(line, sizeof(line), "wake follow %u", static_cast<unsigned>(ms));
+        c = cmd::parse_command(line);
+        CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::Follow && c.wake_follow_ms == ms);
+    }
+    for (const char *b : {"wake follow 1", "wake follow 1999", "wake follow 15001", "wake follow -5", "wake follow 100000"}) {
+        c = cmd::parse_command(b);
+        CHECK(c.kind == Kind::Error && strcmp(c.err_cmd, "wake") == 0 && strcmp(c.err_reason, "follow_range") == 0);
+    }
+    for (const char *b : {"wake follow", "wake follow abc", "wake follow 6.5", "wake follow 6000 1", "wake follow on"}) {
+        c = cmd::parse_command(b);
+        CHECK(c.kind == Kind::Error && strcmp(c.err_reason, "usage") == 0);
+    }
+    // перебивание голосом
+    c = cmd::parse_command("wake barge on");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::BargeOn);
+    c = cmd::parse_command("wake barge OFF");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::BargeOff);
+    c = cmd::parse_command("wake barge thr 0.7");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::BargeThr && fabsf(c.wake_thr - 0.7f) < 1e-6f);
+    c = cmd::parse_command("wake barge threshold 0.9999");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::BargeThr);
+    c = cmd::parse_command("wake barge thr default");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::BargeThr && c.wake_thr == 0.0f);
+    for (const char *b : {"wake barge thr 0.39", "wake barge thr 1.0", "wake barge thr 0"}) {
+        c = cmd::parse_command(b);
+        CHECK(c.kind == Kind::Error && strcmp(c.err_reason, "thr_range") == 0);
+    }
+    for (const char *b : {"wake barge", "wake barge maybe", "wake barge thr", "wake barge thr x", "wake barge on now", "wake barge thr 0.7 0.8"}) {
+        c = cmd::parse_command(b);
+        CHECK(c.kind == Kind::Error && strcmp(c.err_cmd, "wake") == 0 && strcmp(c.err_reason, "usage") == 0);
+    }
+    CHECK(strcmp(cmd::describe_error("beep_range"), "beep_range") != 0 && strlen(cmd::describe_error("beep_range")) > 10);
+    CHECK(strcmp(cmd::describe_error("follow_range"), "follow_range") != 0 && strlen(cmd::describe_error("follow_range")) > 10);
+}
+
+static void test_beep_levels()
+{
+    using namespace wake_logic;
+    const uint32_t rate = 24000;
+    const size_t n = wake_beep_length(rate);
+    // пик по уровням: -20, -16, -12, -8, -4 дБ; по умолчанию 4 (-8); 5 самый громкий (около -4)
+    const float want[6] = {-120.0f, -20.0f, -16.0f, -12.0f, -8.0f, -4.0f};
+    float prev = -1000.0f;
+    for (int lv = 0; lv <= kBeepLevelMax; lv++) {
+        CHECK(beep_level_valid(lv));
+        CHECK_NEAR(beep_level_dbfs(lv), want[lv], 1e-4);
+        CHECK(beep_level_dbfs(lv) > prev);   // каждый следующий уровень громче
+        prev = beep_level_dbfs(lv);
+        std::vector<int16_t> b(n, 7);
+        generate_wake_beep(b.data(), rate, lv);
+        if (lv == 0) {
+            CHECK(dsp::peak_abs(b.data(), n) == 0);   // 0 = тишина
+            continue;
+        }
+        CHECK_NEAR(dsp::peak_dbfs_i16(b.data(), n), want[lv], 0.1);
+        CHECK(b[0] == 0 && b[n - 1] == 0);
+        // плавные края: ни скачка громче собственного синуса, ни щелчка на стыке тонов (между тонами 10 мс тишины)
+        const size_t tone = dsp::beep_length(rate, 55);
+        for (size_t i = tone; i < n - tone; i++) {
+            CHECK(b[i] == 0);
+        }
+        const double amp = 32768.0 * pow(10.0, want[lv] / 20.0);
+        int32_t max_jump = 0;
+        for (size_t i = 1; i < n; i++) {
+            max_jump = std::max(max_jump, abs(static_cast<int32_t>(b[i]) - static_cast<int32_t>(b[i - 1])));
+        }
+        CHECK(max_jump < amp * 2.0 * M_PI * kBeepFreqBHz / rate * 1.05);
+        // нарастание в начале и затухание в конце: первые 10 мс тише полной амплитуды
+        const size_t ramp = dsp::beep_length(rate, 10);
+        CHECK(dsp::peak_abs(b.data(), ramp / 4) < dsp::peak_abs(b.data(), n) / 2);
+        CHECK(dsp::peak_abs(b.data() + n - ramp / 4, ramp / 4) < dsp::peak_abs(b.data(), n) / 2);
+    }
+    // вне пределов зажимается
+    CHECK_NEAR(beep_level_dbfs(99), -4.0, 1e-4);
+    CHECK_NEAR(beep_level_dbfs(-3), -120.0, 1e-4);
+    CHECK(!beep_level_valid(-1) && !beep_level_valid(6));
+    CHECK(kBeepLevelDefault == 4 && kBeepLevelMax == 5);
+    // По умолчанию слышно в комнате с людьми: пик около -8 дБ, громче прежних -20
+    CHECK_NEAR(beep_level_dbfs(kBeepLevelDefault), -8.0, 1e-4);
+
+    // Миграция NVS: ключ wake_beep был булевым (1 = тихий писк -20 дБ, 0 = выключен), теперь ключ с уровнем
+    CHECK(beep_level_from_saved(false, 0, false, 0) == 4);     // ничего не сохраняли: по умолчанию
+    CHECK(beep_level_from_saved(false, 0, true, 1) == 4);      // писк был включён (тихий): теперь громкий по умолчанию
+    CHECK(beep_level_from_saved(false, 0, true, 0) == 0);      // был выключен: остаётся выключенным
+    CHECK(beep_level_from_saved(false, 0, true, 7) == 4);      // любое не нулевое = включён
+    CHECK(beep_level_from_saved(true, 2, true, 1) == 2);       // новый ключ главнее старого
+    CHECK(beep_level_from_saved(true, 0, true, 1) == 0);       // и выключенный уровень тоже
+    CHECK(beep_level_from_saved(true, 5, false, 0) == 5);
+    CHECK(beep_level_from_saved(true, 9, true, 0) == 0);       // мусор в новом ключе: берём старый
+    CHECK(beep_level_from_saved(true, 9, false, 0) == 4);      // мусор и старого нет: по умолчанию
+    CHECK(beep_level_from_saved(true, 255, true, 1) == 4);
+
+    // Автомат: уровень, псевдонимы on/off, Out.beep
+    {
+        Machine m;
+        CHECK(m.beep_level() == 4 && m.beep());
+        m.set_beep_level(7);
+        CHECK(m.beep_level() == 5);
+        m.set_beep_level(-1);
+        CHECK(m.beep_level() == 0 && !m.beep());
+        m.set_beep(true);
+        CHECK(m.beep_level() == kBeepLevelDefault);
+        m.set_beep(false);
+        CHECK(m.beep_level() == 0);
+        for (int lv = 0; lv <= 5; lv++) {
+            Machine q;
+            q.set_beep_level(lv);
+            uint32_t t = 0;
+            wake_run(q, all_ok_cond(), t, 1000);
+            const Out o = q.on_detect(t);
+            CHECK(o.start && o.beep == (lv > 0));
+        }
+    }
+
+    // Окно записи вокруг писка перекрывает и более громкий писк: от вызова до конца самого позднего писка плюс эхо комнаты
+    {
+        const Plan p = plan_capture(10000, 0, 9000, 40, true);
+        const int64_t now_pos = 10000 + ms_to_samples(40);
+        CHECK(p.skip_to - now_pos >= ms_to_samples(kBeepLatencyMaxMs + kBeepMs + 100));   // хвост эха не короче 100 мс
+        CHECK(kBeepTailMs >= 100);
+        // VAD после слова ждёт, пока не кончится писк, хвост и его собственная «задержка» (около 100 мс)
+        CHECK(kSettleBeepMs >= kBeepLatencyMaxMs + kBeepMs + kBeepTailMs + 100);
+        CHECK(kSettleBeepMs > kSettleMs);
+    }
+}
+
+// Условия «все хорошо» плюс один нормально законченный ответ (счётчик + 1), как их даёт разговор
+static void answer_cycle(wake_logic::Machine &m, wake_logic::Cond &c, uint32_t &t, bool normal_end, uint32_t think_ms = 500,
+                         uint32_t speak_ms = 2000)
+{
+    c.dialog_idle = false;
+    c.dialog_answering = true;
+    c.dialog_speaking = false;
+    wake_run(m, c, t, think_ms);
+    c.dialog_speaking = true;
+    wake_run(m, c, t, speak_ms);
+    c.dialog_answering = c.dialog_speaking = false;
+    c.dialog_idle = true;
+    if (normal_end) {
+        c.answers_done++;
+    }
+}
+
+static void test_follow_machine()
+{
+    using namespace wake_logic;
+
+    CHECK(follow_valid(0) && follow_valid(2000) && follow_valid(15000) && follow_valid(6000));
+    CHECK(!follow_valid(1) && !follow_valid(1999) && !follow_valid(15001));
+    CHECK(follow_from_saved(false, 0) == 6000 && follow_from_saved(true, 9000) == 9000 && follow_from_saved(true, 0) == 0);
+    CHECK(follow_from_saved(true, 100) == 6000 && follow_from_saved(true, 65535) == 6000);
+
+    // ---- окно открывается только после нормального конца ответа и только после kResumeMs эха
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        CHECK(m.follow_ms() == kFollowDefaultMs && kFollowDefaultMs == 6000);
+        wake_run(m, c, t, 1000);
+        CHECK(m.armed() && !m.follow_open());          // после включения окна нет
+        answer_cycle(m, c, t, true);
+        CHECK(!m.follow_open());                        // ещё идёт ответ или эхо
+        m.on_tick(c, t += 10);
+        CHECK(m.state() == State::Resuming && !m.follow_open());
+        // в эти 300 мс голос окно не открывает
+        CHECK(!m.on_follow_speech(t, 1000).start);
+        wake_run(m, c, t, kResumeMs - 20);
+        CHECK(m.state() == State::Resuming && !m.follow_open());
+        wake_run(m, c, t, 10);
+        CHECK(m.state() == State::Resuming && !m.follow_open());
+        wake_run(m, c, t, 10);                          // ровно kResumeMs
+        CHECK(m.armed() && m.follow_open() && m.follow_serial() == 1 && m.stats().follow_opened == 1);
+        const uint32_t open_t = t;
+        CHECK(m.follow_left_ms(t) == kFollowDefaultMs);
+        // окно держится follow_ms, потом закрывается МОЛЧА: ни записи, ни «не расслышал», ни слова «отклонено»
+        bool any = false;
+        for (uint32_t i = 10; i < kFollowDefaultMs; i += 10) {
+            t += 10;
+            const Out o = m.on_tick(c, t);
+            any |= o.any();
+            CHECK(m.follow_open());
+        }
+        CHECK(!any && t - open_t == kFollowDefaultMs - 10);
+        t += 10;
+        const Out o = m.on_tick(c, t);
+        CHECK(t - open_t == kFollowDefaultMs && !o.any() && !m.follow_open());
+        CHECK(m.armed() && m.stats().follow_timeouts == 1 && m.stats().follow_starts == 0 && m.stats().nospeech_stops == 0);
+        CHECK(m.stats().detections == 0 && m.stats().rejected == 0);
+        // дальше обычный взвод: слово работает как всегда
+        const Out w = m.on_detect(t);
+        CHECK(w.start && w.beep && !w.follow && !w.barge && m.rec_kind() == RecKind::Wake);
+    }
+
+    // ---- без нормального конца окна нет: abort, обрыв, ошибка, пустой ответ не меняют счётчик
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        answer_cycle(m, c, t, false);
+        wake_run(m, c, t, 2000);
+        CHECK(m.armed() && !m.follow_open() && m.stats().follow_opened == 0);
+    }
+
+    // ---- выключено (0): окна нет; границы: 1000 -> 2000, 20000 -> 15000
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        m.set_follow_ms(0);
+        CHECK(m.follow_ms() == 0);
+        wake_run(m, c, t, 1000);
+        answer_cycle(m, c, t, true);
+        wake_run(m, c, t, 2000);
+        CHECK(m.armed() && !m.follow_open() && m.stats().follow_opened == 0);
+        m.set_follow_ms(1000);
+        CHECK(m.follow_ms() == kFollowMinMs);
+        m.set_follow_ms(20000);
+        CHECK(m.follow_ms() == kFollowMaxMs);
+        m.set_follow_ms(9000);
+        CHECK(m.follow_ms() == 9000);
+    }
+
+    // ---- речь подряд не короче kFollowSpeechMs начинает запись: без слова, без писка, речь уже идёт
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        answer_cycle(m, c, t, true);
+        wake_run(m, c, t, kResumeMs + 20);
+        CHECK(m.follow_open());
+        wake_run(m, c, t, 1500);                       // секунда с лишним тишины в окне
+        CHECK(kFollowSpeechMs == 200);
+        CHECK(!m.on_follow_speech(t, 0).start);
+        CHECK(!m.on_follow_speech(t, kFollowSpeechMs - 1).start);   // щелчок короче 200 мс не считается
+        CHECK(m.follow_open() && m.stats().follow_starts == 0);
+        const Out o = m.on_follow_speech(t, kFollowSpeechMs);
+        CHECK(o.start && o.follow && !o.beep && !o.barge && !o.stop && !o.rejected);
+        CHECK(m.recording() && m.rec_kind() == RecKind::Follow && m.speech_started() && !m.follow_open());
+        CHECK(m.stats().follow_starts == 1 && m.stats().detections == 0 && !m.stats().have_last);
+        // второй вызов во время записи ничего не делает
+        CHECK(!m.on_follow_speech(t, 5000).start);
+        // конец фразы по обычному правилу: 800 мс после ПОСЛЕДНЕЙ речи
+        c.dialog_idle = false;
+        c.dialog_listening = true;
+        const uint32_t t0 = t;
+        for (int i = 0; i < 100; i++) {   // говорит ещё секунду
+            t += 10;
+            m.on_tick(c, t);
+            m.on_speech(t);
+        }
+        const uint32_t last = t;
+        Out e;
+        for (int i = 0; i < 200 && !e.stop; i++) {
+            t += 10;
+            e = m.on_tick(c, t);
+        }
+        CHECK(e.stop && e.reason == StopReason::Silence && !e.no_speech && t - last == kSilenceDefaultMs);
+        CHECK(t - t0 > 1000 && m.stats().silence_stops == 1);
+        CHECK(m.state() == State::Waiting);
+    }
+
+    // ---- запись по голосу кончается и по длине: 12 с
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        answer_cycle(m, c, t, true);
+        wake_run(m, c, t, kResumeMs + 20);
+        CHECK(m.on_follow_speech(t, 400).start);
+        c.dialog_idle = false;
+        c.dialog_listening = true;
+        const uint32_t t0 = t;
+        Out e;
+        for (int i = 0; i < 1500 && !e.stop; i++) {
+            t += 10;
+            e = m.on_tick(c, t);
+            m.on_speech(t);   // болтает без пауз
+        }
+        CHECK(e.stop && e.reason == StopReason::MaxLength && t - t0 == kMaxRecordMs);
+    }
+
+    // ---- слово «Джарвис» в окне работает как обычно (с писком), окно закрывается
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        answer_cycle(m, c, t, true);
+        wake_run(m, c, t, kResumeMs + 20 + 1000);
+        CHECK(m.follow_open());
+        const Out w = m.on_detect(t);
+        CHECK(w.start && w.beep && !w.follow && !w.barge && m.rec_kind() == RecKind::Wake && !m.follow_open());
+        CHECK(m.stats().detections == 1 && m.stats().follow_starts == 0);
+        CHECK(!m.speech_started());   // как всегда: речь по слову ждёт окончания «окна после слова»
+    }
+
+    // ---- BOOT в окне закрывает его; после отпускания окно заново не открывается (ответа не было)
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        answer_cycle(m, c, t, true);
+        wake_run(m, c, t, kResumeMs + 20 + 500);
+        CHECK(m.follow_open());
+        c.button_down = true;
+        m.on_tick(c, t += 10);
+        CHECK(!m.follow_open() && m.state() == State::Waiting && strcmp(m.blocker(), "button") == 0);
+        CHECK(!m.on_follow_speech(t, 1000).start);
+        c.button_down = false;
+        wake_run(m, c, t, 1000);
+        CHECK(m.armed() && !m.follow_open() && m.stats().follow_opened == 1);
+    }
+
+    // ---- пропала связь или Wi-Fi в окне: окно закрыто
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        answer_cycle(m, c, t, true);
+        wake_run(m, c, t, kResumeMs + 20 + 500);
+        CHECK(m.follow_open());
+        c.link_ready = false;
+        m.on_tick(c, t += 10);
+        CHECK(!m.follow_open() && m.state() == State::Waiting);
+        c.link_ready = true;
+        wake_run(m, c, t, 1000);
+        CHECK(m.armed() && !m.follow_open());
+    }
+
+    // ---- короткая помеха сразу после ответа (динамик доигрывает хвост, 50 мс) окно не убивает; долгая (больше 1 с) убивает
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        answer_cycle(m, c, t, true);
+        c.diag_busy = true;
+        wake_run(m, c, t, 50);
+        c.diag_busy = false;
+        wake_run(m, c, t, kResumeMs + 20);
+        CHECK(m.armed() && m.follow_open());
+
+        Machine q;
+        uint32_t tq = 0;
+        Cond cq = all_ok_cond();
+        wake_run(q, cq, tq, 1000);
+        answer_cycle(q, cq, tq, true);
+        cq.diag_busy = true;
+        wake_run(q, cq, tq, kFollowGraceMs + 200);
+        cq.diag_busy = false;
+        wake_run(q, cq, tq, kResumeMs + 200);
+        CHECK(q.armed() && !q.follow_open() && q.stats().follow_opened == 0);
+    }
+
+    // ---- цепочка: ответ на фразу из окна открывает окно снова
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        for (int round = 1; round <= 3; round++) {
+            answer_cycle(m, c, t, true);
+            wake_run(m, c, t, kResumeMs + 20);
+            CHECK(m.follow_open() && m.follow_serial() == static_cast<uint32_t>(round));
+            wake_run(m, c, t, 800);
+            CHECK(m.on_follow_speech(t, 300).start);   // человек продолжает без слова
+            c.dialog_idle = false;
+            c.dialog_listening = true;
+            wake_run(m, c, t, 600);
+            m.on_speech(t);
+            Out e;
+            for (int i = 0; i < 200 && !e.stop; i++) {
+                t += 10;
+                e = m.on_tick(c, t);
+            }
+            CHECK(e.stop && e.reason == StopReason::Silence);
+            c.dialog_listening = false;   // разговор идёт к ответу (в answer_cycle)
+        }
+        CHECK(m.stats().follow_starts == 3 && m.stats().follow_opened == 3 && m.stats().detections == 0);
+    }
+
+    // ---- разговор не принял запись по голосу: счётчики откатываются, автомат ждёт
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        answer_cycle(m, c, t, true);
+        wake_run(m, c, t, kResumeMs + 20);
+        CHECK(m.on_follow_speech(t, 300).start);
+        m.on_start_refused(t);
+        CHECK(!m.recording() && m.stats().follow_starts == 0 && m.stats().refused == 1 && m.stats().detections == 0);
+        CHECK(m.state() == State::Waiting);
+    }
+
+    // ---- кадры VAD: предзапись и окно записи для follow
+    {
+        const int64_t open_pos = 90000;
+        // человек заговорил в окне: движок на 100200, край кольца 100300
+        Plan p = plan_follow(100300, 0, 100200, open_pos);
+        CHECK(p.keep_from == 100200 - ms_to_samples(kFollowPreRollMs));
+        CHECK(p.skip_to <= p.skip_from);   // писка нет: ничего не вырезается
+        CHECK(kFollowPreRollMs >= kFollowSpeechMs + 128 + 100);   // 200 мс речи + задержка VAD 128 мс + запас
+        // раньше открытия окна (с запасом 150 мс) предзапись не берём: там эхо ответа
+        p = plan_follow(100300, 0, 100100, 99000);
+        CHECK(p.keep_from == 99000 - ms_to_samples(kFollowOpenSlackMs));
+        // и не старше самого старого в кольце
+        p = plan_follow(100300, 100000 - 100, 100100, 0);
+        CHECK(p.keep_from == 100000 - 100);
+        // и не позже края кольца
+        p = plan_follow(1000, 0, 9000, 0);
+        CHECK(p.keep_from == 1000);
+        // в самом начале работы (кольцо почти пустое) не уходим в отрицательные индексы
+        p = plan_follow(3000, 0, 500, 0);
+        CHECK(p.keep_from == 0);
+        // Gate: с keep_from отдаётся всё подряд
+        Gate g;
+        const Plan q = plan_follow(20000, 0, 19000, 0);
+        g.start(q.keep_from, q.skip_from, q.skip_to);
+        Span sp[2];
+        const int64_t from = q.keep_from - 160;
+        CHECK(g.apply(from, 160, sp) == 0);               // блок целиком раньше предзаписи
+        CHECK(g.apply(from, 320, sp) == 1 && sp[0].off == 160 && sp[0].len == 160);
+        CHECK(g.apply(q.keep_from, 1600, sp) == 1 && sp[0].off == 0 && sp[0].len == 1600);
+    }
+}
+
+// Часы идут от 0, разговор и автомат слова шагают вместе (как wake.cc); дальше сквозные сценарии
+static void flow_server_answer(WakeSim &s, uint32_t think_ms = 300, uint32_t speak_ms = 1500)
+{
+    s.r.add(s.d.on_server_state(proto::ServerState::Thinking, nullptr, s.t));
+    s.step(think_ms);
+    s.r.add(s.d.on_audio_start(s.t));
+    s.drained = false;
+    s.step(speak_ms);
+    s.r.add(s.d.on_audio_end(s.t));
+    s.r.add(s.d.on_server_state(proto::ServerState::Idle, nullptr, s.t));
+    s.step(200);
+    s.drained = true;
+    s.step(20);   // динамик доиграл
+}
+
+static void test_follow_flow()
+{
+    using dialog::Phase;
+    using wake_logic::State;
+    using wake_logic::StopReason;
+
+    // ---- слово, ответ, окно: молчание закрывает окно молча, лицо и разговор не трогаются
+    {
+        WakeSim s;
+        s.detect = true;
+        s.step(10);
+        s.step(400);
+        s.speech = true;
+        s.step(1000);
+        s.speech = false;
+        s.step(900);
+        CHECK(s.d.phase() == Phase::Thinking && s.r.listen_stop == 1);
+        flow_server_answer(s);
+        CHECK(s.d.phase() == Phase::Idle && s.d.answers_done() == 1);
+        CHECK(!s.m.follow_open());
+        s.step(wake_logic::kResumeMs + 10);
+        CHECK(s.m.armed() && s.m.follow_open());
+        const int starts_before = s.starts;
+        const int stops_before = s.stops;
+        s.step(wake_logic::kFollowDefaultMs + 100);
+        CHECK(!s.m.follow_open() && s.m.stats().follow_timeouts == 1);
+        CHECK(s.starts == starts_before && s.stops == stops_before && s.follow_starts == 0 && s.nospeech == 0);
+        CHECK(s.d.phase() == Phase::Idle && s.m.armed());
+    }
+
+    // ---- окно открывается и после ответа на BOOT; после abort (короткое нажатие) окна нет
+    {
+        WakeSim s;
+        s.r.add(s.d.on_press(s.t));
+        s.step(250);
+        CHECK(s.d.phase() == Phase::Listening && !s.d.wake_listening());
+        s.r.add(s.d.on_release(s.t));
+        flow_server_answer(s);
+        CHECK(s.d.answers_done() == 1);
+        s.step(wake_logic::kResumeMs + 10);
+        CHECK(s.m.follow_open());
+        // новый ответ, но его прервали коротким нажатием
+        WakeSim a;
+        a.r.add(a.d.on_press(a.t));
+        a.step(250);
+        a.r.add(a.d.on_release(a.t));
+        a.r.add(a.d.on_server_state(proto::ServerState::Thinking, nullptr, a.t));
+        a.step(200);
+        a.r.add(a.d.on_press(a.t));
+        a.r.add(a.d.on_release(a.t + 60));
+        a.step(100);
+        CHECK(a.d.phase() == Phase::Idle && a.d.aborts() == 1 && a.d.answers_done() == 0);
+        a.step(1000);
+        CHECK(a.m.armed() && !a.m.follow_open() && a.m.stats().follow_opened == 0);
+    }
+
+    // ---- голос в окне: запись mode=follow без писка, конец по паузе, ответ, и окно снова (цепочка, «города»)
+    {
+        WakeSim s;
+        s.detect = true;
+        s.step(10);
+        s.step(400);
+        s.speech = true;
+        s.step(800);
+        s.speech = false;
+        s.step(900);
+        flow_server_answer(s);
+        s.step(wake_logic::kResumeMs + 10);
+        CHECK(s.m.follow_open());
+        const int beeps_before = s.beeps;
+        const size_t sent_before = s.r.sent.size();
+        s.step(1000);                    // тишина в окне
+        CHECK(s.m.follow_open() && s.r.sent.size() == sent_before);
+        s.follow_run_ms = 100;           // щелчок
+        s.step(10);
+        CHECK(s.follow_starts == 0 && s.d.phase() == Phase::Idle);
+        s.follow_run_ms = 224;           // 7 кадров по 32 мс
+        s.step(10);
+        s.follow_run_ms = 0;
+        CHECK(s.follow_starts == 1 && s.d.phase() == Phase::Listening && s.d.wake_listening() && s.d.follow_listening());
+        CHECK(s.beeps == beeps_before);   // без писка
+        CHECK(s.r.sent.size() == sent_before + 1 && s.r.sent.back() == proto::OutMsg::ListenStartFollow);
+        CHECK(s.r.listen_follow == 1 && s.r.capture_begin == 0 && s.r.abort == 0);
+        CHECK(s.m.recording() && !s.m.follow_open() && s.m.rec_kind() == wake_logic::RecKind::Follow);
+        // говорит ещё секунду, потом пауза 800 мс = конец
+        s.speech = true;
+        s.step(1000);
+        s.speech = false;
+        s.step(700);
+        CHECK(s.d.phase() == Phase::Listening);
+        s.step(150);
+        CHECK(s.d.phase() == Phase::Thinking && s.r.sent.back() == proto::OutMsg::ListenStop && s.last_reason == StopReason::Silence);
+        CHECK(!s.d.follow_listening());
+        // ответ на вторую фразу, и окно открывается СНОВА
+        const uint32_t serial = s.m.follow_serial();
+        flow_server_answer(s);
+        CHECK(s.d.answers_done() == 2);
+        s.step(wake_logic::kResumeMs + 10);
+        CHECK(s.m.follow_open() && s.m.follow_serial() == serial + 1);
+        CHECK(s.m.stats().follow_opened == 2 && s.m.stats().follow_starts == 1);
+        // слово «Джарвис» в окне работает как обычно: писк, mode wake
+        s.detect = true;
+        s.step(10);
+        CHECK(s.d.phase() == Phase::Listening && s.beeps == beeps_before + 1 && s.r.sent.back() == proto::OutMsg::ListenStartWake);
+        CHECK(!s.m.follow_open() && !s.d.follow_listening());
+    }
+
+    // ---- BOOT посреди записи по голосу: конец записи, как при записи по слову
+    {
+        WakeSim s;
+        s.detect = true;
+        s.step(10);
+        s.step(400);
+        s.speech = true;
+        s.step(800);
+        s.speech = false;
+        s.step(900);
+        flow_server_answer(s);
+        s.step(wake_logic::kResumeMs + 10);
+        s.follow_run_ms = 300;
+        s.step(10);
+        s.follow_run_ms = 0;
+        CHECK(s.d.follow_listening());
+        s.step(500);
+        const int stops_before = s.r.listen_stop;
+        s.r.add(s.d.on_press(s.t));
+        s.step(10);
+        CHECK(s.r.listen_stop == stops_before + 1 && s.d.phase() == Phase::Thinking && s.r.capture_begin == 0);
+    }
+
+    // ---- без связи окна нет, и сервер не получает ничего
+    {
+        WakeSim s;
+        s.detect = true;
+        s.step(10);
+        s.step(400);
+        s.speech = true;
+        s.step(800);
+        s.speech = false;
+        s.step(900);
+        flow_server_answer(s);
+        s.step(wake_logic::kResumeMs + 10);
+        CHECK(s.m.follow_open());
+        s.r.add(s.d.on_link(false, s.t));
+        s.step(50);
+        CHECK(!s.m.follow_open());
+        const size_t n = s.r.sent.size();
+        s.follow_run_ms = 500;
+        s.step(100);
+        CHECK(s.r.sent.size() == n && s.d.phase() == Phase::Idle);
+    }
+}
+
+static void test_dialog_v042()
+{
+    using dialog::Phase;
+    using proto::OutMsg;
+    using proto::ServerState;
+
+    // ---- answers_done растёт только при нормальном конце: ответ доигран до конца
+    {
+        dialog::Dialog d;
+        uint32_t t = 1000;
+        d.on_link(true, t);
+        CHECK(d.answers_done() == 0);
+        // обычный ответ кнопкой: audio_end, буфер доигран
+        d.on_press(t);
+        d.on_tick(t + 250, false);
+        d.on_release(t + 300);
+        t += 400;
+        d.on_server_state(ServerState::Thinking, nullptr, t);
+        d.on_audio_start(t + 100);
+        d.on_audio_end(t + 500);
+        d.on_tick(t + 600, false);
+        CHECK(d.phase() == Phase::Speaking && d.answers_done() == 0);   // ещё играет
+        d.on_tick(t + 700, true);
+        CHECK(d.phase() == Phase::Idle && d.answers_done() == 1);
+        d.on_tick(t + 710, true);
+        CHECK(d.answers_done() == 1);   // только один раз за ответ
+        // сервер закончил словом state idle вместо audio_end: тоже нормальный конец
+        t += 5000;
+        d.on_press(t);
+        d.on_tick(t + 250, false);
+        d.on_release(t + 300);
+        d.on_server_state(ServerState::Thinking, nullptr, t + 400);
+        d.on_audio_start(t + 500);
+        d.on_server_state(ServerState::Idle, nullptr, t + 900);
+        d.on_tick(t + 1000, true);
+        CHECK(d.phase() == Phase::Idle && d.answers_done() == 2);
+    }
+
+    // ---- не нормальные концы счётчик не двигают
+    {
+        auto talk = [](dialog::Dialog &d, uint32_t t) {
+            d.on_press(t);
+            d.on_tick(t + 250, false);
+            d.on_release(t + 300);
+            d.on_server_state(ServerState::Thinking, nullptr, t + 400);
+        };
+        // abort коротким нажатием (THINKING и SPEAKING)
+        dialog::Dialog d;
+        d.on_link(true, 0);
+        talk(d, 1000);
+        d.on_press(2000);
+        d.on_release(2060);
+        CHECK(d.phase() == Phase::Idle && d.aborts() == 1 && d.answers_done() == 0);
+        d.on_server_state(ServerState::Idle, nullptr, 2100);
+        talk(d, 3000);
+        d.on_audio_start(3500);
+        d.on_press(4000);
+        d.on_release(4060);
+        CHECK(d.phase() == Phase::Idle && d.aborts() == 2 && d.answers_done() == 0);
+        d.on_server_state(ServerState::Idle, nullptr, 4100);
+        // звук встал без audio_end (kSpeakStallMs)
+        talk(d, 10000);
+        d.on_audio_start(10500);
+        for (uint32_t i = 0; i < dialog::kSpeakStallMs + 200; i += 10) {
+            d.on_tick(10500 + i, false);
+        }
+        CHECK(d.phase() == Phase::Idle && d.answers_done() == 0);
+        // ответ без звука: сервер сказал state idle (речь короче 0,3 с, пустая запись)
+        talk(d, 30000);
+        d.on_server_state(ServerState::Idle, nullptr, 30500);
+        CHECK(d.phase() == Phase::Idle && d.answers_done() == 0);
+        // ошибка сервера
+        talk(d, 40000);
+        d.on_server_state(ServerState::Error, "x", 40500);
+        d.on_tick(40500 + dialog::kErrorShowMs + 10, false);
+        CHECK(d.phase() == Phase::Idle && d.answers_done() == 0);
+        // сервер молчит после listen_stop 60 с
+        talk(d, 60000);
+        for (uint32_t i = 0; i < dialog::kThinkTimeoutMs + 200; i += 100) {
+            d.on_tick(60500 + i, false);
+        }
+        d.on_press(60500 + dialog::kThinkTimeoutMs + 300);
+        d.on_release(60500 + dialog::kThinkTimeoutMs + 360);
+        d.on_tick(60500 + dialog::kThinkTimeoutMs + 20000, false);
+        CHECK(d.answers_done() == 0);
+        // пропала связь посреди ответа
+        const uint32_t tt = 200000;
+        talk(d, tt);
+        d.on_audio_start(tt + 500);
+        d.on_link(false, tt + 600);
+        CHECK(d.phase() == Phase::Idle && d.answers_done() == 0);
+    }
+
+    // ---- запись по голосу: mode follow; сообщения серверу и BOOT
+    {
+        dialog::Dialog d;
+        WRec r;
+        uint32_t t = 100;
+        d.on_link(true, t);
+        r.add(d.on_wake_start(t, true));
+        CHECK(r.listen_start == 1 && r.listen_wake == 1 && r.listen_follow == 1 && r.capture_begin == 0);
+        CHECK(r.sent.size() == 1 && r.sent[0] == OutMsg::ListenStartFollow);
+        CHECK(d.phase() == Phase::Listening && d.wake_listening() && d.follow_listening());
+        r.add(d.on_wake_end(t + 3000, false));
+        CHECK(r.sent.back() == OutMsg::ListenStop && d.phase() == Phase::Thinking && !d.follow_listening() && !d.wake_listening());
+        // обычная запись по слову: mode wake, не follow
+        dialog::Dialog w;
+        WRec rw;
+        w.on_link(true, 0);
+        rw.add(w.on_wake_start(0));
+        CHECK(rw.sent.size() == 1 && rw.sent[0] == OutMsg::ListenStartWake && rw.listen_follow == 0 && !w.follow_listening());
+        // принимается только в покое, как и по слову
+        dialog::Dialog b;
+        b.on_link(true, 0);
+        b.on_press(0);
+        CHECK(!b.on_wake_start(10, true).listen_start);
+    }
+
+    // ---- перебить голосом: abort + новая запись по слову, порядок сообщений abort, потом listen_start
+    for (int speaking = 0; speaking < 2; speaking++) {
+        dialog::Dialog d;
+        WRec r;
+        uint32_t t = 1000;
+        d.on_link(true, t);
+        d.on_press(t);
+        d.on_tick(t + 250, false);
+        d.on_release(t + 300);
+        t += 400;
+        d.on_server_state(ServerState::Thinking, nullptr, t);
+        d.on_audio_start(t + 100);   // чтобы был звук
+        if (!speaking) {
+            // THINKING: звука ещё нет
+            dialog::Dialog q;
+            q.on_link(true, 0);
+            q.on_press(0);
+            q.on_tick(250, false);
+            q.on_release(300);
+            q.on_server_state(ServerState::Thinking, nullptr, 400);
+            CHECK(q.phase() == Phase::Thinking);
+            const dialog::Out o = q.on_barge(500);
+            CHECK(o.abort && o.stop_playback && o.clear_texts && o.listen_start && o.listen_wake && o.barge && !o.listen_follow);
+            CHECK(q.phase() == Phase::Listening && q.wake_listening() && q.aborts() == 1 && q.barges() == 1);
+            proto::OutMsg m[3];
+            CHECK(dialog::out_messages(o, m) == 2 && m[0] == OutMsg::Abort && m[1] == OutMsg::ListenStartWake);
+            continue;
+        }
+        CHECK(d.phase() == Phase::Speaking && d.accept_audio());
+        const dialog::Out o = d.on_barge(t + 1000);
+        r.add(o);
+        CHECK(o.abort && o.stop_playback && o.clear_texts && o.listen_start && o.listen_wake && o.barge && !o.listen_follow);
+        CHECK(!o.capture_begin && !o.listen_stop && !o.begin_playback);
+        CHECK(d.phase() == Phase::Listening && d.wake_listening() && d.aborts() == 1 && d.barges() == 1);
+        // порядок: сначала abort, потом listen_start (mode wake); наоборот сервер сначала начал бы запись, а потом «прервал» её
+        CHECK(r.sent.size() == 2 && r.sent[0] == OutMsg::Abort && r.sent[1] == OutMsg::ListenStartWake);
+        // устаревшее не играет: остаток звука старого ответа, его подтверждение, тексты, новое audio_start
+        CHECK(!d.accept_audio() && !d.on_audio_data(t + 1010));
+        CHECK(!d.accept_text(t + 1020));
+        const dialog::Out a1 = d.on_audio_start(t + 1030);
+        CHECK(!a1.begin_playback && d.phase() == Phase::Listening && !d.accept_audio());
+        CHECK(!d.on_audio_end(t + 1040).finish_playback);
+        d.on_server_state(ServerState::Idle, nullptr, t + 1050);   // подтверждение abort приходит в записи
+        CHECK(d.phase() == Phase::Listening && !d.on_audio_data(t + 1060));
+        d.on_server_state(ServerState::Thinking, nullptr, t + 1070);
+        CHECK(d.phase() == Phase::Listening);
+        // запись кончилась: THINKING, и ответ на НОВУЮ фразу принимается как обычно
+        r.add(d.on_wake_end(t + 3000, false));
+        CHECK(d.phase() == Phase::Thinking && r.sent.back() == OutMsg::ListenStop && r.listen_stop == 1);
+        d.on_server_state(ServerState::Thinking, nullptr, t + 3100);
+        CHECK(d.phase() == Phase::Thinking);
+        const dialog::Out a2 = d.on_audio_start(t + 3500);
+        CHECK(a2.begin_playback && d.phase() == Phase::Speaking && d.accept_audio() && d.on_audio_data(t + 3510));
+        CHECK(d.accept_text(t + 3520));
+        d.on_audio_end(t + 4000);
+        d.on_tick(t + 4100, true);
+        CHECK(d.phase() == Phase::Idle && d.answers_done() == 1);   // перебитый ответ не считался, новый да
+    }
+
+    // ---- перебить нельзя: покой, запись, ошибка, кнопка зажата, нет связи
+    {
+        dialog::Dialog d;
+        uint32_t t = 0;
+        CHECK(!d.on_barge(t).any());                       // нет связи
+        d.on_link(true, t);
+        CHECK(!d.on_barge(t).any() && d.phase() == Phase::Idle);
+        d.on_wake_start(t);
+        CHECK(!d.on_barge(t + 10).any() && d.phase() == Phase::Listening && d.aborts() == 0);
+        d.on_wake_end(t + 2000, false);
+        d.on_server_state(ServerState::Error, "x", t + 2100);
+        CHECK(d.phase() == Phase::Error && !d.on_barge(t + 2200).any() && d.phase() == Phase::Error);
+        dialog::Dialog p;
+        p.on_link(true, 0);
+        p.on_press(0);
+        p.on_tick(250, false);
+        p.on_release(300);
+        p.on_server_state(ServerState::Thinking, nullptr, 400);
+        p.on_press(1000);                                   // кнопка зажата (ещё не решили, тап это или запись)
+        CHECK(!p.on_barge(1010).any() && p.phase() == Phase::Thinking && p.aborts() == 0 && p.barges() == 0);
+    }
+
+    // ---- BOOT после перебивания (идёт запись по слову): конец записи; BOOT-тап во время ответа по-прежнему abort
+    {
+        dialog::Dialog d;
+        WRec r;
+        uint32_t t = 0;
+        d.on_link(true, t);
+        d.on_press(t);
+        d.on_tick(t + 250, false);
+        d.on_release(t + 300);
+        d.on_server_state(ServerState::Thinking, nullptr, t + 400);
+        d.on_audio_start(t + 500);
+        r.add(d.on_barge(t + 1000));
+        r.add(d.on_press(t + 2000));
+        CHECK(r.listen_stop == 1 && d.phase() == Phase::Thinking && r.capture_begin == 0);
+        r.add(d.on_release(t + 2100));
+        CHECK(d.phase() == Phase::Thinking && r.abort == 1 && d.aborts() == 1);   // отпускание ничего не значит, новый abort не шлётся
+    }
+
+    // ---- ответ назвал себя: перебивать нельзя до конца этого ответа
+    {
+        dialog::Dialog d;
+        d.on_link(true, 0);
+        d.on_press(0);
+        d.on_tick(250, false);
+        d.on_release(300);
+        d.on_server_state(ServerState::Thinking, nullptr, 400);
+        CHECK(!d.names_self());
+        d.on_audio_start(500);
+        d.note_names_self();
+        CHECK(d.names_self());
+        d.on_audio_end(900);
+        d.on_tick(1000, true);
+        CHECK(d.phase() == Phase::Idle && !d.names_self());   // следующий ответ с чистого листа
+        // новая запись тоже сбрасывает
+        dialog::Dialog e;
+        e.on_link(true, 0);
+        e.note_names_self();
+        e.on_wake_start(10);
+        CHECK(!e.names_self());
+    }
+
+    // ---- out_messages: порядок и режимы
+    {
+        proto::OutMsg m[3];
+        dialog::Out o;
+        CHECK(dialog::out_messages(o, m) == 0);
+        o.abort = true;
+        CHECK(dialog::out_messages(o, m) == 1 && m[0] == OutMsg::Abort);
+        o.listen_start = true;
+        CHECK(dialog::out_messages(o, m) == 2 && m[0] == OutMsg::Abort && m[1] == OutMsg::ListenStart);
+        o.listen_wake = true;
+        CHECK(dialog::out_messages(o, m) == 2 && m[1] == OutMsg::ListenStartWake);
+        o.listen_follow = true;
+        CHECK(dialog::out_messages(o, m) == 2 && m[1] == OutMsg::ListenStartFollow);
+        dialog::Out p;
+        p.listen_stop = true;
+        CHECK(dialog::out_messages(p, m) == 1 && m[0] == OutMsg::ListenStop);
+        CHECK(strcmp(proto::out_text(OutMsg::ListenStartFollow), "{\"type\":\"listen_start\",\"mode\":\"follow\"}") == 0);
+        CHECK(strcmp(proto::out_text(OutMsg::ListenStartWake), "{\"type\":\"listen_start\",\"mode\":\"wake\"}") == 0);
+        CHECK(strcmp(proto::out_text(OutMsg::Abort), "{\"type\":\"abort\"}") == 0);
+    }
+}
+
+static void test_barge_machine()
+{
+    using namespace wake_logic;
+
+    auto answering = [](Cond &c, bool speaking) {
+        c.dialog_idle = false;
+        c.dialog_answering = true;
+        c.dialog_speaking = speaking;
+    };
+
+    // ---- в THINKING и в SPEAKING слово перебивает: Out.start + barge + писк
+    for (int speaking = 0; speaking < 2; speaking++) {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        answering(c, speaking != 0);
+        wake_run(m, c, t, 700);
+        CHECK(m.state() == State::Waiting && m.barge_ready() && strcmp(m.barge_why(), "none") == 0);
+        CHECK(m.answer_ms(t) >= 690 && m.answer_ms(t) <= 710);
+        const Out o = m.on_detect(t);
+        CHECK(o.start && o.barge && o.beep && !o.follow && !o.rejected);
+        CHECK(m.recording() && m.rec_kind() == RecKind::Barge && !m.speech_started());
+        CHECK(m.stats().detections == 1 && m.stats().barge_ins == 1 && m.stats().have_last);
+        // в записи слово не принимается второй раз
+        const Out o2 = m.on_detect(t + 50);
+        CHECK(!o2.start && o2.rejected && strcmp(o2.reject_why, "already_recording") == 0);
+        // запись как после слова: окно после слова с писком, конец по паузе
+        c.dialog_answering = c.dialog_speaking = false;
+        c.dialog_listening = true;
+        wake_run(m, c, t, kSettleBeepMs + 20);
+        m.on_speech(t);
+        CHECK(m.speech_started());
+        Out e;
+        for (int i = 0; i < 200 && !e.stop; i++) {
+            t += 10;
+            e = m.on_tick(c, t);
+        }
+        CHECK(e.stop && e.reason == StopReason::Silence);
+    }
+
+    // ---- без писка (beep 0) перебивание тоже работает, Out.beep = false
+    {
+        Machine m;
+        m.set_beep_level(0);
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        answering(c, true);
+        wake_run(m, c, t, 100);
+        const Out o = m.on_detect(t);
+        CHECK(o.start && o.barge && !o.beep);
+    }
+
+    // ---- выключено командой: слово во время ответа игнорируется, причина как в v0.4.0
+    {
+        Machine m;
+        m.set_barge(false);
+        CHECK(!m.barge());
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        answering(c, true);
+        wake_run(m, c, t, 700);
+        CHECK(!m.barge_ready() && strcmp(m.barge_why(), "barge_off") == 0 && !m.engine_attenuated());
+        const Out o = m.on_detect(t);
+        CHECK(!o.start && o.rejected && strcmp(o.reject_why, "dialog_busy") == 0 && m.stats().barge_ins == 0 && m.stats().rejected == 1);
+        CHECK(!m.recording());
+        m.set_barge(true);
+        m.on_tick(c, t += 10);
+        CHECK(m.barge_ready());
+    }
+
+    // ---- когда нельзя, причина названа
+    {
+        struct Case {
+            const char *why;
+            void (*breaker)(Cond &);
+        };
+        const Case cases[] = {
+            {"button", [](Cond &c) { c.button_down = true; }},
+            {"diag_busy", [](Cond &c) { c.diag_busy = true; }},
+            {"no_link", [](Cond &c) { c.link_ready = false; }},
+            {"no_wifi", [](Cond &c) { c.wifi_up = false; }},
+            {"no_mic", [](Cond &c) { c.mic_ok = false; }},
+            {"own_name", [](Cond &c) { c.dialog_names_self = true; }},
+        };
+        for (const Case &k : cases) {
+            Machine m;
+            uint32_t t = 0;
+            Cond c = all_ok_cond();
+            wake_run(m, c, t, 1000);
+            answering(c, true);
+            wake_run(m, c, t, 700);
+            CHECK(m.barge_ready());
+            k.breaker(c);
+            m.on_tick(c, t += 10);
+            CHECK(!m.barge_ready() && strcmp(m.barge_why(), k.why) == 0);
+            CHECK(strcmp(barge_blocker_name(c, true), k.why) == 0);
+            const Out o = m.on_detect(t);
+            CHECK(!o.start && o.rejected && strcmp(o.reject_why, k.why) == 0 && !m.recording() && m.stats().barge_ins == 0);
+        }
+        Cond c = all_ok_cond();
+        CHECK(strcmp(barge_blocker_name(c, true), "not_answering") == 0);   // в покое перебивать нечего
+        c.dialog_answering = true;
+        CHECK(strcmp(barge_blocker_name(c, true), "none") == 0);
+        CHECK(strcmp(barge_blocker_name(c, false), "barge_off") == 0);
+        c.enabled = false;
+        CHECK(strcmp(barge_blocker_name(c, true), "disabled") == 0);
+    }
+
+    // ---- слово было сказано ещё до начала ответа (хвост вопроса): не перебивание
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        answering(c, false);
+        wake_run(m, c, t, 100);
+        const Out o = m.on_detect(t, true);
+        CHECK(!o.start && o.rejected && strcmp(o.reject_why, "stale_word") == 0 && !m.recording());
+        const Out o2 = m.on_detect(t, false);
+        CHECK(o2.start && o2.barge);
+    }
+
+    // ---- слово вне ответа и не на взводе по-прежнему отклоняется по старым причинам
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        c.dialog_idle = false;
+        c.dialog_listening = false;   // Error: фаза не ответ
+        c.dialog_answering = false;
+        wake_run(m, c, t, 100);
+        const Out o = m.on_detect(t);
+        CHECK(!o.start && o.rejected && strcmp(o.reject_why, "dialog_busy") == 0);
+    }
+
+    // ---- разговор не принял перебивание: счётчики откатываются
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        answering(c, true);
+        wake_run(m, c, t, 100);
+        CHECK(m.on_detect(t).barge);
+        m.on_start_refused(t);
+        CHECK(!m.recording() && m.stats().detections == 0 && m.stats().barge_ins == 0 && m.stats().refused == 1);
+    }
+
+    // ---- звук для движка слова ослаблен, пока звучит ответ, и ещё kAttenTailMs после; без перебивания не трогаем
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        CHECK(!m.engine_attenuated());
+        answering(c, false);
+        wake_run(m, c, t, 700);
+        CHECK(!m.engine_attenuated());               // думает: динамик молчит, ослаблять не надо
+        c.dialog_speaking = true;
+        m.on_tick(c, t += 10);
+        CHECK(m.engine_attenuated());
+        CHECK(m.speaking_ms(t) < 20);
+        wake_run(m, c, t, 3000);
+        CHECK(m.engine_attenuated() && m.speaking_ms(t) >= 2990);
+        c.dialog_answering = c.dialog_speaking = false;
+        c.dialog_idle = true;                         // ответ доигран
+        const uint32_t t_end = t;
+        while (t < t_end + kAttenTailMs - 10) {
+            m.on_tick(c, t += 10);
+            CHECK(m.engine_attenuated());
+        }
+        m.on_tick(c, t += 10);
+        CHECK(t - t_end == kAttenTailMs && !m.engine_attenuated());
+        // выключили перебивание посреди ответа: сразу нормальный звук
+        Machine q;
+        uint32_t tq = 0;
+        Cond cq = all_ok_cond();
+        wake_run(q, cq, tq, 1000);
+        answering(cq, true);
+        wake_run(q, cq, tq, 500);
+        CHECK(q.engine_attenuated());
+        q.set_barge(false);
+        CHECK(!q.engine_attenuated());
+        wake_run(q, cq, tq, 500);
+        CHECK(!q.engine_attenuated());
+        CHECK(kBargeAttenDb == 12);
+    }
+
+    // ---- порог слова на время ответа
+    {
+        CHECK_NEAR(barge_threshold(0.627f, 0.0f), 0.707, 1e-5);   // обычный + 0.08
+        CHECK_NEAR(barge_threshold(0.60f, 0.0f), 0.68, 1e-5);
+        CHECK_NEAR(barge_threshold(0.90f, 0.0f), 0.95, 1e-5);     // автоматический не выше 0.95
+        CHECK_NEAR(barge_threshold(0.96f, 0.0f), 0.96, 1e-5);     // но и не ниже обычного
+        CHECK_NEAR(barge_threshold(0.627f, 0.85f), 0.85, 1e-5);   // заданный руками
+        CHECK_NEAR(barge_threshold(0.627f, 0.97f), 0.97, 1e-5);   // руками можно выше 0.95
+        CHECK_NEAR(barge_threshold(0.80f, 0.50f), 0.80, 1e-5);    // строже обычного, не мягче
+        CHECK_NEAR(barge_threshold(0.5f, 5.0f), kThresholdMax, 1e-5);
+        CHECK(barge_threshold(0.0f, 0.0f) == 0.0f && barge_threshold(0.0f, 0.8f) == 0.0f);   // порог модели неизвестен: не трогаем
+        CHECK(thr_valid(barge_threshold(0.627f, 0.0f)));
+    }
+}
+
+static void test_barge_flow()
+{
+    using dialog::Phase;
+    using proto::OutMsg;
+    using proto::ServerState;
+    using wake_logic::State;
+    using wake_logic::StopReason;
+
+    // Разговор по слову до ответа: фраза, пауза, сервер «думает»
+    auto ask = [](WakeSim &s) {
+        s.detect = true;
+        s.step(10);
+        s.step(400);
+        s.speech = true;
+        s.step(800);
+        s.speech = false;
+        s.step(900);
+        CHECK(s.d.phase() == Phase::Thinking);
+        s.r.add(s.d.on_server_state(ServerState::Thinking, nullptr, s.t));
+        s.step(100);
+    };
+
+    // ---- слово в THINKING: abort, потом listen_start(wake), писк, запись; потом ответ на новую фразу
+    {
+        WakeSim s;
+        ask(s);
+        const size_t sent0 = s.r.sent.size();
+        const int stops0 = s.r.stop_playback;
+        const int beeps0 = s.beeps;
+        s.detect = true;
+        s.step(10);
+        CHECK(s.barges == 1 && s.starts == 2 && s.beeps == beeps0 + 1 && s.d.phase() == Phase::Listening && s.d.wake_listening());
+        CHECK(s.r.sent.size() == sent0 + 2 && s.r.sent[sent0] == OutMsg::Abort && s.r.sent[sent0 + 1] == OutMsg::ListenStartWake);
+        CHECK(s.r.stop_playback == stops0 + 1 && s.d.aborts() == 1 && s.m.rec_kind() == wake_logic::RecKind::Barge);
+        // подтверждение abort и остаток старого ответа во время записи не доходят до лица
+        s.r.add(s.d.on_server_state(ServerState::Idle, nullptr, s.t));
+        const dialog::Out late = s.d.on_audio_start(s.t);
+        s.r.add(late);
+        CHECK(s.d.phase() == Phase::Listening && !s.d.accept_audio());
+        // новая фраза (пока пищит: тихо), конец по паузе
+        s.step(450);
+        s.speech = true;
+        s.step(600);
+        s.speech = false;
+        s.step(900);
+        CHECK(s.d.phase() == Phase::Thinking && s.r.sent.back() == OutMsg::ListenStop && s.last_reason == StopReason::Silence);
+        const int begins0 = s.r.begin_playback;
+        s.r.add(s.d.on_server_state(ServerState::Thinking, nullptr, s.t));
+        s.r.add(s.d.on_audio_start(s.t + 400));
+        CHECK(s.r.begin_playback == begins0 + 1 && s.d.phase() == Phase::Speaking);   // ответ на новую фразу играет
+    }
+
+    // ---- слово в SPEAKING: динамик замолкает сразу, устаревший звук и тексты выбрасываются, пока идёт запись
+    {
+        WakeSim s;
+        ask(s);
+        s.r.add(s.d.on_audio_start(s.t));
+        s.drained = false;
+        s.step(1500);
+        CHECK(s.d.phase() == Phase::Speaking && s.d.accept_audio());
+        const int stops0 = s.r.stop_playback;
+        const size_t sent0 = s.r.sent.size();
+        s.detect = true;
+        s.step(10);
+        CHECK(s.barges == 1 && s.d.phase() == Phase::Listening);
+        CHECK(s.r.stop_playback == stops0 + 1 && s.r.abort == 1);
+        CHECK(s.r.sent.size() == sent0 + 2 && s.r.sent[sent0] == OutMsg::Abort && s.r.sent[sent0 + 1] == OutMsg::ListenStartWake);
+        CHECK(!s.d.accept_audio() && !s.d.on_audio_data(s.t) && !s.d.accept_text(s.t));
+        // сервер ещё слал: audio_end и state idle (подтверждение abort)
+        s.r.add(s.d.on_audio_end(s.t + 20));
+        s.r.add(s.d.on_server_state(ServerState::Idle, nullptr, s.t + 30));
+        s.step(100);
+        CHECK(s.d.phase() == Phase::Listening && s.m.recording());
+        CHECK(s.r.begin_playback == 1);   // ни одного нового воспроизведения
+        // запись идёт обычным порядком до конца
+        s.step(450);
+        s.speech = true;
+        s.step(500);
+        s.speech = false;
+        s.step(900);
+        CHECK(s.d.phase() == Phase::Thinking);
+    }
+
+    // ---- BOOT: нажатие посреди записи после перебивания заканчивает запись; короткое нажатие в ответе по-прежнему abort
+    {
+        WakeSim s;
+        ask(s);
+        s.detect = true;
+        s.step(10);
+        CHECK(s.d.phase() == Phase::Listening);
+        s.step(600);
+        const int stops0 = s.r.listen_stop;
+        s.r.add(s.d.on_press(s.t));
+        s.step(10);
+        CHECK(s.r.listen_stop == stops0 + 1 && s.d.phase() == Phase::Thinking && s.r.capture_begin == 0);
+        s.r.add(s.d.on_release(s.t + 50));
+        s.step(100);
+        CHECK(s.d.phase() == Phase::Thinking && s.m.stats().button_stops == 1);
+
+        WakeSim t2;
+        ask(t2);
+        t2.r.add(t2.d.on_audio_start(t2.t));
+        t2.drained = false;
+        t2.step(500);
+        const int aborts0 = t2.r.abort;
+        t2.r.add(t2.d.on_press(t2.t));
+        t2.step(60);
+        t2.r.add(t2.d.on_release(t2.t));
+        t2.step(20);
+        CHECK(t2.d.phase() == Phase::Idle && t2.r.abort == aborts0 + 1 && t2.barges == 0);
+        // слово сразу после тапа (кнопки больше нет, ответа тоже): это просто покой, слово ждёт взвода
+        t2.detect = true;
+        t2.step(10);
+        CHECK(t2.barges == 0 && t2.d.phase() == Phase::Idle);
+    }
+
+    // ---- пока BOOT зажата, слово не перебивает
+    {
+        WakeSim s;
+        ask(s);
+        s.r.add(s.d.on_press(s.t));   // ещё не решили: тап или запись
+        s.detect = true;
+        s.step(10);
+        CHECK(s.barges == 0 && s.ignored == 1 && strcmp(s.last_reject, "button") == 0 && s.d.aborts() == 0);
+    }
+
+    // ---- перебивание выключено: слово во время ответа игнорируется, ничего не посылается, динамик не трогается
+    {
+        WakeSim s;
+        s.m.set_barge(false);
+        ask(s);
+        s.r.add(s.d.on_audio_start(s.t));
+        s.drained = false;
+        s.step(500);
+        const size_t sent0 = s.r.sent.size();
+        const int stops0 = s.r.stop_playback;
+        s.detect = true;
+        s.step(10);
+        CHECK(s.barges == 0 && s.ignored == 1 && strcmp(s.last_reject, "dialog_busy") == 0);
+        CHECK(s.d.phase() == Phase::Speaking && s.r.sent.size() == sent0 && s.r.stop_playback == stops0 && s.d.aborts() == 0);
+        CHECK(!s.m.engine_attenuated());
+    }
+
+    // ---- ответ назвал себя: перебивание отключено на этот ответ, на следующем снова работает
+    {
+        WakeSim s;
+        ask(s);
+        s.r.add(s.d.on_audio_start(s.t));
+        s.drained = false;
+        s.d.note_names_self();
+        s.step(300);
+        s.detect = true;
+        s.step(10);
+        CHECK(s.barges == 0 && s.ignored == 1 && strcmp(s.last_reject, "own_name") == 0 && s.d.phase() == Phase::Speaking);
+        s.r.add(s.d.on_audio_end(s.t));
+        s.drained = true;
+        s.step(100);
+        CHECK(s.d.phase() == Phase::Idle && !s.d.names_self());
+    }
+
+    // ---- слово, сказанное до начала ответа (хвост вопроса), не перебивает
+    {
+        WakeSim s;
+        ask(s);
+        s.stale_word = true;
+        s.detect = true;
+        s.step(10);
+        CHECK(s.barges == 0 && s.ignored == 1 && strcmp(s.last_reject, "stale_word") == 0 && s.d.phase() == Phase::Thinking);
+        s.stale_word = false;
+    }
+
+    // ---- перебивание не пускает «слово ради слова» при ошибке сервера и в покое
+    {
+        WakeSim s;
+        ask(s);
+        s.r.add(s.d.on_server_state(ServerState::Error, "x", s.t));
+        s.step(10);
+        CHECK(s.d.phase() == Phase::Error);
+        s.detect = true;
+        s.step(10);
+        CHECK(s.barges == 0 && s.d.phase() == Phase::Error);
+    }
+}
+
+static void test_face_follow()
+{
+    using face_logic::Face;
+    face_logic::In in;
+    in.booted = true;
+    in.idle_hint = "Скажи «Джарвис»";
+    face_logic::Out o = face_logic::decide(in);
+    CHECK(o.face == Face::Idle && strcmp(o.hint, "Скажи «Джарвис»") == 0);
+    // окно «договорить без слова»: спокойное лицо слушания и «Слушаю…»
+    in.follow_window = true;
+    o = face_logic::decide(in);
+    CHECK(o.face == Face::Follow && strcmp(o.hint, "Слушаю…") == 0 && static_cast<int>(Face::Follow) == 8);
+    CHECK(strcmp(wake_logic::kHintFollow, "Слушаю…") == 0);
+    // как только началась запись, лицо обычное LISTENING (без подсказки)
+    in.phase = dialog::Phase::Listening;
+    o = face_logic::decide(in);
+    CHECK(o.face == Face::Listening && o.hint[0] == '\0');
+    in.phase = dialog::Phase::Thinking;
+    CHECK(face_logic::decide(in).face == Face::Thinking);
+    in.phase = dialog::Phase::Idle;
+    // неисправность, нет Wi-Fi или сервера важнее окна
+    in.hw_problem = "Нет микрофона";
+    CHECK(face_logic::decide(in).face == Face::Error);
+    in.hw_problem = nullptr;
+    in.no_wifi = true;
+    in.wifi_hint = "Нет Wi-Fi";
+    CHECK(face_logic::decide(in).face == Face::NoWifi);
+    in.no_wifi = false;
+    in.server_hint = "Ищу ноутбук…";
+    CHECK(face_logic::decide(in).face == Face::NoServer);
+    in.server_hint = nullptr;
+    // эхо-тест важнее
+    in.echo_playing = true;
+    CHECK(face_logic::decide(in).face == Face::Speaking);
+    in.echo_playing = false;
+    in.follow_window = false;
+    CHECK(face_logic::decide(in).face == Face::Idle);
+}
+
+static void test_name_in_text()
+{
+    CHECK(text::mentions_wake_name("Я Джарвис, ваш помощник."));
+    CHECK(text::mentions_wake_name("джарвис"));
+    CHECK(text::mentions_wake_name("ДЖАРВИС ГОТОВ"));
+    CHECK(text::mentions_wake_name("Спросите у Джарвиса."));
+    CHECK(text::mentions_wake_name("Привет, это Jarvis!"));
+    CHECK(text::mentions_wake_name("JARVIS online"));
+    CHECK(text::mentions_wake_name("Жарвис слушает"));
+    CHECK(text::mentions_wake_name("..., сэр Джарвис"));
+    CHECK(text::mentions_wake_name("ДжАрВиС"));
+    CHECK(!text::mentions_wake_name("Сейчас плюс восемь, сэр. Вечером возможен дождь."));
+    CHECK(!text::mentions_wake_name("Города на букву А: Астрахань, Архангельск."));
+    CHECK(!text::mentions_wake_name("Жар и вис"));
+    CHECK(!text::mentions_wake_name("Джарви"));
+    CHECK(!text::mentions_wake_name(""));
+    CHECK(!text::mentions_wake_name(nullptr));
+    CHECK(!text::mentions_wake_name("\xD0"));                       // обрезанный UTF-8
+    CHECK(!text::mentions_wake_name("\xFF\xFE\xD0\x94\xD0"));       // битый UTF-8
+    CHECK(text::mentions_wake_name("\xFF Джарвис"));                // битый байт не мешает найти имя дальше
+}
+
+
+// Одна и та же 24-битная запись в два int16 с разным усилением (звук серверу x4, копия для движка слова x1)
+static void test_analyze_dual_gain()
+{
+    constexpr size_t kN = 1600;
+    std::vector<int32_t> words(2 * kN, 0);
+    for (size_t i = 0; i < kN; i++) {
+        // громкий звук у самого микрофона: синус 1 кГц с амплитудой в половину полной шкалы 24 бит
+        const int32_t v = static_cast<int32_t>(4194304.0 * sin(2.0 * M_PI * 1000.0 * static_cast<double>(i) / 16000.0));
+        words[2 * i] = static_cast<int32_t>(static_cast<uint32_t>(v) << 8);   // 24 бита в старших разрядах слова I2S
+    }
+    dsp::DcBlocker dc[2];
+    dsp::BlockStats st;
+    std::vector<int16_t> a(kN, 7), b(kN, 7);
+    dsp::analyze_block(words.data(), kN, dc, 0, 4, a.data(), &st, b.data(), 1);
+    // x4: вершины срезаны по int16 (значит, в запись они попадают плоскими)
+    size_t clipped4 = 0, clipped1 = 0;
+    for (size_t i = 0; i < kN; i++) {
+        clipped4 += (a[i] >= 32767 || a[i] <= -32767);
+        clipped1 += (b[i] >= 32767 || b[i] <= -32767);
+    }
+    CHECK(clipped4 > kN / 5);
+    // x1 (на 12 дБ тише): срез убран, форма целая, пик около половины шкалы
+    CHECK(clipped1 == 0);
+    CHECK(dsp::peak_abs(b.data(), kN) > 16000 && dsp::peak_abs(b.data(), kN) < 16800);
+    // там, где x4 не срезал, оба варианта сходятся ровно в 4 раза (с точностью до округления сдвига)
+    size_t compared = 0;
+    for (size_t i = 0; i < kN; i++) {
+        if (abs(a[i]) < 32000) {
+            CHECK(abs(static_cast<int>(a[i]) - 4 * static_cast<int>(b[i])) <= 4);
+            compared++;
+        }
+    }
+    CHECK(compared > 100);
+    // статистика слота не зависит от второго выхода
+    dsp::DcBlocker dc2[2];
+    dsp::BlockStats st2;
+    std::vector<int16_t> a2(kN, 7);
+    dsp::analyze_block(words.data(), kN, dc2, 0, 4, a2.data(), &st2);
+    CHECK(a2 == a && st2.slot[0].mean_sq == st.slot[0].mean_sq && st2.slot[0].peak == st.slot[0].peak);
+}
+
+static void test_heap_logic()
+{
+    using namespace heap_logic;
+    // здоровая куча: после старта PSRAM 8 МиБ, свободно 6,7 МиБ, 340 занятых и 12 свободных блоков, счётчик = сумма (размер + 4)
+    Sample ok;
+    ok.name = "psram";
+    ok.total = 8128 * 1024;
+    ok.walk_free = 6767u * 1024u;
+    ok.free_blocks = 12;
+    ok.used_blocks = 340;
+    ok.free = ok.walk_free + kBlockOverhead * ok.free_blocks;
+    ok.min_free = 6700u * 1024u;
+    ok.largest = 6500u * 1024u;
+    ok.walked = true;
+    ok.integrity_checked = true;
+    ok.integrity_ok = true;
+    CHECK(walk_diff(ok) == 0);
+    CHECK(evaluate(ok, nullptr, true) == kIssueNone);
+    Sample next = ok;
+    next.free -= 24 * 1024;   // обычное колебание за период
+    next.walk_free -= 24 * 1024;
+    CHECK(evaluate(next, &ok, true) == kIssueNone);
+
+    // тот самый случай из лога v0.4.1: свободно 6767 КБ -> 14965 КБ (бит 23 счётчика), всего 8128 КБ
+    {
+        Sample bad = ok;
+        bad.free = ok.free + 8u * 1024u * 1024u;
+        const uint32_t r = evaluate(bad, &ok, true);
+        CHECK(r & kIssueFreeAboveTotal);
+        CHECK(r & kIssueJump);
+        CHECK(r & kIssueWalkMismatch);   // обход блоков показывает прежние 6767 КБ: счётчик врёт
+        char buf[200];
+        issues_text(r, buf, sizeof(buf));
+        CHECK(strstr(buf, "free>total") && strstr(buf, "free_counter_vs_block_walk") && strstr(buf, "free_jumped"));
+        // без обхода (проверка пропущена) всё равно ловится по «свободно больше, чем всего»
+        Sample cheap = bad;
+        cheap.walked = false;
+        cheap.integrity_checked = false;
+        const uint32_t rc = evaluate(cheap, nullptr, true);
+        CHECK((rc & kIssueFreeAboveTotal) && !(rc & kIssueWalkMismatch));
+    }
+    // единичные причины
+    {
+        Sample s = ok;
+        s.integrity_ok = false;
+        CHECK(evaluate(s, nullptr, true) == kIssueIntegrity);
+        s = ok;
+        s.min_free = ok.free + 1;
+        CHECK(evaluate(s, nullptr, true) == kIssueMinAboveFree);
+        s = ok;
+        s.largest = ok.free + 4096;
+        CHECK(evaluate(s, nullptr, true) == kIssueLargestAboveFree);
+        s = ok;
+        s.free += 1u * 1024u * 1024u;   // 1 МиБ расхождения счётчика с обходом, но до общего размера далеко
+        CHECK(evaluate(s, nullptr, true) == kIssueWalkMismatch);
+        s = ok;
+        s.free += kWalkSlackBytes + kPerFreeBlockSlack * ok.free_blocks - 100;   // в пределах допуска
+        CHECK(evaluate(s, nullptr, true) == kIssueNone);
+        s = ok;
+        s.free = ok.free - (kWalkSlackBytes + kPerFreeBlockSlack * ok.free_blocks + 100);   // и вниз за допуск
+        CHECK(evaluate(s, nullptr, true) == kIssueWalkMismatch);
+    }
+    // скачок только у PSRAM; у внутренней памяти за 30 с и 100 КБ бывает законно (Wi-Fi)
+    {
+        Sample a = ok, b = ok;
+        b.free = a.free - 3u * 1024u * 1024u;
+        b.walk_free = a.walk_free - 3u * 1024u * 1024u;
+        b.min_free = b.free;
+        b.largest = b.free / 2;
+        CHECK(evaluate(b, &a, true) == kIssueJump);
+        CHECK(evaluate(b, &a, false) == kIssueNone);
+    }
+    // форматирование
+    {
+        char buf[200];
+        Sample s = ok;
+        s.integrity_us = 800;
+        s.walk_us = 450;
+        const size_t n = format_sample(s, buf, sizeof(buf));
+        CHECK(n == strlen(buf) && strstr(buf, "psram 6767/8128 KB free") && strstr(buf, "min 6700") && strstr(buf, "check 1.2 ms"));
+        s.walked = false;
+        s.integrity_checked = false;
+        format_sample(s, buf, sizeof(buf));
+        CHECK(strstr(buf, "counters only") != nullptr);
+        char tiny[10];
+        format_sample(ok, tiny, sizeof(tiny));
+        CHECK(strlen(tiny) < sizeof(tiny));
+        CHECK(issues_text(kIssueNone, tiny, sizeof(tiny)) == 0 && tiny[0] == '\0');
+    }
+    // планировщик: быстрая проверка каждый период, медленная раз в 10 периодов (5 минут при 30 с)
+    {
+        Scheduler sc;
+        for (int i = 0; i < 5; i++) {
+            CHECK(sc.due(0) && sc.due(1));
+            sc.note(0, 1500);
+            sc.note(1, 400);
+        }
+        CHECK(!sc.slow(0) && !sc.slow(1));
+        CHECK(sc.due(1));
+        sc.note(1, kSlowUs[1] + 1000);          // внутренняя куча проверилась медленно
+        CHECK(sc.slow(1) && !sc.slow(0));
+        int runs = 0;
+        for (int i = 0; i < 30; i++) {
+            if (sc.due(1)) {
+                runs++;
+                sc.note(1, kSlowUs[1] + 1000);   // и дальше медленно
+            }
+            CHECK(sc.due(0));
+        }
+        CHECK(runs == 3 && kPeriodsPerSlow == 10);   // 30 периодов: каждый десятый
+        // проверка снова быстрая: возвращается каждый период
+        for (int i = 0; i < 10 && !sc.due(1); i++) {
+        }
+        sc.note(1, 300);
+        CHECK(!sc.slow(1) && sc.due(1));
+        CHECK(!sc.due(2) && !sc.due(-1));
+    }
+}
+
+static void test_settings_logic_v042()
+{
+    using namespace wake_logic;
+    // настройки по умолчанию
+    CHECK(kFollowDefaultMs == 6000 && kFollowMinMs == 2000 && kFollowMaxMs == 15000);
+    CHECK(kBeepLevelDefault == 4);
+    Machine m;
+    CHECK(m.beep_level() == 4 && m.follow_ms() == 6000 && m.barge());
+    // тексты подсказок и новых состояний
+    CHECK(strcmp(rec_kind_name(RecKind::Wake), "wake") == 0 && strcmp(rec_kind_name(RecKind::Follow), "follow") == 0 &&
+          strcmp(rec_kind_name(RecKind::Barge), "barge") == 0);
+    // подсказка в покое не изменилась
+    CHECK(strcmp(idle_hint(true, false), kHintArmed) == 0 && strcmp(idle_hint(false, false), kHintBoot) == 0);
+}
+
 int main()
 {
     test_dbfs();
@@ -3535,6 +5092,18 @@ int main()
     test_wake_logic();
     test_wake_dialog();
     test_wake_flow();
+    test_commands_v042();
+    test_beep_levels();
+    test_follow_machine();
+    test_follow_flow();
+    test_dialog_v042();
+    test_barge_machine();
+    test_barge_flow();
+    test_face_follow();
+    test_name_in_text();
+    test_analyze_dual_gain();
+    test_heap_logic();
+    test_settings_logic_v042();
     test_timeutil();
     test_time_skew();
     test_wake_perf();

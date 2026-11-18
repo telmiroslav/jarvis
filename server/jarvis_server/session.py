@@ -15,11 +15,12 @@ from . import __version__, protocol
 from .audio import float_to_pcm16
 from .config import Settings
 from .engines import Engines, is_fatal_gpu_error
+from .followguard import follow_reject_reason
 from .llm import FLUSH, LLMError, LLMStats, classify_exception
 from .memory import ConversationMemory
 from .pacing import AudioPacer
-from .sentences import SentenceSplitter, split_long
-from .textnorm import clean_markdown, normalize_ru, strip_wake_word
+from .sentences import Chunk, SentenceSplitter, split_long
+from .textnorm import clean_markdown, mute_own_name, normalize_ru, strip_wake_word
 from .timing import TurnTiming
 from .tts import TtsError, postprocess
 
@@ -65,6 +66,7 @@ class _TurnCtx:
         self.spoken: list[str] = []
         self.error: LLMError | None = None
         self.user_text = ""  # распознанная фраза (для памяти разговора)
+        self.cancelled = False  # ход отменяют (abort / новый listen_start / обрыв): плате больше ничего не отправлять
 
 
 class Session:
@@ -167,10 +169,12 @@ class Session:
         pcm = bytes(self._rx[: len(self._rx) // 2 * 2])
         self._rx = bytearray()
         dur = len(pcm) / 2 / protocol.MIC_RATE
-        # в начале записи ~200 мс «до-записи» (плата берёт её из кольца до listen_start): это не речь, но и не режем
-        if dur - self.s.preroll_s < self.s.min_utterance_s:
+        # в начале записи ~200 мс «до-записи» (плата берёт её из кольца до listen_start; в режиме follow ~400 мс):
+        # это не речь, но и не режем
+        preroll = self.s.follow_preroll_s if self._mode == "follow" else self.s.preroll_s
+        if dur - preroll < self.s.min_utterance_s:
             log.info("запись %.2f с (из них ~%.1f с до-запись, mode=%s) слишком короткая: молча в idle", dur,
-                     self.s.preroll_s, self._mode)
+                     preroll, self._mode)
             self.state = "idle"
             await self._send_state("idle")
             return
@@ -194,6 +198,8 @@ class Session:
     async def _cancel_turn(self) -> None:
         """Отмена хода. Ждём её не дольше секунды, чтобы приём сообщений платы (ping, abort) никогда не вставал."""
         t = self._turn
+        if self._ctx is not None:
+            self._ctx.cancelled = True  # сразу: пока отмена доходит до дочерних задач, звук и текст уже не уходят
         if t is not None and not t.done():
             t.cancel()
             done, _ = await asyncio.wait({t}, timeout=1.0)
@@ -228,12 +234,21 @@ class Session:
                     log.info("обращение снято (mode=%s): «%s» -> «%s»", mode, res.text, text)
                 if not text:
                     reason = "wake_only"  # сказано только слово пробуждения: отвечать нечего
+            if text and mode == "follow" and self.s.follow_guard:
+                # без слова «Джарвис» в комнате слышно всё подряд: молча отбрасываем неуверенное и междометия
+                why = follow_reject_reason(text, res.avg_logprob, res.no_speech_prob, self.s.follow_min_logprob,
+                                           self.s.follow_max_no_speech)
+                if why is not None:
+                    log.info("follow: отброшено (%s): «%s» avg_logprob=%s no_speech_prob=%s", why, text,
+                             "-" if res.avg_logprob is None else f"{res.avg_logprob:.2f}",
+                             "-" if res.no_speech_prob is None else f"{res.no_speech_prob:.2f}")
+                    text, reason = "", why
             if not text:
                 tm.outcome = f"empty({reason})"
                 if reason == "wake_only":
                     log.info("после снятия обращения ничего не осталось (%.1f с звука, mode=%s): отвечать нечего",
                              res.audio_s, mode)
-                else:
+                elif reason not in ("low_conf", "filler"):  # эти две уже записаны строкой «follow: отброшено»
                     log.info("речь не распознана (%s, %.1f с звука, mode=%s)", reason, res.audio_s, mode)
                 await self._send_state("idle")
                 return
@@ -316,28 +331,31 @@ class Session:
         audio_q: asyncio.Queue[_AudioItem | None] = asyncio.Queue(maxsize=1)
 
         async def llm_stage() -> None:
-            splitter = SentenceSplitter(self.s.first_chunk_max_chars, self.s.chunk_max_chars)
+            splitter = SentenceSplitter(self.s.first_chunk_max_chars, self.s.chunk_max_chars,
+                                        first_split=self.s.first_chunk_split)
             t0 = time.perf_counter()
 
-            def emit(s: str, last: bool = False) -> None:
+            def emit(c: Chunk, last: bool = False) -> None:
                 if tm.first_sentence_ms is None:
                     tm.first_sentence_ms = (time.perf_counter() - t0) * 1000
-                sent_q.put_nowait(_Sentence(s, last))
+                    if c.cont:
+                        tm.first_split = len(c.text)
+                sent_q.put_nowait(_Sentence(c.text, last))
 
             try:
                 async with asyncio.timeout(self.s.llm_total_timeout_s):
                     async for item in self.eng.llm.stream(history, user_text, self.eng.tools, stats):
                         if item is FLUSH:
-                            for s in splitter.flush():
-                                emit(s)
+                            for c in splitter.flush_chunks():
+                                emit(c)
                             continue
                         if tm.llm_first_token_ms is None and item:
                             tm.llm_first_token_ms = (time.perf_counter() - t0) * 1000
-                        for s in splitter.feed(item):
-                            emit(s)
-                tail = splitter.flush()
-                for i, s in enumerate(tail):
-                    emit(s, last=(i == len(tail) - 1))
+                        for c in splitter.feed_chunks(item):
+                            emit(c)
+                tail = splitter.flush_chunks()
+                for i, c in enumerate(tail):
+                    emit(c, last=(i == len(tail) - 1))
                 if tm.first_sentence_ms is None:
                     ctx.error = LLMError(MSG_NO_ANSWER, "ИИ вернул пустой текст")
             except asyncio.CancelledError:
@@ -357,7 +375,10 @@ class Session:
                 if item is None:
                     break
                 display = clean_markdown(item.text)
-                speak = normalize_ru(item.text)
+                muted, n_name = mute_own_name(item.text)
+                if n_name:  # плата слушает «Джарвис» и во время ответа: своё имя из динамика она приняла бы за обращение
+                    log.info("ИИ назвал себя по имени (%d раз), в звук имя не пускаю: %.60s", n_name, display)
+                speak = normalize_ru(muted)
                 if not any(c.isalnum() for c in speak):
                     continue
                 t0 = time.perf_counter()
@@ -384,6 +405,8 @@ class Session:
                 item = await audio_q.get()
                 if item is None:
                     break
+                if ctx.cancelled:
+                    return
                 n_items += 1
                 if n_items == 1:
                     await self._send_state("speaking")
@@ -391,6 +414,8 @@ class Session:
                     wait = pacer.delay_until_buffered_below(self.s.subtitle_lead_s)
                     if wait > 0:
                         await asyncio.sleep(wait)
+                    if ctx.cancelled:
+                        return
                 gap = pacer.underrun_gap()
                 if n_items > 1 and gap > 0.05:
                     tm.underruns += 1
@@ -413,6 +438,8 @@ class Session:
                         delay = pacer.delay_before(d)
                         if delay > 0.001:
                             await asyncio.sleep(delay)
+                        if ctx.cancelled:
+                            return
                         await self.link.send_bytes(chunk)
                         if tm.total_to_first_audio_ms is None:
                             tm.total_to_first_audio_ms = (time.perf_counter() - tm.t_stop) * 1000

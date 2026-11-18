@@ -50,7 +50,14 @@ Out decide(const In &in)
         o.hint = in.server_hint;
         return o;
     }
-    // 5. Всё в порядке: подсказка, как заговорить
+    // 5. Окно «договорить без слова»: лицо слушает спокойно, подсказка «Слушаю…» (Listening с полосками и свечением появится,
+    // когда начнётся запись по голосу)
+    if (in.follow_window) {
+        o.face = Face::Follow;
+        o.hint = "Слушаю…";
+        return o;
+    }
+    // 6. Всё в порядке: подсказка, как заговорить
     if (in.idle_hint) {
         o.hint = in.idle_hint;
     }

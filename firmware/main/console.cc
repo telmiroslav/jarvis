@@ -113,16 +113,30 @@ void run_wake(const cmd::Command &c)
         } else {
             snprintf(last, sizeof(last), "never");
         }
-        reply("WAKE %s state=%s engine=%s model=%s thr=%s default_thr=%.3f beep=%s gain_db=%d silence_ms=%u detections=%u ignored=%u speech_stops=%u "
+        reply("WAKE %s state=%s engine=%s model=%s thr=%s default_thr=%.3f beep=%d gain_db=%d silence_ms=%u detections=%u ignored=%u speech_stops=%u "
               "false_stops=%u cap_stops=%u button_stops=%u last=%s mic=%.1fdBFS peak=%.1fdBFS frames=%u dropped=%u/%u speech=%u%% "
               "chunk=%d",
-              s.enabled ? "on" : "off", state, s.available ? "running" : s.why, s.model, thr, static_cast<double>(s.thr_default), s.beep ? "on" : "off",
+              s.enabled ? "on" : "off", state, s.available ? "running" : s.why, s.model, thr, static_cast<double>(s.thr_default), s.beep_level,
               s.gain_db, static_cast<unsigned>(s.silence_ms), static_cast<unsigned>(s.stats.detections), static_cast<unsigned>(s.stats.rejected),
               static_cast<unsigned>(s.stats.silence_stops), static_cast<unsigned>(s.stats.nospeech_stops),
               static_cast<unsigned>(s.stats.cap_stops), static_cast<unsigned>(s.stats.button_stops), last,
               static_cast<double>(s.mic_rms_dbfs), static_cast<double>(s.mic_peak_dbfs), static_cast<unsigned>(s.frames),
               static_cast<unsigned>(s.ring_overruns), static_cast<unsigned>(s.afe_errors), static_cast<unsigned>(s.speech_pct),
               s.feed_chunk);
+        {
+            char bthr[40];
+            if (s.barge_thr > 0.0f) {
+                snprintf(bthr, sizeof(bthr), "%.3f(%s)", static_cast<double>(s.barge_thr), s.barge_thr_custom ? "set" : "auto");
+            } else {
+                snprintf(bthr, sizeof(bthr), "n/a");
+            }
+            reply("WAKE v0.4.2 beep_level=%d(%.0fdBFS) follow_ms=%u follow_open=%s barge=%s barge_thr=%s engine_atten=%s", s.beep_level,
+                  static_cast<double>(wake_logic::beep_level_dbfs(s.beep_level)), static_cast<unsigned>(s.follow_ms),
+                  s.follow_open ? "yes" : "no", s.barge ? "on" : "off", bthr, s.engine_atten ? "yes(-12dB)" : "no");
+            reply("WAKE v0.4.2 stats follow_windows=%u follow_voice=%u follow_silent=%u barge_ins=%u", static_cast<unsigned>(s.stats.follow_opened),
+                  static_cast<unsigned>(s.stats.follow_starts), static_cast<unsigned>(s.stats.follow_timeouts),
+                  static_cast<unsigned>(s.stats.barge_ins));
+        }
         if (s.available) {
             // Измерения движка: каждая строка короче 200 символов (./tools/flash.sh cmd обрезает длиннее)
             const wake::PerfInfo p = wake::perf_info();
@@ -156,15 +170,52 @@ void run_wake(const cmd::Command &c)
         break;
     }
     case WakeOp::BeepOn:
-    case WakeOp::BeepOff: {
-        const bool on = (c.wake_op == WakeOp::BeepOn);
-        if (wake::set_beep(on)) {
-            reply("WAKE OK beep %s", on ? "on" : "off");
+    case WakeOp::BeepOff:
+    case WakeOp::BeepLevel: {
+        const int level = c.wake_op == WakeOp::BeepOn ? wake_logic::kBeepLevelDefault : c.wake_op == WakeOp::BeepOff ? 0 : c.wake_beep_level;
+        if (wake::set_beep_level(level)) {
+            if (level == 0) {
+                reply("WAKE OK beep 0 (off)");
+            } else {
+                reply("WAKE OK beep %d (peak %.0f dBFS; played once now)", level, static_cast<double>(wake_logic::beep_level_dbfs(level)));
+            }
         } else {
             reply("ERR wake save_failed");
         }
         break;
     }
+    case WakeOp::Follow:
+        if (wake::set_follow_ms(c.wake_follow_ms)) {
+            if (c.wake_follow_ms == 0) {
+                reply("WAKE OK follow 0 (off: after an answer only the word works)");
+            } else {
+                reply("WAKE OK follow %u ms (after an answer, speak without the word for this long)", static_cast<unsigned>(c.wake_follow_ms));
+            }
+        } else {
+            reply("ERR wake save_failed");
+        }
+        break;
+    case WakeOp::BargeOn:
+    case WakeOp::BargeOff: {
+        const bool on = (c.wake_op == WakeOp::BargeOn);
+        if (wake::set_barge(on)) {
+            reply("WAKE OK barge %s", on ? "on (the word interrupts an answer)" : "off (the word is ignored while Jarvis thinks and speaks)");
+        } else {
+            reply("ERR wake save_failed");
+        }
+        break;
+    }
+    case WakeOp::BargeThr:
+        if (wake::set_barge_threshold(c.wake_thr)) {
+            if (c.wake_thr == 0.0f) {
+                reply("WAKE OK barge thr automatic (normal + 0.08, at most 0.95)");
+            } else {
+                reply("WAKE OK barge thr %.4f", static_cast<double>(c.wake_thr));
+            }
+        } else {
+            reply("ERR wake barge_thr_failed");
+        }
+        break;
     case WakeOp::Threshold:
         if (wake::set_threshold(c.wake_thr)) {
             if (c.wake_thr == 0.0f) {
@@ -272,7 +323,8 @@ void run_command(const cmd::Command &c)
         break;
     case cmd::Kind::Help:
         reply("HELP wifi_set <ssid><TAB><password> | wifi_clear | tz <POSIX TZ> | lcd <1-6> | server [ws://ip:port/ws|auto] | "
-              "wake [on|off|beep on|beep off|thr <0.40-0.9999|default>|silence <300-3000 ms>|gain <0-18 dB>] | echo | status | reboot");
+              "wake [on|off|beep on|off|0-5|thr <0.40-0.9999|default>|silence <300-3000 ms>|gain <0-18 dB>|follow <0|2000-15000 ms>|"
+              "barge on|off|barge thr <0.40-0.9999|default>] | echo | status | reboot");
         break;
     case cmd::Kind::Error:
         reply("ERR %s %s", c.err_cmd, c.err_reason);

@@ -128,3 +128,18 @@ def test_env_file_precedence(tmp_path, monkeypatch):
     assert s.tts_steps == 8 and s.llm_model == "from-repo"
     monkeypatch.setenv("JARVIS_TTS_STEPS", "16")
     assert load_settings(files=[a, b]).tts_steps == 16
+
+
+def test_first_chunk_split_and_follow_settings():
+    s = load_settings({})
+    assert s.first_chunk_split is True and s.first_chunk_max_chars == 70  # по умолчанию включено
+    assert s.follow_guard is True and s.follow_preroll_s == 0.4
+    assert s.follow_min_logprob < 0 and 0 < s.follow_max_no_speech < 1
+    assert s.memory_turns == 20  # на игру в «города» нужно помнить названные города
+    s = load_settings({"JARVIS_FIRST_CHUNK_SPLIT": "0", "JARVIS_FIRST_CHUNK_MAX_CHARS": "60", "JARVIS_FOLLOW_GUARD": "0",
+                       "JARVIS_FOLLOW_MIN_LOGPROB": "-1.2", "JARVIS_FOLLOW_MAX_NO_SPEECH": "0.5", "JARVIS_FOLLOW_PREROLL_S": "0.5",
+                       "JARVIS_MEMORY_TURNS": "30"})
+    assert s.first_chunk_split is False and s.first_chunk_max_chars == 60 and s.follow_guard is False
+    assert s.follow_min_logprob == -1.2 and s.follow_max_no_speech == 0.5 and s.follow_preroll_s == 0.5
+    assert s.memory_turns == 30
+    assert load_settings({"JARVIS_FIRST_CHUNK_SPLIT": "1"}).first_chunk_split is True

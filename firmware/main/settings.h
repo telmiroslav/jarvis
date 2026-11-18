@@ -45,20 +45,30 @@ bool clear_server();
 int get_lcd();
 bool set_lcd(int n);
 
-// Слово «Джарвис» (wake.cc, консоль: wake on|off, wake beep on|off, wake thr <число>, wake silence <мс>, wake gain <дБ>).
-// Ключи в NVS: wake_on, wake_beep (по умолчанию включены), wake_thr (порог*10000, 0 = стандартный для модели),
-// wake_sil (пауза после речи, мс; 0 = 800 по умолчанию), wake_gain (усиление звука для движка слова, целые дБ 0..18, по
-// умолчанию 0).
+// Слово «Джарвис» (wake.cc, консоль: wake on|off, wake beep on|off|0..5, wake thr <число>, wake silence <мс>, wake gain <дБ>,
+// wake follow <мс>, wake barge on|off, wake barge thr <число>).
+// Ключи в NVS: wake_on, wake_beep (булев ключ до v0.4.1: 1 = писк; теперь только для совместимости), wake_beepl (v0.4.2:
+// уровень писка 0..5, по умолчанию 4; если его нет, берётся wake_beep: 0 остаётся 0, не 0 становится 4), wake_thr (порог*10000,
+// 0 = стандартный для модели), wake_sil (пауза после речи, мс; 0 = 800 по умолчанию), wake_gain (усиление звука для движка
+// слова, целые дБ 0..18, по умолчанию 0), wake_follow (окно «договорить без слова», мс: 0 = выключено или 2000..15000, по
+// умолчанию 6000), wake_barge (перебить голосом, по умолчанию включено), wake_bthr (порог слова, пока звучит ответ, *10000;
+// 0 = автоматически: обычный + 0,08, не выше 0,95).
 struct WakeSettings {
     bool enabled = true;
-    bool beep = true;
+    int beep_level = 4;           // 0 = без писка, 1..5 громкость
     float threshold = 0.0f;       // 0 = стандартный порог модели
     uint32_t silence_ms = 800;
     int gain_db = 0;              // усиление звука только для движка слова
+    uint32_t follow_ms = 6000;    // окно «договорить без слова» после ответа, 0 = выключено
+    bool barge = true;            // перебить ответ голосом
+    float barge_thr = 0.0f;       // порог слова, пока звучит ответ: 0 = автоматически
 };
 WakeSettings get_wake();
 bool set_wake_enabled(bool on);
-bool set_wake_beep(bool on);
+bool set_wake_beep_level(int level);        // 0..5; пишет и старый булев ключ (level > 0), чтобы откат на v0.4.1 понимал
+bool set_wake_follow_ms(uint32_t ms);       // 0 или 2000..15000
+bool set_wake_barge(bool on);
+bool set_wake_barge_thr(float thr);         // 0 = автоматически; иначе 0,40..0,9999
 bool set_wake_threshold(float thr);         // 0 = вернуть стандартный; иначе 0,40..0,9999
 bool set_wake_silence_ms(uint32_t ms);
 bool set_wake_gain_db(int db);              // 0..18

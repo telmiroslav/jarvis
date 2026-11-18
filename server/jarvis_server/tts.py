@@ -21,8 +21,15 @@ class TtsError(RuntimeError):
     pass
 
 
+class TtsCancelled(Exception):
+    """Синтез прерван снаружи (abort / новая запись): результат никому не нужен. Не ошибка голоса."""
+
+
 class TTS(Protocol):
     sample_rate: int
+    # Engines.run_tts кладёт сюда threading.Event на время одного синтеза; если его выставили, синтез в потоке должен
+    # оборваться (TtsCancelled) как можно скорее, чтобы поток освободился для следующей фразы. Необязательно.
+    cancel_event: object | None
 
     def load(self) -> None: ...
 
@@ -94,6 +101,12 @@ class OmniVoiceTTS:
         self.dtype_name = "fp32"
         self._ref = None
         self.load_s = 0.0
+        self.cancel_event = None
+
+    def _check_cancel(self, *_args) -> None:
+        ev = self.cancel_event
+        if ev is not None and ev.is_set():
+            raise TtsCancelled()
 
     def load(self) -> None:
         if self.s.hf_offline:
@@ -122,6 +135,9 @@ class OmniVoiceTTS:
             raise
         if dev == "cuda":
             torch.cuda.synchronize()
+        # каждый из шагов диффузии (32 по умолчанию) это один вызов модели: на входе в него проверяем отмену,
+        # так прерванный abort-ом синтез освобождает видеокарту за один шаг модели, а не за всю фразу (замер в docs/SERVER.md)
+        self.model.register_forward_pre_hook(self._check_cancel)
         self.sample_rate = int(getattr(self.model, "sampling_rate", OUT_RATE))
         with torch.inference_mode():  # без этого энкодер хранит граф и съедает память
             self.prompt = self.model.create_voice_clone_prompt(
@@ -134,10 +150,13 @@ class OmniVoiceTTS:
     def synth(self, text: str) -> np.ndarray:
         import torch
 
+        self._check_cancel()
         try:
             with torch.inference_mode():
                 out = self.model.generate(text=text, language="ru", voice_clone_prompt=self.prompt,
                                           num_step=self.s.tts_steps)
+        except TtsCancelled:
+            raise
         except Exception as e:
             raise TtsError(f"синтез не удался: {type(e).__name__}: {e}") from e
         a = out[0] if isinstance(out, (list, tuple)) else out
@@ -172,6 +191,8 @@ class MockTTS:
         self.min_s = min_s
         self.fail_on = fail_on  # для тестов: при этом тексте бросить TtsError
         self.calls: list[str] = []
+        self.cancel_event = None
+        self.cancelled = 0  # сколько синтезов оборвали отменой (для тестов)
 
     def load(self) -> None:
         pass
@@ -192,8 +213,21 @@ class MockTTS:
         sig[:fade] *= np.linspace(0, 1, fade)
         sig[-fade:] *= np.linspace(1, 0, fade)
         if self.rtf or self.fixed_delay_s:
-            time.sleep(self.fixed_delay_s + self.rtf * dur)
+            self._sleep(self.fixed_delay_s + self.rtf * dur)
         return sig.astype(np.float32)
+
+    def _sleep(self, seconds: float) -> None:
+        """Как «синтез»: ждёт по 10 мс и между ними смотрит, не отменили ли (как шаги диффузии настоящей модели)."""
+        end = time.perf_counter() + seconds
+        ev = self.cancel_event
+        while True:
+            if ev is not None and ev.is_set():
+                self.cancelled += 1
+                raise TtsCancelled()
+            left = end - time.perf_counter()
+            if left <= 0:
+                return
+            time.sleep(min(0.01, left))
 
     def info(self) -> dict:
         return {"engine": "mock", "rate": self.sample_rate}

@@ -52,8 +52,9 @@ class FakeLink:
 
 
 class FakeSTT:
-    def __init__(self, text="который сейчас час", delay=0.0, reason=""):
+    def __init__(self, text="который сейчас час", delay=0.0, reason="", avg_logprob=None, no_speech_prob=None):
         self.text, self.delay, self.reason = text, delay, reason
+        self.avg_logprob, self.no_speech_prob = avg_logprob, no_speech_prob
         self.calls = 0
 
     def transcribe(self, pcm, sample_rate=16000):
@@ -61,7 +62,7 @@ class FakeSTT:
         if self.delay:
             time.sleep(self.delay)
         return SttResult(self.text if not self.reason else "", audio_s=len(pcm) / 2 / sample_rate, ms=1.0,
-                         reason=self.reason)
+                         reason=self.reason, avg_logprob=self.avg_logprob, no_speech_prob=self.no_speech_prob)
 
     def load(self): ...
 

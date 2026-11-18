@@ -11,6 +11,7 @@
 #include "mic_stream.h"
 #include "playback.h"
 #include "subtitle.h"
+#include "text_util.h"
 #include "ui.h"
 
 namespace jarvis {
@@ -53,25 +54,38 @@ void apply(const dialog::Out &o)
         ui::clear_texts();
     }
     if (o.listen_start) {
+        // Запись микрофона готовим до сообщений серверу (звук пойдёт, как только link получит listen_start)
         if (o.listen_wake) {
             mic_stream::begin_capture_injected();   // звук подаёт wake.cc с точностью до отсчёта (без писка, с предзаписью)
-            link::send(proto::OutMsg::ListenStartWake);
-            ESP_LOGI(TAG, "WAKE: listening");
-        } else {
-            if (!mic_stream::capturing()) {
-                mic_stream::begin_capture();   // нажали, пока связи не было, а она вернулась: копим с этого момента
-            }
-            link::send(proto::OutMsg::ListenStart);
-            ESP_LOGI(TAG, "PTT: listening");
+        } else if (!mic_stream::capturing()) {
+            mic_stream::begin_capture();   // нажали, пока связи не было, а она вернулась: копим с этого момента
         }
     }
-    if (o.listen_stop) {
-        link::send(proto::OutMsg::ListenStop);
-        ESP_LOGI(TAG, "listen_stop sent, waiting for the answer");
-    }
-    if (o.abort) {
-        link::send(proto::OutMsg::Abort);
-        ESP_LOGI(TAG, "PTT: abort");
+    // Сообщения серверу строго в порядке dialog::out_messages(): abort, потом listen_start, потом listen_stop (перебивание
+    // голосом шлёт abort и сразу listen_start; наоборот сервер сначала начал бы запись, а потом «прервал» бы её)
+    proto::OutMsg msgs[3];
+    const int nmsg = dialog::out_messages(o, msgs);
+    for (int i = 0; i < nmsg; i++) {
+        link::send(msgs[i]);
+        switch (msgs[i]) {
+        case proto::OutMsg::Abort:
+            ESP_LOGI(TAG, "%s: abort", o.barge ? "BARGE-IN" : "PTT");
+            break;
+        case proto::OutMsg::ListenStartFollow:
+            ESP_LOGI(TAG, "FOLLOW: listening (voice without the word)");
+            break;
+        case proto::OutMsg::ListenStartWake:
+            ESP_LOGI(TAG, "%s: listening", o.barge ? "BARGE-IN" : "WAKE");
+            break;
+        case proto::OutMsg::ListenStart:
+            ESP_LOGI(TAG, "PTT: listening");
+            break;
+        case proto::OutMsg::ListenStop:
+            ESP_LOGI(TAG, "listen_stop sent, waiting for the answer");
+            break;
+        default:
+            break;
+        }
     }
     if (o.begin_playback) {
         playback::begin();
@@ -104,6 +118,9 @@ void on_message(const proto::ServerMsg &m)
         ESP_LOGI(TAG, "server: jarvis_text (%u bytes)%s", static_cast<unsigned>(strlen(m.text)), m.final_flag ? " final" : "");
         if (S.dlg.accept_text(now)) {
             ui::set_jarvis_text(S.answer.append(m.text, m.final_flag));
+            if (text::mentions_wake_name(m.text)) {
+                S.dlg.note_names_self();   // динамик скажет «Джарвис» сам: перебивать этот ответ голосом нельзя
+            }
         }
         break;
     case proto::Kind::AudioStart:
@@ -169,16 +186,29 @@ void on_button(bool pressed, uint32_t at_ms)
     }
 }
 
-bool wake_begin(uint32_t at_ms)
+bool wake_begin(uint32_t at_ms, bool follow)
 {
     std::lock_guard<std::mutex> lock(S.mu);
-    const dialog::Out o = S.dlg.on_wake_start(at_ms);
+    const dialog::Out o = S.dlg.on_wake_start(at_ms, follow);
     if (!o.listen_start) {
         return false;
     }
     if (S.dlg.phase() == dialog::Phase::Listening) {
-        ESP_LOGI(TAG, "dialog: IDLE -> LISTENING (wake word)");
+        ESP_LOGI(TAG, "dialog: IDLE -> LISTENING (%s)", follow ? "voice in the follow window" : "wake word");
     }
+    apply(o);
+    return true;
+}
+
+bool wake_barge(uint32_t at_ms)
+{
+    std::lock_guard<std::mutex> lock(S.mu);
+    const dialog::Phase before = S.dlg.phase();
+    const dialog::Out o = S.dlg.on_barge(at_ms);
+    if (!o.listen_start) {
+        return false;
+    }
+    ESP_LOGI(TAG, "dialog: %s -> LISTENING (barge-in: the word interrupted the answer)", dialog::phase_name(before));
     apply(o);
     return true;
 }
@@ -227,7 +257,11 @@ View view()
     v.link_ready = S.dlg.link_ready();
     v.button_down = S.dlg.pressed();
     v.wake_listening = S.dlg.wake_listening();
+    v.follow_listening = S.dlg.follow_listening();
+    v.names_self = S.dlg.names_self();
     v.aborts = S.dlg.aborts();
+    v.answers_done = S.dlg.answers_done();
+    v.barges = S.dlg.barges();
     return v;
 }
 

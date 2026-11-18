@@ -102,8 +102,9 @@ const Look kLooks[] = {
     /* NoServer  */ { 420, 1020,   0,   70,  620,    0,    0,    0,    0, kSleepyTeal},
     /* Error     */ { 360,  990,   0,   70,  720,    0,    0,    0,    0, kWarm},
     /* Sleep     */ {  70, 1000,   0,    0,  330,    0,    0,    0,    0, kAccent},
+    /* Follow    */ {1030, 1060,   0,  -10,  900,    0,    0,    0,  450, kAccentLight},
 };
-static_assert(sizeof(kLooks) / sizeof(kLooks[0]) == static_cast<size_t>(State::Sleep) + 1, "kLooks must have a row per State, in the enum order");
+static_assert(sizeof(kLooks) / sizeof(kLooks[0]) == static_cast<size_t>(State::Follow) + 1, "kLooks must have a row per State, in the enum order");
 
 // ---------------------------------------------------------------- модель (общая с другими задачами)
 
@@ -473,7 +474,7 @@ void apply_face(uint32_t now)
 
     // «Дыхание»: едва заметное колебание высоты глаз, пока всё спокойно
     float breath = 0.0f;
-    if (U.state == State::Idle || U.state == State::Sleep) {
+    if (U.state == State::Idle || U.state == State::Sleep || U.state == State::Follow) {
         breath = 0.018f * sinf(t * 1.5f);
     }
 
@@ -1012,6 +1013,7 @@ const char *state_name(State s)
     case State::NoServer:  return "NO_SERVER";
     case State::Error:     return "ERROR";
     case State::Sleep:     return "SLEEP";
+    case State::Follow:    return "FOLLOW";
     }
     return "?";
 }

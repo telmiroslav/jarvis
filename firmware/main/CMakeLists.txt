@@ -9,6 +9,8 @@ idf_component_register(
          "dsp.cc"
          "face_logic.cc"
          "gui.cc"
+         "heap_diag.cc"
+         "heap_logic.cc"
          "link.cc"
          "link_logic.cc"
          "mic_stream.cc"

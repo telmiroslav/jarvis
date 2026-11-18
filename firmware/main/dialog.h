@@ -18,7 +18,13 @@
 //   - слово «Джарвис» (wake_logic.h, wake.cc) начинает такую же запись без кнопки: on_wake_start() даёт listen_start с
 //     mode=wake, а закончить её может on_wake_end() (конец фразы по VAD) или нажатие BOOT (оно работает как отпускание:
 //     listen_stop и THINKING, а само нажатие запись PTT не начинает);
-//   - ошибка сервера (state error): лицо ERROR с текстом msg на kErrorShowMs.
+//   - ошибка сервера (state error): лицо ERROR с текстом msg на kErrorShowMs;
+//   - v0.4.2, окно «договорить без слова»: запись может начаться и по голосу сразу после ответа (on_wake_start(now, true),
+//     mode=follow). Автомат считает ответы, которые закончились НОРМАЛЬНО (answers_done(): ответ полностью доигран, не abort,
+//     не обрыв, не ошибка): по этому счётчику автомат слова решает, открывать ли окно;
+//   - v0.4.2, перебить голосом: on_barge() = abort (как короткое нажатие BOOT: стоп динамика, чистка субтитров, abort серверу)
+//     и сразу новая запись по слову. Звук и сообщения старого ответа в записи игнорируются (лицо LISTENING принадлежит плате),
+//     так что «устаревший» звук не доиграется; порядок сообщений серверу: abort, потом listen_start (out_messages()).
 // Метод on_* возвращает Out: что сделать плате (послать серверу, замолчать, очистить субтитры). Состояние читается
 // через phase(), error_msg(), accept_audio().
 //
@@ -48,6 +54,8 @@ constexpr uint32_t kSubtitleHoldMs = 8000;   // сколько субтитры 
 struct Out {
     bool listen_start = false;      // послать серверу listen_start и начать отправку звука с микрофона
     bool listen_wake = false;       // вместе с listen_start: запись начата словом, а не кнопкой (mode "wake", звук подаёт wake.cc)
+    bool listen_follow = false;     // вместе с listen_wake: запись начата голосом без слова, в окне после ответа (mode "follow")
+    bool barge = false;             // вместе с abort и listen_start: слово перебило ответ
     bool listen_stop = false;       // дослать остаток, потом listen_stop
     bool abort = false;             // послать серверу abort
     bool stop_playback = false;     // сразу замолчать и очистить буфер ответа
@@ -60,7 +68,7 @@ struct Out {
     bool any() const
     {
         return listen_start || listen_stop || abort || stop_playback || begin_playback || finish_playback ||
-               clear_texts || capture_begin || capture_cancel || no_link;
+               clear_texts || capture_begin || capture_cancel || no_link || barge;
     }
 };
 
@@ -75,7 +83,14 @@ public:
 
     // Слово «Джарвис»: начать запись без кнопки. Принимается только в покое (Idle), при связи и отпущенной кнопке;
     // иначе пустой Out (автомат слова узнает по phase()). Запись заканчивает on_wake_end() или нажатие BOOT.
-    Out on_wake_start(uint32_t now);
+    // follow = true: запись началась не со слова, а с голоса в окне после ответа (listen_start с mode=follow).
+    Out on_wake_start(uint32_t now, bool follow = false);
+    // Слово «Джарвис» посреди ответа (THINKING или SPEAKING): замолчать и начать запись. Принимается при связи и отпущенной
+    // кнопке; в других фазах пустой Out. Out: abort + stop_playback + clear_texts + listen_start (wake) + barge.
+    Out on_barge(uint32_t now);
+    // Ответ назвал себя («Джарвис» в тексте предложения): пока этот ответ не кончился, перебивать его голосом нельзя
+    // (динамик сам скажет слово, микрофон его услышит). Сбрасывается в начале следующего ответа.
+    void note_names_self() { names_self_ = true; }
     // Конец записи, начатой словом (конец фразы): listen_stop и THINKING. no_speech = ничего не сказали: сразу в покой,
     // ответа ждать не надо (сервер на пустую запись отвечает state idle, это безвредно).
     Out on_wake_end(uint32_t now, bool no_speech);
@@ -97,9 +112,15 @@ public:
     bool pressed() const { return pressed_; }
     bool link_ready() const { return link_; }
     bool wake_listening() const { return phase_ == Phase::Listening && listen_wake_; }
+    bool follow_listening() const { return phase_ == Phase::Listening && listen_wake_ && listen_follow_; }
     // Сервер сейчас шлёт или готов слать звук, и мы его берём
     bool accept_audio() const { return phase_ == Phase::Speaking && !stale_ && audio_open_ && !audio_ended_; }
     uint32_t aborts() const { return aborts_; }
+    // Сколько ответов закончилось нормально (доиграны до конца) за всё время; растёт на единицу в тот самый такт, когда лицо
+    // возвращается в IDLE. Не растёт после abort, обрыва звука, ошибки, пропажи связи и ответа без звука.
+    uint32_t answers_done() const { return answers_done_; }
+    uint32_t barges() const { return barges_; }
+    bool names_self() const { return names_self_; }
 
 private:
     Out abort_answer(uint32_t now);
@@ -123,8 +144,17 @@ private:
     bool audio_open_ = false;       // audio_start принят
     bool audio_ended_ = false;      // audio_end принят (или state idle вместо него)
     uint32_t aborts_ = 0;
+    uint32_t answers_done_ = 0;
+    uint32_t barges_ = 0;
+    bool listen_follow_ = false;    // текущая запись по слову (Listening) начата голосом в окне, а не словом
+    bool names_self_ = false;       // ответ уже назвал себя вслух
     char err_msg_[proto::kMaxErrMsg + 1] = {0};
 };
+
+// Сообщения серверу в том порядке, в каком их надо отправить для решения Out (максимум три): abort, потом listen_start
+// (mode ptt | wake | follow), потом listen_stop. Порядок важен: abort раньше listen_start, иначе сервер сначала начал бы новую
+// запись, а потом «прервал» её. Возвращает число сообщений, msgs не короче трёх.
+int out_messages(const Out &o, proto::OutMsg *msgs);
 
 }  // namespace dialog
 }  // namespace jarvis

@@ -50,6 +50,41 @@ const char *blocker_name(const Cond &c)
     return "none";
 }
 
+const char *barge_blocker_name(const Cond &c, bool barge_on)
+{
+    if (!c.enabled) {
+        return "disabled";
+    }
+    if (!c.engine_ok) {
+        return "no_engine";
+    }
+    if (!c.mic_ok) {
+        return "no_mic";
+    }
+    if (!c.wifi_up) {
+        return "no_wifi";
+    }
+    if (!c.link_ready) {
+        return "no_link";
+    }
+    if (!barge_on) {
+        return "barge_off";
+    }
+    if (!c.dialog_answering) {
+        return "not_answering";
+    }
+    if (c.button_down) {
+        return "button";
+    }
+    if (c.diag_busy) {
+        return "diag_busy";
+    }
+    if (c.dialog_names_self) {
+        return "own_name";
+    }
+    return "none";
+}
+
 const char *state_name(State s)
 {
     switch (s) {
@@ -75,7 +110,61 @@ const char *stop_reason_name(StopReason r)
     return "?";
 }
 
+const char *rec_kind_name(RecKind k)
+{
+    switch (k) {
+    case RecKind::Wake:   return "wake";
+    case RecKind::Follow: return "follow";
+    case RecKind::Barge:  return "barge";
+    }
+    return "?";
+}
+
 // ------------------------------------------------------------------ автомат
+
+void Machine::set_beep_level(int level)
+{
+    if (level < 0) {
+        level = 0;
+    }
+    if (level > kBeepLevelMax) {
+        level = kBeepLevelMax;
+    }
+    beep_level_ = level;
+}
+
+void Machine::set_follow_ms(uint32_t ms)
+{
+    if (ms != 0) {
+        if (ms < kFollowMinMs) {
+            ms = kFollowMinMs;
+        }
+        if (ms > kFollowMaxMs) {
+            ms = kFollowMaxMs;
+        }
+    }
+    follow_ms_ = ms;
+    if (ms == 0) {
+        pending_ = false;
+        follow_open_ = false;
+    }
+}
+
+void Machine::set_barge(bool on)
+{
+    barge_on_ = on;
+    if (!on) {
+        atten_ = false;
+    }
+}
+
+uint32_t Machine::follow_left_ms(uint32_t now) const
+{
+    if (!follow_open_ || timeutil::reached(now, follow_until_)) {
+        return 0;
+    }
+    return follow_until_ - now;
+}
 
 void Machine::set_silence_ms(uint32_t ms)
 {
@@ -124,6 +213,26 @@ Out Machine::check_recording(uint32_t now)
     return Out();
 }
 
+void Machine::begin_recording(RecKind k, uint32_t now)
+{
+    state_ = State::Recording;
+    blocker_ = "none";
+    rec_kind_ = k;
+    rec_start_ = now;
+    follow_open_ = false;   // окно и ожидание окна кончились: идёт запись
+    pending_ = false;
+    if (k == RecKind::Follow) {
+        // Речь уже идёт (её увидел VAD), писка нет: ждать «окно после слова» не надо
+        settle_until_ = now;
+        speech_started_ = true;
+        last_speech_ = now;
+    } else {
+        settle_until_ = now + (beep_level_ > 0 ? kSettleBeepMs : kSettleMs);
+        speech_started_ = false;
+        last_speech_ = now;
+    }
+}
+
 Out Machine::on_tick(const Cond &c, uint32_t now)
 {
     if (have_tick_ && state_ == State::Armed) {
@@ -131,6 +240,43 @@ Out Machine::on_tick(const Cond &c, uint32_t now)
     }
     have_tick_ = true;
     last_tick_ = now;
+
+    // ---- ответ: сколько идёт, звучит ли голос; звук для движка ослабляется, пока он звучит
+    if (c.dialog_answering) {
+        if (!answering_) {
+            answering_ = true;
+            answer_start_ = now;
+        }
+        if (c.dialog_speaking) {
+            if (!speaking_) {
+                speaking_ = true;
+                speak_start_ = now;
+            }
+        } else {
+            speaking_ = false;
+        }
+    } else {
+        answering_ = false;
+        speaking_ = false;
+    }
+    if (barge_on_ && c.enabled && c.engine_ok && c.dialog_speaking) {
+        atten_ = true;
+        atten_until_ = now + kAttenTailMs;
+    } else if (!barge_on_ || reached(now, atten_until_)) {
+        atten_ = false;
+    }
+
+    // ---- ответ закончился нормально: окно follow ждёт, пока автомат встанет на взвод
+    if (!have_answers_) {
+        have_answers_ = true;
+        seen_answers_ = c.answers_done;
+    } else if (c.answers_done != seen_answers_) {
+        seen_answers_ = c.answers_done;
+        if (follow_ms_ > 0) {
+            pending_ = true;
+            pending_since_ = now;
+        }
+    }
 
     if (state_ == State::Recording) {
         if (!c.dialog_listening) {
@@ -154,6 +300,7 @@ Out Machine::on_tick(const Cond &c, uint32_t now)
     const bool all_ok = c.enabled && c.engine_ok && c.mic_ok && c.wifi_up && c.link_ready && c.dialog_idle &&
                         !c.button_down && !c.diag_busy;
     blocker_ = blocker_name(c);
+    const State prev = state_;
     if (!c.enabled) {
         state_ = State::Off;
         ok_valid_ = false;
@@ -170,31 +317,87 @@ Out Machine::on_tick(const Cond &c, uint32_t now)
         }
         state_ = (elapsed(now, ok_since_) >= kResumeMs) ? State::Armed : State::Resuming;
     }
+
+    // ---- перебивание: можно ли, если сейчас услышим слово
+    barge_why_ = barge_blocker_name(c, barge_on_);
+    barge_ready_ = strcmp(barge_why_, "none") == 0;
+
+    // ---- окно follow. Ожидание живёт, пока разговор в покое и связь на месте; короткая помеха (динамик ещё доигрывает
+    // хвост) его не убивает, но дольше kFollowGraceMs после конца ответа ждать нельзя.
+    if (pending_) {
+        const bool alive = c.enabled && c.engine_ok && c.mic_ok && c.wifi_up && c.link_ready && c.dialog_idle && !c.button_down;
+        if (!alive || elapsed(now, pending_since_) > kFollowGraceMs) {
+            pending_ = false;
+        }
+    }
+    if (state_ == State::Armed) {
+        if (prev != State::Armed && pending_) {
+            pending_ = false;
+            follow_open_ = true;
+            follow_until_ = now + follow_ms_;
+            follow_serial_++;
+            stats_.follow_opened++;
+        }
+    } else {
+        follow_open_ = false;   // не на взводе (BOOT, пропала связь, ответ пошёл): окно закрыто
+    }
+    if (follow_open_ && reached(now, follow_until_)) {
+        follow_open_ = false;   // никто не заговорил: молча обратно в обычный взвод
+        stats_.follow_timeouts++;
+    }
     return Out();
 }
 
-Out Machine::on_detect(uint32_t now)
+Out Machine::on_detect(uint32_t now, bool stale_word)
 {
     Out o;
     if (state_ == State::Armed) {
-        state_ = State::Recording;
-        blocker_ = "none";
-        rec_start_ = now;
-        settle_until_ = now + (beep_ ? kSettleBeepMs : kSettleMs);
-        speech_started_ = false;
-        last_speech_ = now;
+        begin_recording(RecKind::Wake, now);
         stats_.detections++;
         stats_.have_last = true;
         stats_.last_detect_ms = now;
         o.start = true;
-        o.beep = beep_;
+        o.beep = beep_level_ > 0;
+        return o;
+    }
+    if (state_ == State::Waiting && barge_ready_ && answering_ && !stale_word) {
+        begin_recording(RecKind::Barge, now);
+        stats_.detections++;
+        stats_.barge_ins++;
+        stats_.have_last = true;
+        stats_.last_detect_ms = now;
+        o.start = true;
+        o.barge = true;
+        o.beep = beep_level_ > 0;
         return o;
     }
     stats_.rejected++;
     o.rejected = true;
-    o.reject_why = (state_ == State::Recording) ? "already_recording"
-                   : (state_ == State::Resuming) ? "resume_delay"
-                                                 : blocker_;
+    if (state_ == State::Recording) {
+        o.reject_why = "already_recording";
+    } else if (state_ == State::Resuming) {
+        o.reject_why = "resume_delay";
+    } else if (answering_ && state_ == State::Waiting && barge_ready_ && stale_word) {
+        o.reject_why = "stale_word";
+    } else if (answering_ && barge_on_) {
+        o.reject_why = barge_why_;   // перебивание включено, но сейчас нельзя: «own_name», «button», ...
+    } else {
+        o.reject_why = blocker_;     // перебивание выключено (или ответа нет): как в v0.4.0, «dialog_busy» и т.п.
+    }
+    return o;
+}
+
+Out Machine::on_follow_speech(uint32_t now, uint32_t run_ms)
+{
+    Out o;
+    if (state_ != State::Armed || !follow_open_ || run_ms < kFollowSpeechMs) {
+        return o;
+    }
+    begin_recording(RecKind::Follow, now);
+    stats_.follow_starts++;
+    o.start = true;
+    o.follow = true;
+    o.beep = false;
     return o;
 }
 
@@ -202,9 +405,18 @@ void Machine::on_start_refused(uint32_t now)
 {
     (void)now;
     if (state_ == State::Recording) {
-        // detections уже посчитан, но записи не было: не считаем это словом
-        if (stats_.detections > 0) {
-            stats_.detections--;
+        // счётчики уже выросли, но записи не было: не считаем это словом
+        if (rec_kind_ == RecKind::Follow) {
+            if (stats_.follow_starts > 0) {
+                stats_.follow_starts--;
+            }
+        } else {
+            if (stats_.detections > 0) {
+                stats_.detections--;
+            }
+            if (rec_kind_ == RecKind::Barge && stats_.barge_ins > 0) {
+                stats_.barge_ins--;
+            }
         }
         stats_.refused++;
         state_ = State::Waiting;
@@ -278,18 +490,85 @@ Plan plan_capture(int64_t ring_edge, int64_t ring_oldest, int64_t afe_pos, uint3
     return p;
 }
 
+Plan plan_follow(int64_t ring_edge, int64_t ring_oldest, int64_t afe_pos, int64_t open_pos)
+{
+    Plan p;
+    int64_t k = afe_pos - ms_to_samples(kFollowPreRollMs);
+    k = max64(k, open_pos - ms_to_samples(kFollowOpenSlackMs));
+    k = max64(k, ring_oldest);
+    k = min64(k, ring_edge);   // в кольце ничего позже края нет
+    p.keep_from = k;
+    p.skip_from = p.skip_to = k;   // писка нет, ничего не вырезаем
+    return p;
+}
+
 // ------------------------------------------------------------------ писк и мелочи
+
+float beep_level_dbfs(int level)
+{
+    if (level <= 0) {
+        return -120.0f;
+    }
+    if (level > kBeepLevelMax) {
+        level = kBeepLevelMax;
+    }
+    return -20.0f + 4.0f * static_cast<float>(level - 1);   // 1: -20, 2: -16, 3: -12, 4: -8, 5: -4
+}
+
+bool beep_level_valid(int level) { return level >= 0 && level <= kBeepLevelMax; }
+
+int beep_level_from_saved(bool has_level, int level, bool has_old_bool, int old_bool)
+{
+    if (has_level && beep_level_valid(level)) {
+        return level;
+    }
+    if (has_old_bool) {
+        return old_bool != 0 ? kBeepLevelDefault : 0;
+    }
+    return kBeepLevelDefault;
+}
 
 size_t wake_beep_length(uint32_t rate) { return dsp::beep_length(rate, kBeepMs); }
 
-void generate_wake_beep(int16_t *out, uint32_t rate)
+void generate_wake_beep(int16_t *out, uint32_t rate, int level)
 {
     const size_t n = wake_beep_length(rate);
+    memset(out, 0, n * sizeof(int16_t));
+    if (level <= 0) {
+        return;
+    }
+    const float peak = beep_level_dbfs(level);
     const size_t tone = dsp::beep_length(rate, 55);
     const size_t gap = n - 2 * tone;   // остаток (10 мс) тишиной между тонами
-    memset(out, 0, n * sizeof(int16_t));
-    dsp::generate_beep(out, tone, rate, kBeepFreqAHz, kBeepPeakDbfs);
-    dsp::generate_beep(out + tone + gap, tone, rate, kBeepFreqBHz, kBeepPeakDbfs);
+    dsp::generate_beep(out, tone, rate, kBeepFreqAHz, peak);
+    dsp::generate_beep(out + tone + gap, tone, rate, kBeepFreqBHz, peak);
+}
+
+bool follow_valid(uint32_t ms) { return ms == 0 || (ms >= kFollowMinMs && ms <= kFollowMaxMs); }
+
+uint32_t follow_from_saved(bool has, uint32_t ms) { return (has && follow_valid(ms)) ? ms : kFollowDefaultMs; }
+
+float barge_threshold(float normal, float custom)
+{
+    if (!(normal > 0.0f)) {
+        return 0.0f;
+    }
+    float t;
+    if (custom > 0.0f) {
+        t = custom;
+    } else {
+        t = normal + kBargeThrOffset;
+        if (t > kBargeThrCap) {
+            t = kBargeThrCap;
+        }
+    }
+    if (t < normal) {
+        t = normal;
+    }
+    if (t > kThresholdMax) {
+        t = kThresholdMax;
+    }
+    return t;
 }
 
 const char *idle_hint(bool wake_on_and_ready, bool didnt_hear_active)

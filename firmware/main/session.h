@@ -25,7 +25,11 @@ void tick();
 
 // Слово «Джарвис» (wake.cc, главный цикл): начать запись без кнопки. true: разговор принял (лицо LISTENING, listen_start с
 // mode=wake ушёл в очередь, запись микрофона включена в режиме inject: звук подаёт wake.cc). false: занят, ничего не сделано.
-bool wake_begin(uint32_t now_ms);
+// follow = true: запись началась с голоса в окне после ответа (mode=follow).
+bool wake_begin(uint32_t now_ms, bool follow = false);
+// Слово «Джарвис» посреди ответа (THINKING или SPEAKING): замолчать, abort серверу и сразу новая запись по слову. В очередь к
+// серверу идут abort, потом listen_start (в таком порядке). true: принято; false: фаза уже другая, ничего не сделано.
+bool wake_barge(uint32_t now_ms);
 // Конец записи, начатой словом: listen_stop и THINKING (no_speech: сразу в покой). false: разговор уже не слушает.
 bool wake_end(uint32_t now_ms, bool no_speech);
 
@@ -34,8 +38,12 @@ struct View {
     char error_msg[proto::kMaxErrMsg + 1] = {0};
     bool link_ready = false;
     bool button_down = false;
-    bool wake_listening = false;   // идёт запись, начатая словом
+    bool wake_listening = false;   // идёт запись, начатая словом (или голосом в окне follow)
+    bool follow_listening = false; // запись начата голосом в окне follow
+    bool names_self = false;       // идущий ответ уже назвал «Джарвис» (перебивать голосом нельзя)
     uint32_t aborts = 0;
+    uint32_t answers_done = 0;     // сколько ответов закончилось нормально (по нему автомат слова открывает окно follow)
+    uint32_t barges = 0;           // сколько раз ответ перебит словом
 };
 View view();
 

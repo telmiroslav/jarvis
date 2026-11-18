@@ -116,13 +116,19 @@ class Settings:
     tts_gap_ms: int = 0
     voice_dir: Path = field(default_factory=lambda: config_dir() / "voice")
     # разговор
-    memory_turns: int = 10
+    memory_turns: int = 20  # обменов в памяти: на игру в «города» нужно помнить названные города
     memory_idle_s: float = 600.0
-    first_chunk_max_chars: int = 80
+    first_chunk_split: bool = True  # длинное первое предложение озвучивать двумя кусками (быстрее первый звук)
+    first_chunk_max_chars: int = 70  # первое предложение длиннее этого режется (0 = не резать)
     chunk_max_chars: int = 220
     max_utterance_s: float = 30.0
     min_utterance_s: float = 0.3
     preroll_s: float = 0.2  # первые ~200 мс записи плата берёт из до-записи (до listen_start); не обрезаем, но не считаем речью
+    follow_preroll_s: float = 0.4  # то же в режиме follow (предзапись ~400 мс)
+    # режим follow: отсев чужой болтовни и междометий (followguard.py)
+    follow_guard: bool = True
+    follow_min_logprob: float = -1.1  # средняя уверенность Whisper (avg_logprob) ниже этого: скорее шум, принятый за слова
+    follow_max_no_speech: float = 0.6  # вероятность «это не речь» (no_speech_prob) выше этого: тоже
     # подача звука
     frame_ms: int = 40
     pacing_burst_s: float = 0.5
@@ -189,11 +195,16 @@ def load_settings(env_override: dict[str, str] | None = None, *, files: list[Pat
         voice_dir=voice_dir,
         memory_turns=_int(env, "JARVIS_MEMORY_TURNS", base.memory_turns),
         memory_idle_s=_float(env, "JARVIS_MEMORY_IDLE_S", base.memory_idle_s),
+        first_chunk_split=_bool(env, "JARVIS_FIRST_CHUNK_SPLIT", base.first_chunk_split),
         first_chunk_max_chars=_int(env, "JARVIS_FIRST_CHUNK_MAX_CHARS", base.first_chunk_max_chars),
         chunk_max_chars=_int(env, "JARVIS_CHUNK_MAX_CHARS", base.chunk_max_chars),
         max_utterance_s=_float(env, "JARVIS_MAX_UTTERANCE_S", base.max_utterance_s),
         min_utterance_s=_float(env, "JARVIS_MIN_UTTERANCE_S", base.min_utterance_s),
         preroll_s=_float(env, "JARVIS_PREROLL_S", base.preroll_s),
+        follow_preroll_s=_float(env, "JARVIS_FOLLOW_PREROLL_S", base.follow_preroll_s),
+        follow_guard=_bool(env, "JARVIS_FOLLOW_GUARD", base.follow_guard),
+        follow_min_logprob=_float(env, "JARVIS_FOLLOW_MIN_LOGPROB", base.follow_min_logprob),
+        follow_max_no_speech=_float(env, "JARVIS_FOLLOW_MAX_NO_SPEECH", base.follow_max_no_speech),
         frame_ms=_int(env, "JARVIS_FRAME_MS", base.frame_ms),
         pacing_burst_s=_float(env, "JARVIS_PACING_BURST_S", base.pacing_burst_s),
         pacing_max_lead_s=_float(env, "JARVIS_PACING_MAX_LEAD_S", base.pacing_max_lead_s),

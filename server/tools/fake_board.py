@@ -6,6 +6,8 @@
   fake_board.py --url ws://127.0.0.1:47801/ws q1.wav q2.wav     # два хода подряд на одном подключении
   fake_board.py q.wav --abort-after-audio 2        # через 2 с после первого звука нажать «abort»
   fake_board.py q.wav --mode wake                  # как плата v0.4 после слова «Джарвис»: listen_start с mode=wake
+  fake_board.py q.wav --mode follow                # продолжение разговора без слова: listen_start с mode=follow
+  fake_board.py a.wav b.wav --abort-after-audio 2 --pause 0   # приблизительно barge-in: abort посреди ответа и сразу новая запись
 
 Звук на этой машине не проигрывается: ответ только сохраняется в WAV (папка --out-dir).
 Код возврата: 0 ход завершён штатно, 3 сервер прислал state error, 2 нарушение протокола или тайм-аут.
@@ -292,7 +294,7 @@ def main() -> int:
     ap.add_argument("--discover-timeout", type=float, default=9.0)
     ap.add_argument("--out-dir", default="fake_board_out", help="куда сохранять звук ответа")
     ap.add_argument("--name", default="reply", help="префикс имени файла ответа")
-    ap.add_argument("--mode", default="ptt", help="значение listen_start.mode: ptt (кнопка) или wake (слово «Джарвис»)")
+    ap.add_argument("--mode", default="ptt", help="значение listen_start.mode: ptt (кнопка), wake (слово «Джарвис») или follow (продолжение без слова)")
     ap.add_argument("--chunk-ms", type=int, default=40)
     ap.add_argument("--fast", action="store_true", help="слать звук не по часам, а сразу")
     ap.add_argument("--tail-silence", type=float, default=0.3, help="секунд тишины перед listen_stop")

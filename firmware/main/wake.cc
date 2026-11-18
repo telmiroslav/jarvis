@@ -78,7 +78,11 @@ constexpr size_t kMinInternalAfterBytes = 20 * 1024;
 constexpr size_t kMinPsramBytes = 1536 * 1024;
 
 constexpr size_t kRingSamples = 16384;                     // кольцо блоков микрофона, 1,02 с (степень двойки)
-constexpr size_t kPreRollMax = static_cast<size_t>(wake_logic::ms_to_samples(wake_logic::kPreRollMs)) + 64;
+// Буфер предзаписи (PSRAM). Для follow это kFollowPreRollMs до позиции движка плюс то, на сколько движок отстал от края кольца
+// (обычно < 100 мс), с запасом 400 мс; для слова хватает 150 мс. Если не помещается, берётся самое свежее.
+constexpr size_t kPreRollMax = static_cast<size_t>(wake_logic::ms_to_samples(wake_logic::kFollowPreRollMs + 400)) + 64;
+constexpr int kEngineGainAtten = AudioIn::kPcmGain / 4;    // -12 дБ для движка, пока звучит ответ: 4 -> 1
+static_assert(AudioIn::kPcmGain == 4 && wake_logic::kBargeAttenDb == 12, "kEngineGainAtten is -12 dB only for kPcmGain 4");
 constexpr uint32_t kStatPeriodMs = 30000;
 constexpr uint32_t kGuardClearMs = 30000;                  // через столько работы сторож запуска снимается
 constexpr uint32_t kRejectLogGapMs = 3000;
@@ -103,6 +107,7 @@ struct Ctx {
     bool ok = false;
     const char *why = "not_started";
     AudioOut *out = nullptr;
+    AudioIn *in = nullptr;
     const esp_afe_sr_iface_t *afe = nullptr;
     esp_afe_sr_data_t *afe_data = nullptr;
     srmodel_list_t *models = nullptr;
@@ -122,8 +127,9 @@ struct Ctx {
 
     // ---- кольцо и окно записи (под mu)
     std::mutex mu;
-    int16_t *ring = nullptr;
-    int64_t ring_w = 0;            // сколько отсчётов принято всего (индекс следующего)
+    int16_t *ring = nullptr;       // то, что уходит серверу (предзапись берётся отсюда)
+    int16_t *eng_ring = nullptr;   // то же для движка: пока звучит ответ при включённом перебивании на 12 дБ тише
+    int64_t ring_w = 0;            // сколько отсчётов принято всего (индекс следующего), общий для обоих колец
     int64_t feed_pos = 0;          // индекс следующего отсчёта, который уйдёт в AFE
     int64_t t_edge_us = 0;         // когда принят последний блок
     wake_logic::Gate gate;
@@ -134,12 +140,15 @@ struct Ctx {
     double period_sum_sq = 0.0;              // за период WAKE stat
     double period_peak = 0.0;
     uint32_t period_blocks = 0;
+    uint32_t period_clip_srv = 0;            // отсчётов на полной шкале (срез) в звуке, который уходит серверу
+    uint32_t period_clip_eng = 0;            // и в звуке для движка (там пока звучит ответ срез убран ослаблением)
 
     // ---- счётчики задач (атомарные)
     std::atomic<uint32_t> fed_frames{0};
     std::atomic<uint32_t> fetched_frames{0};
     std::atomic<uint32_t> vad_frames{0};
     std::atomic<uint32_t> vad_speech{0};
+    std::atomic<uint32_t> vad_run{0};          // сколько кадров подряд VAD видит речь (обнуляется кадром без речи)
     std::atomic<uint32_t> ring_overruns{0};
     std::atomic<uint32_t> afe_errors{0};
     std::atomic<uint32_t> fetch_timeouts{0};
@@ -149,6 +158,7 @@ struct Ctx {
     // ---- усиление звука для движка (только в AFE; на сервер звук идёт как был)
     std::atomic<float> gain_lin{1.0f};
     int gain_db = 0;                         // под ctl_mu
+    std::atomic<bool> atten{false};          // звук для движка ослаблен (идёт ответ): усиление wake gain тогда не применяется
 
     // ---- измерения (wake_perf.h)
     // Время подачи каждого кадра (мкс, младшие 32 бита) по номеру кадра: feed пишет, fetch читает. Кольцо AFE 50 кадров < 64.
@@ -191,6 +201,21 @@ struct Ctx {
     uint32_t stat_prev_vad_speech = 0;
     bool guard_pending = false;
     uint32_t guard_clear_at_ms = 0;
+    // v0.4.2: окно follow, перебивание
+    float barge_thr_custom = 0.0f;           // wake barge thr, 0 = автоматически
+    bool thr_barge_on = false;               // в движке сейчас порог для ответа
+    float thr_barge_applied = 0.0f;
+    // Просьба fetch сменить порог в движке (-1 = просьбы нет, 0 = стандартный порог модели, иначе порог). Меняет его сама задача
+    // fetch между кадрами: эту же библиотеку она держит в руках, пока считает кадр, и менять порог из другой задачи посреди
+    // расчёта не нужно.
+    std::atomic<float> thr_req{-1.0f};
+    uint32_t follow_seen_serial = 0;         // номер открытия окна, который уже учтён
+    uint32_t follow_frames0 = 0;             // vad_frames при открытии окна
+    int64_t follow_open_pos = 0;             // позиция движка при открытии окна
+    uint32_t follow_open_ms = 0;
+    uint32_t follow_logged_timeouts = 0;
+    bool was_answering = false;
+    int64_t answer_pos = 0;                  // ring_w в момент, когда начался ответ (слово до этой позиции относится к вопросу)
     std::atomic<bool> gate_on{false};
     std::atomic<bool> run{true};     // false: «wake off», звук в движок не подаём (он простаивает, процессор свободен)
 };
@@ -223,25 +248,32 @@ void log_memory(const char *when)
 
 // ---- кольцо (вызывающий держит C.mu)
 
-void ring_write(const int16_t *src, size_t n)
+// Пишет n <= kRingSamples отсчётов в кольцо ring начиная с индекса at (индекс не двигает)
+void ring_copy_in(int16_t *ring, int64_t at, const int16_t *src, size_t n)
 {
-    const size_t pos = static_cast<size_t>(C.ring_w) & (kRingSamples - 1);
+    const size_t pos = static_cast<size_t>(at) & (kRingSamples - 1);
     const size_t first = (kRingSamples - pos) < n ? (kRingSamples - pos) : n;
-    memcpy(C.ring + pos, src, first * sizeof(int16_t));
+    memcpy(ring + pos, src, first * sizeof(int16_t));
     if (n > first) {
-        memcpy(C.ring, src + first, (n - first) * sizeof(int16_t));
+        memcpy(ring, src + first, (n - first) * sizeof(int16_t));
     }
-    C.ring_w += static_cast<int64_t>(n);
 }
 
-void ring_read(int64_t from, size_t n, int16_t *dst)
+void ring_read(const int16_t *ring, int64_t from, size_t n, int16_t *dst)
 {
     const size_t pos = static_cast<size_t>(from) & (kRingSamples - 1);
     const size_t first = (kRingSamples - pos) < n ? (kRingSamples - pos) : n;
-    memcpy(dst, C.ring + pos, first * sizeof(int16_t));
+    memcpy(dst, ring + pos, first * sizeof(int16_t));
     if (n > first) {
-        memcpy(dst + first, C.ring, (n - first) * sizeof(int16_t));
+        memcpy(dst + first, ring, (n - first) * sizeof(int16_t));
     }
+}
+
+// Позиция движка: индекс отсчёта, до которого он дошёл (всё до него он уже видел). Вызывающий держит C.mu.
+int64_t afe_pos_locked()
+{
+    const int64_t in_afe = static_cast<int64_t>(C.fed_frames.load()) - static_cast<int64_t>(C.fetched_frames.load());
+    return C.feed_pos - (in_afe > 0 ? in_afe : 0) * C.feed_chunk;
 }
 
 // ---- задачи
@@ -275,7 +307,7 @@ void feed_task(void *)
                         skipped = lag;
                     }
                     if (C.ring_w - C.feed_pos >= static_cast<int64_t>(chunk)) {
-                        ring_read(C.feed_pos, chunk, C.feed_buf);
+                        ring_read(C.eng_ring, C.feed_pos, chunk, C.feed_buf);
                         C.feed_pos += static_cast<int64_t>(chunk);
                         got = true;
                     }
@@ -293,8 +325,9 @@ void feed_task(void *)
                 if (!got) {
                     break;
                 }
-                // Усиление только для движка (кольцо и звук серверу остаются как были)
-                const float gain = C.gain_lin.load();
+                // Усиление только для движка (кольцо и звук серверу остаются как были). Пока звучит ответ, звук уже ослаблен
+                // на 12 дБ в audio_in; усиление wake gain тогда не применяем (оно вернуло бы срез: 4x и насыщение)
+                const float gain = C.atten.load() ? 1.0f : C.gain_lin.load();
                 if (gain != 1.0f) {
                     dsp::scale_i16_sat(C.feed_buf, chunk, gain);
                 }
@@ -329,6 +362,15 @@ void fetch_task(void *)
             vTaskDelay(pdMS_TO_TICKS(100));
             run_start_us = now_us32();
             continue;
+        }
+        const float thr_rq = C.thr_req.exchange(-1.0f);
+        if (thr_rq >= 0.0f) {
+            const int ok = thr_rq > 0.0f ? C.afe->set_wakenet_threshold(C.afe_data, 1, thr_rq) : C.afe->reset_wakenet_threshold(C.afe_data, 1);
+            if (ok == 1) {
+                ESP_LOGI(TAG, "WAKE word threshold now %s (the engine confirmed)", thr_rq > 0.0f ? "changed for the answer" : "back to the default");
+            } else {
+                ESP_LOGW(TAG, "the engine refused the threshold change (%.3f)", static_cast<double>(thr_rq));
+            }
         }
         const uint32_t fed0 = C.fed_frames.load();
         const uint32_t got0 = C.fetched_frames.load();   // номер кадра, который сейчас придёт
@@ -379,14 +421,15 @@ void fetch_task(void *)
         C.vad_frames.fetch_add(1);
         if (res->vad_state == VAD_SPEECH) {
             C.vad_speech.fetch_add(1);
+            C.vad_run.fetch_add(1);
+        } else {
+            C.vad_run.store(0);
         }
         C.last_volume.store(res->data_volume);
         if (res->wakeup_state == WAKENET_DETECTED) {
             std::lock_guard<std::mutex> lock(C.mu);
-            const int64_t in_afe = static_cast<int64_t>(C.fed_frames.load()) - static_cast<int64_t>(C.fetched_frames.load());
-            const int64_t backlog_samples = (in_afe > 0 ? in_afe : 0) * C.feed_chunk;
             C.det.pending = true;
-            C.det.afe_pos = C.feed_pos - backlog_samples;
+            C.det.afe_pos = afe_pos_locked();
             C.det.model_idx = res->wakenet_model_index;
             C.det.word_idx = res->wake_word_index;
             C.det.word_len = res->wake_word_length;
@@ -508,8 +551,9 @@ void do_stop(const wake_logic::Out &o, uint32_t now, uint32_t rec_ms)
     }
     C.gate_on.store(false);
     const bool ended = session::wake_end(now, o.no_speech);
-    ESP_LOGI(TAG, "WAKE end: reason=%s, recording %u ms%s", wake_logic::stop_reason_name(o.reason),
-             static_cast<unsigned>(rec_ms), ended ? "" : " (the dialog had already left LISTENING)");
+    ESP_LOGI(TAG, "WAKE end: kind=%s reason=%s, recording %u ms%s", wake_logic::rec_kind_name(C.machine.rec_kind()),
+             wake_logic::stop_reason_name(o.reason), static_cast<unsigned>(rec_ms),
+             ended ? "" : " (the dialog had already left LISTENING)");
     if (o.no_speech) {
         C.didnt_hear_set = true;
         C.didnt_hear_until = now + wake_logic::kDidntHearMs;
@@ -517,15 +561,31 @@ void do_stop(const wake_logic::Out &o, uint32_t now, uint32_t rec_ms)
     perf_rec_end(rec_ms);
 }
 
-void do_start(const Detection &d, const wake_logic::Out &o, uint32_t now)
+// Начало записи: слово (Wake), голос в окне после ответа (Follow) или слово посреди ответа (Barge). phase: фаза разговора ДО
+// начала (для лога). d.afe_pos: позиция движка, до неё звук относится к слову (для Follow: к уже сказанному).
+void do_start(const Detection &d, const wake_logic::Out &o, uint32_t now, dialog::Phase phase)
 {
-    if (!session::wake_begin(now)) {
+    using wake_logic::RecKind;
+    const RecKind kind = o.barge ? RecKind::Barge : o.follow ? RecKind::Follow : RecKind::Wake;
+    // Сколько идёт ответ (до этого вызова: после него автомат считает уже запись)
+    const uint32_t answer_ms = C.machine.answer_ms(now);
+    const uint32_t speaking_ms = C.machine.speaking_ms(now);
+    const float spk_dbfs = C.out ? C.out->level_dbfs() : dsp::kFloorDbfs;
+    // Порядок сообщений серверу для перебивания: abort, потом listen_start (session::apply, dialog::out_messages)
+    const bool began = (kind == RecKind::Barge) ? session::wake_barge(now) : session::wake_begin(now, kind == RecKind::Follow);
+    if (!began) {
         C.machine.on_start_refused(now);
-        ESP_LOGW(TAG, "WAKE detected but the dialog is not idle any more: recording not started");
+        ESP_LOGW(TAG, "WAKE %s start refused: the dialog is not in the right phase any more: recording not started",
+                 wake_logic::rec_kind_name(kind));
         return;
     }
     perf_rec_begin();
-    const bool beep = o.beep && C.beep && C.out && C.out->ok() && !C.out->busy();
+    bool beep = o.beep && C.machine.beep_level() > 0 && C.out && C.out->ok();
+    if (beep && kind == RecKind::Barge) {
+        // Динамик только что остановлен (playback::abort): поток доигрывает последний кусок (20 мс), потом писк можно начать
+        C.out->wait_idle(100);
+    }
+    beep = beep && !C.out->busy();
     int pre_ms = 0;
     int since_ms = 0;
     wake_logic::Plan plan;
@@ -534,17 +594,21 @@ void do_start(const Detection &d, const wake_logic::Out &o, uint32_t now)
         const int64_t since_us = esp_timer_get_time() - C.t_edge_us;
         since_ms = since_us > 0 ? static_cast<int>(since_us / 1000) : 0;
         const int64_t oldest = C.ring_w > static_cast<int64_t>(kRingSamples) ? C.ring_w - static_cast<int64_t>(kRingSamples) : 0;
-        plan = wake_logic::plan_capture(C.ring_w, oldest, d.afe_pos, static_cast<uint32_t>(since_ms), beep);
+        if (kind == RecKind::Follow) {
+            plan = wake_logic::plan_follow(C.ring_w, oldest, d.afe_pos, C.follow_open_pos);
+        } else {
+            plan = wake_logic::plan_capture(C.ring_w, oldest, d.afe_pos, static_cast<uint32_t>(since_ms), beep);
+        }
         C.gate.start(plan.keep_from, plan.skip_from, plan.skip_to);
-        // Предзапись: то, что сказано после слова и до писка. Живые блоки пойдут через sink() под этим же замком, поэтому
-        // порядок отсчётов не нарушится.
+        // Предзапись: то, что сказано после слова и до писка (для follow: начало фразы, которое VAD заметил с опозданием).
+        // Живые блоки пойдут через sink() под этим же замком, поэтому порядок отсчётов не нарушится.
         int64_t n64 = C.ring_w - plan.keep_from;
         if (n64 > static_cast<int64_t>(kPreRollMax)) {
             n64 = static_cast<int64_t>(kPreRollMax);
         }
         if (n64 > 0 && C.preroll) {
             const int64_t from = C.ring_w - n64;
-            ring_read(from, static_cast<size_t>(n64), C.preroll);
+            ring_read(C.ring, from, static_cast<size_t>(n64), C.preroll);
             wake_logic::Span spans[2];
             const int ns = C.gate.apply(from, static_cast<size_t>(n64), spans);
             for (int i = 0; i < ns; i++) {
@@ -565,31 +629,58 @@ void do_start(const Detection &d, const wake_logic::Out &o, uint32_t now)
         mic_rms = C.last_rms_db;
         mic_peak = C.last_peak_db;
     }
+    if (kind == RecKind::Follow) {
+        ESP_LOGI(TAG,
+                 "WAKE follow start #%u: the voice began without the word (VAD speech for >= %u ms), the window had been open %u ms | "
+                 "mic rms=%.1f peak=%.1f dBFS | pre-roll+backlog sent %d ms, no beep | up=%us",
+                 static_cast<unsigned>(C.machine.stats().follow_starts), static_cast<unsigned>(wake_logic::kFollowSpeechMs),
+                 static_cast<unsigned>(timeutil::elapsed(now, C.follow_open_ms)), static_cast<double>(mic_rms),
+                 static_cast<double>(mic_peak), pre_ms, static_cast<unsigned>(now / 1000));
+        return;
+    }
+    const char *label = (kind == RecKind::Barge) ? "WAKE barge-in" : "WAKE detected";
     ESP_LOGI(TAG,
-             "WAKE detected #%u: model=%s (model idx %d, word idx %d) word_len=%d samples, volume=%.1f dB, thr=%.3f%s | mic "
+             "%s #%u: model=%s (model idx %d, word idx %d) word_len=%d samples, volume=%.1f dB, thr=%.3f%s | mic "
              "rms=%.1f peak=%.1f dBFS | pre-roll %d ms, beep %s, since the last mic block %d ms, AFE backlog %d ms | up=%us",
-             static_cast<unsigned>(C.machine.stats().detections), C.model_name, d.model_idx, d.word_idx, d.word_len,
-             static_cast<double>(d.volume), static_cast<double>(C.thr_now), C.thr_custom ? " (set by hand)" : " (model default)",
-             static_cast<double>(mic_rms), static_cast<double>(mic_peak), pre_ms, beep ? "on" : "off", since_ms, d.backlog_ms,
-             static_cast<unsigned>(now / 1000));
+             label, static_cast<unsigned>(C.machine.stats().detections), C.model_name, d.model_idx, d.word_idx, d.word_len,
+             static_cast<double>(d.volume), static_cast<double>(C.thr_barge_on && kind == RecKind::Barge ? C.thr_barge_applied : C.thr_now),
+             kind == RecKind::Barge ? (C.thr_barge_on ? " (barge threshold)" : " (normal)")
+                                    : (C.thr_custom ? " (set by hand)" : " (model default)"),
+             static_cast<double>(mic_rms), static_cast<double>(mic_peak), pre_ms,
+             beep ? "on" : "off", since_ms, d.backlog_ms, static_cast<unsigned>(now / 1000));
+    if (kind == RecKind::Barge) {
+        ESP_LOGI(TAG,
+                 "WAKE barge-in #%u detail: the word came while the dialog was %s, +%u ms into the answer (speaking +%u ms), "
+                 "speaker level %.1f dBFS, engine input %s | abort sent, then listen_start (wake); stale audio is dropped",
+                 static_cast<unsigned>(C.machine.stats().barge_ins), dialog::phase_name(phase), static_cast<unsigned>(answer_ms),
+                 static_cast<unsigned>(speaking_ms), static_cast<double>(spk_dbfs),
+                 C.atten.load() ? "attenuated (-12 dB)" : "normal");
+    }
 }
 
 void print_stat(uint32_t now)
 {
     const wake_logic::Stats &st = C.machine.stats();
     double sum_sq, peak;
-    uint32_t blocks;
+    uint32_t blocks, clip_srv, clip_eng;
     {
         std::lock_guard<std::mutex> lock(C.mu);
         sum_sq = C.period_sum_sq;
         peak = C.period_peak;
         blocks = C.period_blocks;
+        clip_srv = C.period_clip_srv;
+        clip_eng = C.period_clip_eng;
         C.period_sum_sq = 0.0;
         C.period_peak = 0.0;
         C.period_blocks = 0;
+        C.period_clip_srv = 0;
+        C.period_clip_eng = 0;
     }
     const float avg_db = blocks ? mean_sq_to_db(sum_sq / (static_cast<double>(blocks) * AudioIn::kBlockFrames)) : dsp::kFloorDbfs;
     const float peak_db = dsp::amplitude_to_dbfs(static_cast<float>(peak), dsp::kFullScale16) - kGainDb;
+    const double total_samples = static_cast<double>(blocks) * AudioIn::kBlockFrames;
+    const double clip_srv_pct = total_samples > 0.0 ? 100.0 * clip_srv / total_samples : 0.0;
+    const double clip_eng_pct = total_samples > 0.0 ? 100.0 * clip_eng / total_samples : 0.0;
     const uint32_t frames = C.fetched_frames.load();
     const uint32_t vad = C.vad_frames.load();
     const uint32_t vsp = C.vad_speech.load();
@@ -608,12 +699,18 @@ void print_stat(uint32_t now)
         snprintf(C.pb->period_cpu, sizeof(C.pb->period_cpu), "%s", pc);
     }
     ESP_LOGI(TAG,
-             "WAKE stat: armed %us of %us | words +%u (total %u) ignored +%u no_speech +%u | mic avg %.1f peak %.1f dBFS | VAD "
+             "WAKE stat: armed %us of %us | words +%u (total %u) ignored +%u no_speech +%u | follow windows +%u voice +%u silent +%u | "
+             "barge-ins +%u (total %u) | mic avg %.1f peak %.1f dBFS clipped srv %.1f%% eng %.1f%% | VAD "
              "speech %u%% | frames +%u dropped %u/%u | heap %u KB (min %u KB) PSRAM %u KB | state %s | gain %d dB | %s | %s",
              armed_s, static_cast<unsigned>(timeutil::elapsed(now, C.stat_at_ms) / 1000), static_cast<unsigned>(st.detections - C.stat_prev.detections),
              static_cast<unsigned>(st.detections), static_cast<unsigned>(st.rejected - C.stat_prev.rejected),
-             static_cast<unsigned>(st.nospeech_stops - C.stat_prev.nospeech_stops), static_cast<double>(avg_db),
-             static_cast<double>(peak_db), d_vad ? static_cast<unsigned>(d_sp * 100 / d_vad) : 0u,
+             static_cast<unsigned>(st.nospeech_stops - C.stat_prev.nospeech_stops),
+             static_cast<unsigned>(st.follow_opened - C.stat_prev.follow_opened),
+             static_cast<unsigned>(st.follow_starts - C.stat_prev.follow_starts),
+             static_cast<unsigned>(st.follow_timeouts - C.stat_prev.follow_timeouts),
+             static_cast<unsigned>(st.barge_ins - C.stat_prev.barge_ins), static_cast<unsigned>(st.barge_ins),
+             static_cast<double>(avg_db),
+             static_cast<double>(peak_db), clip_srv_pct, clip_eng_pct, d_vad ? static_cast<unsigned>(d_sp * 100 / d_vad) : 0u,
              static_cast<unsigned>(frames - C.stat_prev_frames), static_cast<unsigned>(C.ring_overruns.load()),
              static_cast<unsigned>(C.afe_errors.load()), static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024),
@@ -630,22 +727,30 @@ void print_stat(uint32_t now)
 
 // ---------------------------------------------------------------- запуск
 
-bool init(AudioOut *out)
+bool init(AudioOut *out, AudioIn *in)
 {
     C.out = out;
+    C.in = in;
     C.started = true;
 
     // Настройки (даже если движок не поднимется, команда wake их показывает)
     const settings::WakeSettings ws = settings::get_wake();
     C.enabled = ws.enabled;
     C.run.store(ws.enabled);
-    C.machine.set_beep(ws.beep);
+    C.machine.set_beep_level(ws.beep_level);
+    C.machine.set_follow_ms(ws.follow_ms);
+    C.machine.set_barge(ws.barge);
+    C.barge_thr_custom = ws.barge_thr;
     C.machine.set_silence_ms(ws.silence_ms);
     C.gain_db = wake_logic::gain_valid(ws.gain_db) ? ws.gain_db : 0;
     C.gain_lin.store(wake_logic::gain_db_to_linear(C.gain_db));
-    ESP_LOGI(TAG, "settings: wake %s, beep %s, silence %u ms, threshold %s, gain %d dB", ws.enabled ? "on" : "off",
-             ws.beep ? "on" : "off", static_cast<unsigned>(C.machine.silence_ms()),
-             ws.threshold > 0.0f ? "set by hand" : "model default", C.gain_db);
+    ESP_LOGI(TAG,
+             "settings: wake %s, beep level %d (%.0f dBFS), silence %u ms, threshold %s, gain %d dB, follow window %u ms, barge-in %s, "
+             "barge threshold %s",
+             ws.enabled ? "on" : "off", C.machine.beep_level(), static_cast<double>(wake_logic::beep_level_dbfs(C.machine.beep_level())),
+             static_cast<unsigned>(C.machine.silence_ms()), ws.threshold > 0.0f ? "set by hand" : "model default", C.gain_db,
+             static_cast<unsigned>(C.machine.follow_ms()), C.machine.barge() ? "on" : "off",
+             C.barge_thr_custom > 0.0f ? "set by hand" : "automatic");
 
     if (!ws.enabled) {
         // Выключено командой wake off: движок вообще не запускаем (ни памяти, ни процессора, ни риска). Включить: wake on + reboot
@@ -680,15 +785,17 @@ bool init(AudioOut *out)
 
     // Буферы
     C.ring = static_cast<int16_t *>(heap_caps_malloc(kRingSamples * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    C.eng_ring = static_cast<int16_t *>(heap_caps_malloc(kRingSamples * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     C.preroll = static_cast<int16_t *>(heap_caps_malloc(kPreRollMax * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     C.beep_n = wake_logic::wake_beep_length(AudioOut::kSampleRate);
     C.beep = static_cast<int16_t *>(heap_caps_malloc(C.beep_n * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!C.ring || !C.preroll || !C.beep) {
+    if (!C.ring || !C.eng_ring || !C.preroll || !C.beep) {
         settings::set_wake_guard(false);
         return fail("low_memory", "no memory for the wake word buffers");
     }
     memset(C.ring, 0, kRingSamples * sizeof(int16_t));
-    wake_logic::generate_wake_beep(C.beep, AudioOut::kSampleRate);
+    memset(C.eng_ring, 0, kRingSamples * sizeof(int16_t));
+    wake_logic::generate_wake_beep(C.beep, AudioOut::kSampleRate, C.machine.beep_level());
     // Буфер измерений (снимки задач и готовые строки, около 4 КБ) в PSRAM; не нашлось, то без загрузки процессора по задачам
     void *pbmem = heap_caps_calloc(1, sizeof(Ctx::PerfBufs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (pbmem) {
@@ -829,13 +936,20 @@ bool init(AudioOut *out)
     log_memory("with the wake tasks running");
     ESP_LOGI(TAG,
              "WAKE ready: word \"Jarvis\" (%s), VAD %s, threshold %.3f%s, silence end %u ms, no-speech timeout %u s, cap %u s, "
-             "resume delay %u ms, beep %s, wake %s, gain %d dB (engine only) | tasks: feed core %d prio %d, fetch core %d prio %d "
+             "resume delay %u ms, beep level %d, wake %s, gain %d dB (engine only) | tasks: feed core %d prio %d, fetch core %d prio %d "
              "(VAD + WakeNet run in fetch)",
              C.model_name, C.vad_name, static_cast<double>(C.thr_now), C.thr_custom ? " (set by hand)" : " (model default)",
              static_cast<unsigned>(C.machine.silence_ms()), static_cast<unsigned>(wake_logic::kNoSpeechMs / 1000),
              static_cast<unsigned>(wake_logic::kMaxRecordMs / 1000), static_cast<unsigned>(wake_logic::kResumeMs),
-             C.machine.beep() ? "on" : "off", C.enabled ? "on" : "OFF in settings", C.gain_db, kFeedCore, kFeedPrio, kFetchCore,
+             C.machine.beep_level(), C.enabled ? "on" : "OFF in settings", C.gain_db, kFeedCore, kFeedPrio, kFetchCore,
              kFetchPrio);
+    ESP_LOGI(TAG,
+             "WAKE v0.4.2: follow window %u ms (voice >= %u ms starts a recording, pre-roll %u ms), barge-in %s (word threshold while "
+             "the answer plays: %.3f, engine input %d dB quieter while it plays)",
+             static_cast<unsigned>(C.machine.follow_ms()), static_cast<unsigned>(wake_logic::kFollowSpeechMs),
+             static_cast<unsigned>(wake_logic::kFollowPreRollMs), C.machine.barge() ? "on" : "off",
+             static_cast<double>(wake_logic::barge_threshold(C.thr_now, C.barge_thr_custom)),
+             wake_logic::kBargeAttenDb);
     return true;
 }
 
@@ -843,19 +957,33 @@ bool available() { return C.ok; }
 
 // ---------------------------------------------------------------- звук микрофона
 
-void sink(void *, const int16_t *pcm, size_t n)
+void sink(void *, const int16_t *pcm, const int16_t *engine_pcm, size_t n)
 {
-    if (!C.ok || !C.ring || n == 0 || n > kRingSamples) {
+    if (!C.ok || !C.ring || !C.eng_ring || !pcm || n == 0 || n > kRingSamples) {
         return;
     }
+    const int16_t *eng = engine_pcm ? engine_pcm : pcm;
     double sum_sq = 0.0;
     int32_t peak = 0;
+    uint32_t clip_srv = 0;
     for (size_t i = 0; i < n; i++) {
         const int32_t v = pcm[i];
         sum_sq += static_cast<double>(v) * static_cast<double>(v);
         const int32_t a = v < 0 ? -v : v;
         if (a > peak) {
             peak = a;
+        }
+        if (a >= 32767) {
+            clip_srv++;   // int16 на полной шкале: микрофон слишком громкий для усиления kPcmGain, вершины срезаны
+        }
+    }
+    uint32_t clip_eng = clip_srv;
+    if (eng != pcm) {
+        clip_eng = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (eng[i] >= 32767 || eng[i] <= -32767) {
+                clip_eng++;
+            }
         }
     }
     const int64_t now_us = esp_timer_get_time();
@@ -868,9 +996,13 @@ void sink(void *, const int16_t *pcm, size_t n)
             return;
         }
         const int64_t b0 = C.ring_w;
-        ring_write(pcm, n);
+        ring_copy_in(C.ring, b0, pcm, n);
+        ring_copy_in(C.eng_ring, b0, eng, n);
+        C.ring_w += static_cast<int64_t>(n);
         C.t_edge_us = now_us;
         C.period_sum_sq += sum_sq;
+        C.period_clip_srv += clip_srv;
+        C.period_clip_eng += clip_eng;
         C.period_blocks++;
         if (static_cast<double>(peak) > C.period_peak) {
             C.period_peak = static_cast<double>(peak);
@@ -890,6 +1022,43 @@ void sink(void *, const int16_t *pcm, size_t n)
 
 // ---------------------------------------------------------------- главный цикл
 
+// Ослабление звука для движка (пока звучит ответ при включённом перебивании). Зовётся под ctl_mu.
+static void apply_attenuation(bool on)
+{
+    if (on == C.atten.load()) {
+        return;
+    }
+    C.atten.store(on);
+    if (C.in) {
+        C.in->set_engine_gain(on ? kEngineGainAtten : AudioIn::kPcmGain);   // со следующего блока микрофона (до 100 мс)
+    }
+    ESP_LOGI(TAG, "WAKE engine input %s (%s)", on ? "attenuated by 12 dB" : "back to normal",
+             on ? "the answer is playing: the speaker would clip the microphone path" : "the answer has finished");
+}
+
+// Порог слова в движке: на время ответа (SPEAKING) строже, потом обычный. Зовётся под ctl_mu. Сам порог в движке меняет
+// задача fetch (thr_req), здесь только решение и просьба; просьба шлётся один раз на смену состояния.
+static void apply_threshold(bool answer_playing)
+{
+    if (!C.ok) {
+        return;
+    }
+    const float want = answer_playing ? wake_logic::barge_threshold(C.thr_now, C.barge_thr_custom) : 0.0f;
+    if (want > 0.0f) {
+        if (!C.thr_barge_on || C.thr_barge_applied != want) {
+            C.thr_req.store(want);
+            C.thr_barge_on = true;
+            C.thr_barge_applied = want;
+            ESP_LOGI(TAG, "WAKE word threshold %.3f while the answer plays (normal %.3f)", static_cast<double>(want),
+                     static_cast<double>(C.thr_now));
+        }
+    } else if (C.thr_barge_on) {
+        C.thr_req.store(C.thr_custom ? C.thr_now : 0.0f);   // 0 = стандартный порог модели
+        C.thr_barge_on = false;
+        ESP_LOGI(TAG, "WAKE word threshold back to %.3f", static_cast<double>(C.thr_now));
+    }
+}
+
 void tick(uint32_t now, const Env &env)
 {
     const session::View sv = session::view();
@@ -902,8 +1071,12 @@ void tick(uint32_t now, const Env &env)
     c.link_ready = sv.link_ready;
     c.dialog_idle = (sv.phase == dialog::Phase::Idle);
     c.dialog_listening = (sv.phase == dialog::Phase::Listening);
+    c.dialog_answering = (sv.phase == dialog::Phase::Thinking || sv.phase == dialog::Phase::Speaking);
+    c.dialog_speaking = (sv.phase == dialog::Phase::Speaking);
+    c.dialog_names_self = sv.names_self;
     c.button_down = sv.button_down;
     c.diag_busy = env.diag_busy;
+    c.answers_done = sv.answers_done;
 
     const wake_logic::State before = C.machine.state();
     const uint32_t rec_ms = C.machine.recording_ms(now);
@@ -914,9 +1087,21 @@ void tick(uint32_t now, const Env &env)
     if (before == wake_logic::State::Recording && !C.machine.recording() && C.gate_on.exchange(false)) {
         std::lock_guard<std::mutex> g(C.mu);
         C.gate.stop();
-        ESP_LOGI(TAG, "WAKE end: the recording was ended by %s", sv.button_down ? "the BOOT button" : "the dialog (link lost?)");
+        ESP_LOGI(TAG, "WAKE end: kind=%s, the recording was ended by %s", wake_logic::rec_kind_name(C.machine.rec_kind()),
+                 sv.button_down ? "the BOOT button" : "the dialog (link lost?)");
         perf_rec_end(rec_ms);
     }
+
+    // Звук и порог для движка на время ответа
+    apply_attenuation(C.machine.engine_attenuated());
+    apply_threshold(C.machine.barge() && sv.phase == dialog::Phase::Speaking);
+
+    // Где в кольце начался ответ: слово, которое движок нашёл в звуке ДО этой позиции, относится к вопросу, а не к перебиванию
+    if (c.dialog_answering && !C.was_answering) {
+        std::lock_guard<std::mutex> g(C.mu);
+        C.answer_pos = C.ring_w;
+    }
+    C.was_answering = c.dialog_answering;
 
     // Движок: речь по VAD и слово
     if (C.ok) {
@@ -939,12 +1124,13 @@ void tick(uint32_t now, const Env &env)
             }
         }
         if (have) {
-            const wake_logic::Out r = C.machine.on_detect(now);
+            const bool stale_word = c.dialog_answering && d.afe_pos < C.answer_pos;
+            const wake_logic::Out r = C.machine.on_detect(now, stale_word);
             if (r.start) {
                 C.last_vad_speech = C.vad_speech.load();
-                do_start(d, r, now);
+                do_start(d, r, now, sv.phase);
             } else if (r.rejected) {
-                if (!C.reject_logged || now - C.last_reject_log_ms >= kRejectLogGapMs) {
+                if (!C.reject_logged || timeutil::elapsed(now, C.last_reject_log_ms) >= kRejectLogGapMs) {
                     C.reject_logged = true;
                     C.last_reject_log_ms = now;
                     ESP_LOGI(TAG, "WAKE word heard but ignored: %s (state %s; volume %.1f dB; ignored so far: %u)", r.reject_why,
@@ -952,6 +1138,41 @@ void tick(uint32_t now, const Env &env)
                              static_cast<unsigned>(C.machine.stats().rejected));
                 }
             }
+        }
+
+        // Окно «договорить без слова»: пока оно открыто, речь по VAD подряд kFollowSpeechMs начинает запись
+        if (C.machine.follow_open()) {
+            if (C.machine.follow_serial() != C.follow_seen_serial) {
+                C.follow_seen_serial = C.machine.follow_serial();
+                C.follow_frames0 = C.vad_frames.load();
+                C.follow_open_ms = now;
+                {
+                    std::lock_guard<std::mutex> g(C.mu);
+                    C.follow_open_pos = afe_pos_locked();
+                }
+                ESP_LOGI(TAG, "WAKE follow: window open for %u ms after the answer (speak without the word; no beep)",
+                         static_cast<unsigned>(C.machine.follow_ms()));
+            }
+            // Речь считается только та, что началась уже после открытия окна (иначе хвост эха открыл бы запись сразу)
+            const uint32_t run = C.vad_run.load();
+            const uint32_t since_open = C.vad_frames.load() - C.follow_frames0;
+            const uint32_t frames = run < since_open ? run : since_open;
+            const wake_logic::Out f = C.machine.on_follow_speech(now, frames * wake_logic::kVadFrameMs);
+            if (f.start) {
+                Detection fd;
+                {
+                    std::lock_guard<std::mutex> g(C.mu);
+                    fd.afe_pos = afe_pos_locked();
+                    fd.volume = C.last_volume.load();
+                }
+                C.last_vad_speech = C.vad_speech.load();
+                do_start(fd, f, now, sv.phase);
+            }
+        }
+        if (C.machine.stats().follow_timeouts != C.follow_logged_timeouts) {
+            C.follow_logged_timeouts = C.machine.stats().follow_timeouts;
+            ESP_LOGI(TAG, "WAKE follow: window closed, nobody spoke (back to the word only; windows so far %u, with voice %u)",
+                     static_cast<unsigned>(C.machine.stats().follow_opened), static_cast<unsigned>(C.machine.stats().follow_starts));
         }
     }
 
@@ -970,7 +1191,7 @@ void tick(uint32_t now, const Env &env)
     }
 
     // Сторож запуска: плата прожила kGuardClearMs с работающим движком
-    if (C.guard_pending && static_cast<int32_t>(now - C.guard_clear_at_ms) >= 0) {
+    if (C.guard_pending && timeutil::reached(now, C.guard_clear_at_ms)) {
         C.guard_pending = false;
         settings::set_wake_guard(false);
         ESP_LOGI(TAG, "wake word engine has been running for %u s: start guard cleared", static_cast<unsigned>(kGuardClearMs / 1000));
@@ -985,7 +1206,8 @@ void tick(uint32_t now, const Env &env)
         perf_period_take(&a, &sh);   // начало первого периода: запоминаем снимок задач
     } else if (timeutil::elapsed(now, C.stat_at_ms) >= kStatPeriodMs) {
         const wake_logic::Stats &ms = C.machine.stats();
-        if (C.ok && ((ms.armed_ms - C.stat_prev.armed_ms) > 0 || ms.detections != C.stat_prev.detections)) {
+        if (C.ok && ((ms.armed_ms - C.stat_prev.armed_ms) > 0 || ms.detections != C.stat_prev.detections ||
+                     ms.follow_starts != C.stat_prev.follow_starts)) {
             print_stat(now);
         } else {
             wake_perf::FrameAcc a;
@@ -994,6 +1216,12 @@ void tick(uint32_t now, const Env &env)
             C.stat_at_ms = now;
         }
     }
+}
+
+bool follow_window()
+{
+    std::lock_guard<std::mutex> lock(C.ctl_mu);
+    return C.started && C.ok && C.machine.follow_open();
 }
 
 const char *idle_hint(uint32_t now)
@@ -1020,7 +1248,13 @@ Status status(uint32_t now)
         s.thr = C.thr_now;
         s.thr_default = C.thr_default;
         s.thr_custom = C.thr_custom;
-        s.beep = C.machine.beep();
+        s.beep_level = C.machine.beep_level();
+        s.follow_ms = C.machine.follow_ms();
+        s.follow_open = C.machine.follow_open();
+        s.barge = C.machine.barge();
+        s.barge_thr = wake_logic::barge_threshold(C.thr_now, C.barge_thr_custom);
+        s.barge_thr_custom = C.barge_thr_custom > 0.0f;
+        s.engine_atten = C.atten.load();
         s.silence_ms = C.machine.silence_ms();
         s.stats = C.machine.stats();
         // метку последнего слова поставил главный цикл, часы вызывающего могли быть взяты чуть раньше: elapsed, не разность
@@ -1086,12 +1320,69 @@ bool set_enabled(bool on)
     return saved;
 }
 
-bool set_beep(bool on)
+bool set_beep(bool on) { return set_beep_level(on ? wake_logic::kBeepLevelDefault : 0); }
+
+bool set_beep_level(int level)
 {
-    const bool saved = settings::set_wake_beep(on);
+    if (!wake_logic::beep_level_valid(level)) {
+        return false;
+    }
+    const bool saved = settings::set_wake_beep_level(level);
+    // Буфер писка один: если прежний писк ещё играет, ждём его конец (вне замка), иначе перезапись дала бы треск
+    if (C.beep && C.out) {
+        C.out->wait_idle(400);
+    }
     std::lock_guard<std::mutex> lock(C.ctl_mu);
-    C.machine.set_beep(on);
-    ESP_LOGI(TAG, "wake beep %s by command%s", on ? "ON" : "OFF", saved ? " (saved)" : " (NOT saved: NVS write failed)");
+    C.machine.set_beep_level(level);
+    if (C.beep) {
+        wake_logic::generate_wake_beep(C.beep, AudioOut::kSampleRate, level);
+    }
+    ESP_LOGI(TAG, "wake beep level %d (%.0f dBFS peak) by command%s", level, static_cast<double>(wake_logic::beep_level_dbfs(level)),
+             saved ? " (saved)" : " (NOT saved: NVS write failed)");
+    // Один раз проигрываем новый писк, чтобы сразу было слышно, но только если разговор в покое и динамик свободен
+    if (level > 0 && C.beep && C.out && C.out->ok() && !C.out->busy() && session::view().phase == dialog::Phase::Idle) {
+        C.out->play(C.beep, C.beep_n);
+    }
+    return saved;
+}
+
+bool set_follow_ms(uint32_t ms)
+{
+    if (!wake_logic::follow_valid(ms)) {
+        return false;
+    }
+    const bool saved = settings::set_wake_follow_ms(ms);
+    std::lock_guard<std::mutex> lock(C.ctl_mu);
+    C.machine.set_follow_ms(ms);
+    ESP_LOGI(TAG, "wake follow window %u ms%s by command%s", static_cast<unsigned>(ms), ms == 0 ? " (off)" : "",
+             saved ? " (saved)" : " (NOT saved: NVS write failed)");
+    return saved;
+}
+
+bool set_barge(bool on)
+{
+    const bool saved = settings::set_wake_barge(on);
+    std::lock_guard<std::mutex> lock(C.ctl_mu);
+    C.machine.set_barge(on);
+    if (!on) {
+        apply_attenuation(false);
+        apply_threshold(false);
+    }
+    ESP_LOGI(TAG, "wake barge-in %s by command%s", on ? "ON" : "OFF", saved ? " (saved)" : " (NOT saved: NVS write failed)");
+    return saved;
+}
+
+bool set_barge_threshold(float thr)
+{
+    if (thr != 0.0f && !wake_logic::thr_valid(thr)) {
+        return false;
+    }
+    const bool saved = settings::set_wake_barge_thr(thr);
+    std::lock_guard<std::mutex> lock(C.ctl_mu);
+    C.barge_thr_custom = thr;
+    ESP_LOGI(TAG, "wake barge threshold %s%.3f by command%s", thr == 0.0f ? "automatic, now " : "",
+             static_cast<double>(wake_logic::barge_threshold(C.thr_now, C.barge_thr_custom)),
+             saved ? " (saved)" : " (NOT saved: NVS write failed)");
     return saved;
 }
 
@@ -1118,6 +1409,7 @@ bool set_threshold(float thr)
             C.thr_now = thr;
             C.thr_custom = true;
         }
+        C.thr_barge_on = false;   // новый обычный порог уже в движке; порог для ответа tick поставит заново, если надо
     }
     ESP_LOGI(TAG, "wake threshold %.3f by command%s%s", static_cast<double>(thr == 0.0f ? C.thr_default : thr),
              thr == 0.0f ? " (model default)" : "", saved ? " (saved)" : " (NOT saved: NVS write failed)");

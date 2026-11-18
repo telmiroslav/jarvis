@@ -182,6 +182,73 @@ Command parse_wake(const char *a)
             c.wake_op = WakeOp::BeepOff;
             return c;
         }
+        if (al == 0) {
+            return make_error("wake", "usage");
+        }
+        char *endp = nullptr;
+        const long v = strtol(arg, &endp, 10);
+        if (endp == arg || *endp != '\0') {
+            return make_error("wake", "usage");
+        }
+        if (v < 0 || v > 5) {
+            return make_error("wake", "beep_range");
+        }
+        c.wake_op = WakeOp::BeepLevel;
+        c.wake_beep_level = static_cast<int>(v);
+        return c;
+    }
+    if (word_eq(w, wl, "follow")) {
+        if (*arg == '\0') {
+            return make_error("wake", "usage");
+        }
+        char *endp = nullptr;
+        const long v = strtol(arg, &endp, 10);
+        if (endp == arg || *endp != '\0') {
+            return make_error("wake", "usage");
+        }
+        if (v != 0 && (v < 2000 || v > 15000)) {
+            return make_error("wake", "follow_range");
+        }
+        c.wake_op = WakeOp::Follow;
+        c.wake_follow_ms = static_cast<uint32_t>(v);
+        return c;
+    }
+    if (word_eq(w, wl, "barge")) {
+        const size_t al = strlen(arg);
+        if (word_eq(arg, al, "on")) {
+            c.wake_op = WakeOp::BargeOn;
+            return c;
+        }
+        if (word_eq(arg, al, "off")) {
+            c.wake_op = WakeOp::BargeOff;
+            return c;
+        }
+        // «barge thr <число>|default»
+        const char *p2 = arg;
+        while (*p2 && !is_space(*p2)) {
+            p2++;
+        }
+        if (word_eq(arg, static_cast<size_t>(p2 - arg), "thr") || word_eq(arg, static_cast<size_t>(p2 - arg), "threshold")) {
+            const char *val = skip_spaces(p2);
+            if (*val == '\0') {
+                return make_error("wake", "usage");
+            }
+            c.wake_op = WakeOp::BargeThr;
+            if (word_eq(val, strlen(val), "default")) {
+                c.wake_thr = 0.0f;
+                return c;
+            }
+            char *endp = nullptr;
+            const double v = strtod(val, &endp);
+            if (endp == val || *endp != '\0' || !(v == v)) {
+                return make_error("wake", "usage");
+            }
+            if (v < 0.40 || v > 0.9999) {
+                return make_error("wake", "thr_range");
+            }
+            c.wake_thr = static_cast<float>(v);
+            return c;
+        }
         return make_error("wake", "usage");
     }
     if (word_eq(w, wl, "thr") || word_eq(w, wl, "threshold")) {
@@ -460,6 +527,8 @@ const char *describe_error(const char *reason)
         {"thr_range", "порог слова от 0.40 до 0.9999 (или default); меньше = чувствительнее"},
         {"silence_range", "пауза после речи в миллисекундах, от 300 до 3000"},
         {"gain_range", "усиление для слова в децибелах, целое число от 0 до 18"},
+        {"beep_range", "громкость писка: целое число от 0 (выключен) до 5 (самый громкий), или on, off"},
+        {"follow_range", "окно «договорить без слова» в миллисекундах: 0 (выключено) или от 2000 до 15000"},
     };
     for (const Item &it : kItems) {
         if (strcmp(it.key, reason) == 0) {

@@ -34,6 +34,12 @@ esp_err_t AudioIn::init()
     if (!pcm_) {
         pcm_ = static_cast<int16_t *>(heap_caps_malloc(kBlockFrames * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     }
+    // Копия для движка слова (другое усиление): только PSRAM (внутренняя память здесь не тратится); нет её, то усиление для движка
+    // просто не меняется
+    pcm_eng_ = static_cast<int16_t *>(heap_caps_malloc(kBlockFrames * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!pcm_eng_) {
+        ESP_LOGW(TAG, "no PSRAM for the engine copy of the block: the engine input level cannot be lowered while the answer plays");
+    }
     rec_mutex_ = xSemaphoreCreateMutex();
     if (!words_ || !pcm_ || !rec_mutex_) {
         ESP_LOGE(TAG, "out of memory for audio_in buffers");
@@ -215,8 +221,11 @@ void AudioIn::process_block(const int32_t *words, size_t frames)
     portEXIT_CRITICAL(&lock_);
     const int sel = dsp::mic_slot_index(slot_now);
 
+    // Для движка слова при другом усилении тот же блок считается ещё раз из тех же 24 бит (срезанный int16 не вернуть)
+    const int eng_gain = engine_gain_.load();
+    const bool dual = pcm_eng_ != nullptr && eng_gain != kPcmGain;
     Block b;
-    dsp::analyze_block(words, frames, dc_, sel, kPcmGain, pcm_, &b.stats);
+    dsp::analyze_block(words, frames, dc_, sel, kPcmGain, pcm_, &b.stats, dual ? pcm_eng_ : nullptr, dual ? eng_gain : 0);
     b.seq = block_count_;
     b.t_us = esp_timer_get_time();
 
@@ -284,8 +293,8 @@ void AudioIn::process_block(const int32_t *words, size_t frames)
     if (const SinkFn sink = sink_.load()) {
         sink(sink_ctx_.load(), pcm_, frames);
     }
-    if (const SinkFn tap = tap_.load()) {
-        tap(tap_ctx_.load(), pcm_, frames);
+    if (const TapFn tap = tap_.load()) {
+        tap(tap_ctx_.load(), pcm_, dual ? pcm_eng_ : pcm_, frames);
     }
 
     seq_.store(b.seq);
@@ -297,7 +306,7 @@ void AudioIn::set_sink(SinkFn fn, void *ctx)
     sink_.store(fn);
 }
 
-void AudioIn::set_tap(SinkFn fn, void *ctx)
+void AudioIn::set_tap(TapFn fn, void *ctx)
 {
     tap_ctx_.store(ctx);
     tap_.store(fn);

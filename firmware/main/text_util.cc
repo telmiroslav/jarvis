@@ -125,6 +125,64 @@ size_t utf8_count(const char *s)
     return n;
 }
 
+namespace {
+
+// Строчная буква: ASCII, русский алфавит (А-Я -> а-я, Ё -> ё); остальное как есть
+uint32_t lower_cp(uint32_t cp)
+{
+    if (cp >= 'A' && cp <= 'Z') {
+        return cp + 0x20;
+    }
+    if (cp >= 0x410 && cp <= 0x42F) {
+        return cp + 0x20;
+    }
+    if (cp == 0x401) {
+        return 0x451;
+    }
+    return cp;
+}
+
+// Строка s начинается с шаблона pat (коды строчных букв, n штук), регистр не важен
+bool starts_with_ci(const char *s, const char *end, const uint32_t *pat, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (s >= end) {
+            return false;
+        }
+        uint32_t cp;
+        const int len = utf8_decode(s, end, &cp);
+        if (cp == 0xFFFD || lower_cp(cp) != pat[i]) {
+            return false;
+        }
+        s += len;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool mentions_wake_name(const char *utf8)
+{
+    if (!utf8) {
+        return false;
+    }
+    static const uint32_t kJarvisRu[] = {0x434, 0x436, 0x430, 0x440, 0x432, 0x438, 0x441};   // джарвис
+    static const uint32_t kZharvisRu[] = {0x436, 0x430, 0x440, 0x432, 0x438, 0x441};         // жарвис
+    static const uint32_t kJarvisEn[] = {'j', 'a', 'r', 'v', 'i', 's'};
+    const char *end = utf8 + strlen(utf8);
+    for (const char *p = utf8; p < end;) {
+        uint32_t cp;
+        const int len = utf8_decode(p, end, &cp);
+        if (starts_with_ci(p, end, kJarvisRu, sizeof(kJarvisRu) / sizeof(kJarvisRu[0])) ||
+            starts_with_ci(p, end, kZharvisRu, sizeof(kZharvisRu) / sizeof(kZharvisRu[0])) ||
+            starts_with_ci(p, end, kJarvisEn, sizeof(kJarvisEn) / sizeof(kJarvisEn[0]))) {
+            return true;
+        }
+        p += len;
+    }
+    return false;
+}
+
 size_t sanitize(const char *src, char *dst, size_t cap)
 {
     if (cap == 0) {

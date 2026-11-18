@@ -12,7 +12,8 @@ namespace jarvis {
 namespace face_logic {
 
 // Числа те же, что у ui::State (main.cc проверяет это через static_assert)
-enum class Face : uint8_t { Idle = 0, Listening, Thinking, Speaking, NoWifi, NoServer, Error, Sleep };
+// Follow (v0.4.2): окно «договорить без слова» после ответа, плата слушает голос: тот же взгляд, что у Listening, но спокойнее
+enum class Face : uint8_t { Idle = 0, Listening, Thinking, Speaking, NoWifi, NoServer, Error, Sleep, Follow };
 
 struct In {
     bool booted = false;                 // самопроверка при старте закончена
@@ -26,6 +27,7 @@ struct In {
     const char *wifi_hint = nullptr;     // подсказка про Wi-Fi (когда no_wifi)
     const char *server_hint = nullptr;   // подсказка про сервер (nullptr: связь есть или нет Wi-Fi)
     const char *idle_hint = nullptr;     // подсказка в покое, когда всё в порядке («Скажи «Джарвис»», «Зажми BOOT и говори»)
+    bool follow_window = false;          // открыто окно «договорить без слова» (wake_logic::Machine::follow_open)
 };
 
 struct Out {

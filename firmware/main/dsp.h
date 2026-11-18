@@ -59,8 +59,9 @@ struct BlockStats {
 // words: чередующиеся слова I2S [L0,R0,L1,R1,...], frames = число пар.
 // dc: состояние фильтров (2 штуки), сохраняется между блоками.
 // out_slot: какой слот (0/1) превратить в int16 и записать в pcm_out (nullptr = не надо).
+// pcm_out2 / gain2: тот же слот ещё раз, с другим усилением (из тех же 24 бит, а не из уже срезанного int16); nullptr = не надо.
 void analyze_block(const int32_t *words, size_t frames, DcBlocker *dc, int out_slot, int gain,
-                   int16_t *pcm_out, BlockStats *stats);
+                   int16_t *pcm_out, BlockStats *stats, int16_t *pcm_out2 = nullptr, int gain2 = 0);
 
 inline float slot_rms_dbfs(const SlotStats &s) { return power_to_dbfs(s.mean_sq, kFullScale24); }
 inline float slot_peak_dbfs(const SlotStats &s)

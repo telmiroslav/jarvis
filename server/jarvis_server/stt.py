@@ -32,6 +32,9 @@ class SttResult:
     audio_s: float = 0.0
     ms: float = 0.0
     reason: str = ""  # почему пусто: "short" | "silence" | "no_speech" | "junk" | ""
+    # уверенность Whisper по сегментам (None = не известна: подделка модели, пустая запись); нужна режиму follow
+    avg_logprob: float | None = None  # средняя по сегментам (взвешена длиной текста): -0.1...-0.5 чистая речь, ниже -1.1 скорее шум, принятый за слова
+    no_speech_prob: float | None = None  # наибольшая по сегментам: вероятность, что речи нет
 
 
 def clean_transcript(text: str) -> str:
@@ -114,7 +117,7 @@ class WhisperSTT:
         audio = audio - float(np.mean(audio))
         if rms_db(audio) < -62.0:  # цифровая тишина: Whisper зря не гоняем
             return SttResult("", audio_s=dur, ms=(time.perf_counter() - t0) * 1000, reason="silence")
-        raw, language = self._raw_text(audio)
+        raw, language, avg_logprob, no_speech_prob = self._raw_text_stats(audio)
         text = clean_transcript(raw)
         ms = (time.perf_counter() - t0) * 1000
         reason = ""
@@ -122,10 +125,16 @@ class WhisperSTT:
             reason = "junk" if any(c.isalnum() for c in raw) else "no_speech"
             if reason == "junk":
                 log.info("STT: отброшен мусор Whisper: %.80s", raw)
-        return SttResult(text, language=language, audio_s=dur, ms=ms, reason=reason)
+        return SttResult(text, language=language, audio_s=dur, ms=ms, reason=reason,
+                         avg_logprob=avg_logprob if text else None, no_speech_prob=no_speech_prob if text else None)
 
     def _raw_text(self, audio: np.ndarray, vad: bool = True) -> tuple[str, str]:
         """Whisper -> (текст всех сегментов как есть, язык). Без фильтра мусора; vad=False только для опытов."""
+        raw, language, _lp, _ns = self._raw_text_stats(audio, vad)
+        return raw, language
+
+    def _raw_text_stats(self, audio: np.ndarray, vad: bool = True) -> tuple[str, str, float | None, float | None]:
+        """Whisper -> (текст, язык, средний avg_logprob, наибольший no_speech_prob) по принятым сегментам."""
         segments, info = self.model.transcribe(
             audio,
             language="ru",
@@ -142,11 +151,22 @@ class WhisperSTT:
             log_prob_threshold=-1.0,
         )
         parts: list[str] = []
+        lp_sum = w_sum = 0.0
+        ns_max: float | None = None
         for seg in segments:  # генератор: сама работа идёт здесь
-            if getattr(seg, "no_speech_prob", 0.0) > 0.7 and getattr(seg, "avg_logprob", 0.0) < -1.0:
+            ns = getattr(seg, "no_speech_prob", None)
+            lp = getattr(seg, "avg_logprob", None)
+            if (ns or 0.0) > 0.7 and (lp or 0.0) < -1.0:
                 continue
             parts.append(seg.text)
-        return " ".join(parts), getattr(info, "language", "ru")
+            w = max(1, len(seg.text.strip()))
+            if lp is not None:
+                lp_sum += lp * w
+                w_sum += w
+            if ns is not None:
+                ns_max = ns if ns_max is None else max(ns_max, ns)
+        avg_lp = lp_sum / w_sum if w_sum else None
+        return " ".join(parts), getattr(info, "language", "ru"), avg_lp, ns_max
 
     def warmup(self) -> None:
         """Прогон на секунде шума: прогревает CUDA-ядра."""

@@ -33,6 +33,7 @@ void Dialog::to_idle(uint32_t now, Out *o)
     phase_ = Phase::Idle;
     audio_open_ = false;
     audio_ended_ = false;
+    names_self_ = false;
     err_msg_[0] = '\0';
     texts_clear_set_ = true;
     texts_clear_ms_ = now + kSubtitleHoldMs;   // субтитры остаются ещё на несколько секунд
@@ -67,9 +68,11 @@ Out Dialog::on_link(bool ready, uint32_t now)
         o.capture_cancel = true;
         phase_ = Phase::Idle;
         listen_wake_ = false;
+        listen_follow_ = false;
         audio_open_ = false;
         audio_ended_ = false;
         stale_ = false;
+        names_self_ = false;
         err_msg_[0] = '\0';
         texts_clear_set_ = false;
         if (pressed_) {
@@ -96,6 +99,7 @@ Out Dialog::on_press(uint32_t now)
         think_ms_ = now;
         last_server_ms_ = now;
         listen_wake_ = false;
+        listen_follow_ = false;
         hold_fired_ = true;
         return o;
     }
@@ -105,7 +109,7 @@ Out Dialog::on_press(uint32_t now)
     return o;
 }
 
-Out Dialog::on_wake_start(uint32_t now)
+Out Dialog::on_wake_start(uint32_t now, bool follow)
 {
     Out o;
     if (!link_ || pressed_ || phase_ != Phase::Idle) {
@@ -114,14 +118,46 @@ Out Dialog::on_wake_start(uint32_t now)
     phase_ = Phase::Listening;
     listen_ms_ = now;
     listen_wake_ = true;
+    listen_follow_ = follow;
     stale_ = false;
     audio_open_ = false;
     audio_ended_ = false;
+    names_self_ = false;
     err_msg_[0] = '\0';
     texts_clear_set_ = false;
     o.listen_start = true;
     o.listen_wake = true;
+    o.listen_follow = follow;
     o.clear_texts = true;
+    return o;
+}
+
+Out Dialog::on_barge(uint32_t now)
+{
+    if (!link_ || pressed_ || (phase_ != Phase::Thinking && phase_ != Phase::Speaking)) {
+        return Out();
+    }
+    // Тот же путь, что у короткого нажатия BOOT: стоп динамика, чистка субтитров, abort серверу, счётчик abort
+    Out o = abort_answer(now);
+    // и сразу новая запись по слову. Метка «устарело» (stale_) здесь снимается: в записи сообщения сервера и так все
+    // игнорируются (лицо LISTENING принадлежит плате), в том числе подтверждение abort (state idle) и остаток старого звука,
+    // а запись длится не меньше секунды, то есть подтверждение (оно приходит сразу после abort, раньше любого ответа на
+    // новую фразу) успевает прийти до её конца. Если всё же придёт позже, оно безвредно: лицо на миг IDLE до state thinking.
+    phase_ = Phase::Listening;
+    listen_ms_ = now;
+    listen_wake_ = true;
+    listen_follow_ = false;
+    stale_ = false;
+    audio_open_ = false;
+    audio_ended_ = false;
+    names_self_ = false;
+    err_msg_[0] = '\0';
+    texts_clear_set_ = false;
+    barges_++;
+    o.listen_start = true;
+    o.listen_wake = true;
+    o.clear_texts = true;
+    o.barge = true;
     return o;
 }
 
@@ -132,6 +168,7 @@ Out Dialog::on_wake_end(uint32_t now, bool no_speech)
         return o;
     }
     listen_wake_ = false;
+    listen_follow_ = false;
     o.listen_stop = true;
     if (no_speech) {
         to_idle(now, &o);
@@ -195,6 +232,7 @@ Out Dialog::on_tick(uint32_t now, bool playback_drained)
             stale_ = false;
             audio_open_ = false;
             audio_ended_ = false;
+            names_self_ = false;
             err_msg_[0] = '\0';
             texts_clear_set_ = false;
             o.listen_start = true;
@@ -207,6 +245,7 @@ Out Dialog::on_tick(uint32_t now, bool playback_drained)
         if (elapsed(now, listen_ms_) >= kMaxListenMs) {
             o.listen_stop = true;
             listen_wake_ = false;
+            listen_follow_ = false;
             phase_ = Phase::Thinking;
             think_ms_ = now;
             last_server_ms_ = now;
@@ -226,6 +265,7 @@ Out Dialog::on_tick(uint32_t now, bool playback_drained)
     case Phase::Speaking:
         if (audio_open_ && audio_ended_ && playback_drained) {
             to_idle(now, &o);
+            answers_done_++;   // ответ доигран до конца: это единственный «нормальный» конец (по нему открывается окно follow-up)
         } else if (audio_open_ && !audio_ended_ && elapsed(now, last_audio_ms_) > kSpeakStallMs) {
             o.stop_playback = true;   // звук встал и конца нет: не висим в SPEAKING
             to_idle(now, &o);
@@ -370,6 +410,23 @@ bool Dialog::on_audio_data(uint32_t now)
     last_audio_ms_ = now;
     touch(now);
     return true;
+}
+
+int out_messages(const Out &o, proto::OutMsg *msgs)
+{
+    int n = 0;
+    if (o.abort) {
+        msgs[n++] = proto::OutMsg::Abort;
+    }
+    if (o.listen_start) {
+        msgs[n++] = o.listen_follow ? proto::OutMsg::ListenStartFollow
+                    : o.listen_wake ? proto::OutMsg::ListenStartWake
+                                    : proto::OutMsg::ListenStart;
+    }
+    if (o.listen_stop) {
+        msgs[n++] = proto::OutMsg::ListenStop;
+    }
+    return n;
 }
 
 }  // namespace dialog

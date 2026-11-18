@@ -5,7 +5,9 @@
 // Что делает:
 //   - СЛОВО «ДЖАРВИС» (wake.cc, wake_logic.cc): пока Wi-Fi и связь с ноутбуком есть, а разговор в покое, плата слушает слово
 //     на самой плате (без интернета). Услышала: писк, лицо LISTENING, запись; конец фразы по VAD (пауза 800 мс), 5 с тишины
-//     после слова или 12 с записи = конец. Пока Jarvis думает и говорит, слово не слушается (эхо одним микрофоном не убрать);
+//     после слова или 12 с записи = конец. v0.4.2: после ответа ещё 6 с можно говорить без слова (окно follow, лицо «Слушаю…»), а
+//     слово, сказанное пока Jarvis думает или говорит, перебивает ответ (wake barge; эхо одним микрофоном не убрать, поэтому
+//     порог строже и звук для движка тише, а ответ, назвавший себя, перебить нельзя);
 //   - РАЗГОВОР (docs/PROTOCOL.md, session.cc, dialog.cc): BOOT зажата дольше 200 мс = запись (лицо LISTENING, голос идёт
 //     серверу по WebSocket), отпустил = ответ (THINKING, потом SPEAKING со звуком и субтитрами). Короткое нажатие во время
 //     ответа = замолчать. Максимум записи 15 с. BOOT работает всегда, в том числе посреди записи по слову (конец записи);
@@ -16,7 +18,7 @@
 //     время по SNTP (серверы, доступные из Китая, первыми), часовой пояс по умолчанию CST-8;
 //   - серийные команды: console.cc (wifi_set, wifi_clear, tz, lcd, server, wake, echo, status, reboot). Слушаются оба порта платы;
 //   - при старте: отчёт о плате, тест PSRAM, звонок + проверка «динамик услышан микрофоном» (LOOPBACK);
-//   - каждые 30 с одна строка "STATUS: ..." (Wi-Fi, сервер, время, память, loopback, сброс);
+//   - каждые 30 с одна строка "STATUS: ..." (Wi-Fi, сервер, время, память, loopback, сброс) и строка "HEAP ok/CORRUPT" (проверка куч);
 //   - светодиод: ожидание плавно зелёный, слушает красный, думает янтарный пульс, говорит синий, нет сервера или
 //     Wi-Fi медленно янтарный, ошибка красным миганием.
 // Любая ошибка инициализации пишется в лог и пропускается, остальное продолжает работать.
@@ -52,6 +54,7 @@
 #include "dsp.h"
 #include "face_logic.h"
 #include "gui.h"
+#include "heap_diag.h"
 #include "lcd_cfg.h"
 #include "link.h"
 #include "link_logic.h"
@@ -317,6 +320,9 @@ void led_update(int64_t now_ms)
     case ui::State::Listening:
         led_show(kLedLevel, 0, 0);
         break;
+    case ui::State::Follow:
+        led_show(kLedLevel / 4, 0, 0);   // окно «договорить без слова»: тусклый красный, спокойнее, чем при записи
+        break;
     case ui::State::Speaking:
         led_show(0, 0, kLedLevel);
         break;
@@ -506,6 +512,7 @@ static_assert(static_cast<int>(face_logic::Face::NoWifi) == static_cast<int>(ui:
 static_assert(static_cast<int>(face_logic::Face::NoServer) == static_cast<int>(ui::State::NoServer), "Face/ui::State");
 static_assert(static_cast<int>(face_logic::Face::Error) == static_cast<int>(ui::State::Error), "Face/ui::State");
 static_assert(static_cast<int>(face_logic::Face::Sleep) == static_cast<int>(ui::State::Sleep), "Face/ui::State");
+static_assert(static_cast<int>(face_logic::Face::Follow) == static_cast<int>(ui::State::Follow), "Face/ui::State");
 
 // Собирает всё, что должно быть на экране, из состояния прошивки и отдаёт в ui::*. Дёшево: можно звать часто.
 // Что именно показывать, решает чистая логика face_logic::decide (проверена тестами), здесь только сбор данных.
@@ -547,6 +554,7 @@ void ui_sync(int64_t now_ms)
     // Про сервер говорим, когда Wi-Fi уже есть, а связи с ноутбуком нет (пока связь не стартовала, молчим)
     fin.server_hint = g_link_started ? link_logic::server_hint(hin.connected, ls.ready, ls.down_ms) : nullptr;
     fin.idle_hint = wake::idle_hint(static_cast<uint32_t>(now_ms));
+    fin.follow_window = wake::follow_window();
     const face_logic::Out fo = face_logic::decide(fin);
 
     const ui::State want = static_cast<ui::State>(fo.face);
@@ -1038,6 +1046,7 @@ void print_status_line()
     } else {
         ESP_LOGW(TAG, "%s", line);
     }
+    heap_diag::check();   // HEAP ok ... или HEAP CORRUPT (куча PSRAM и внутренняя, см. heap_diag.h)
 }
 
 // Ответ на команду status: одна строка в духе JSON
@@ -1099,7 +1108,7 @@ bool apply_lcd_cfg(int n)
 void print_greeting()
 {
     ESP_LOGI(TAG, "################################################################");
-    ESP_LOGI(TAG, "# JARVIS v0.4: слово «Джарвис» без кнопки. Или BOOT зажата = говоришь, отпустил = ответ");
+    ESP_LOGI(TAG, "# JARVIS v0.4.2: слово «Джарвис» без кнопки, после ответа можно продолжить без слова, ответ можно перебить словом");
     ESP_LOGI(TAG, "################################################################");
     ESP_LOGI(TAG, "Привет, Давид! Что должно быть:");
     ESP_LOGI(TAG, "  1. ЭКРАН: два бирюзовых глаза. Без Wi-Fi внизу подсказка, с Wi-Fi без ноутбука «Ищу ноутбук…» и «Нет связи…».");
@@ -1108,7 +1117,9 @@ void print_greeting()
     ESP_LOGI(TAG, "  4. BOOT коротко, пока Jarvis думает или говорит: замолчать. Новая запись во время ответа тоже прерывает его.");
     ESP_LOGI(TAG, "  5. СВЕТОДИОД: зелёный плавно (ждёт), красный (слушает), янтарный пульс (думает), синий (говорит), янтарный медленно (нет связи).");
     ESP_LOGI(TAG, "  6. Диагностика звука без сервера: команда echo по серийному порту (запись 4 с и воспроизведение).");
-    ESP_LOGI(TAG, "  7. СЛОВО: когда внизу «Скажи «Джарвис»», скажи «Джарвис», дождись писка и говори. Пауза в речи 0,8 с = конец. Команды: wake, wake thr 0.55, wake off.");
+    ESP_LOGI(TAG, "  7. СЛОВО: когда внизу «Скажи «Джарвис»», скажи «Джарвис», дождись писка и говори. Пауза в речи 0,8 с = конец. Команды: wake, wake thr 0.55, wake beep 0..5, wake off.");
+    ESP_LOGI(TAG, "  8. ПОСЛЕ ОТВЕТА 6 секунд внизу «Слушаю…»: можно говорить без слова «Джарвис» (без писка). Выключить: wake follow 0.");
+    ESP_LOGI(TAG, "  9. ПЕРЕБИТЬ: скажи «Джарвис», пока он думает или говорит: он замолчит и начнёт слушать (писк). Выключить: wake barge off.");
     ESP_LOGI(TAG, "Пришли мне весь лог и скажи, что видел и слышал. В логе главное: «STATUS:», «HWCHECK RESULT», «WIFI», «link», «session», «WAKE».");
 }
 
@@ -1187,7 +1198,8 @@ void main_loop()
             wake::Env wenv;
             wenv.wifi_up = net_status(now).state == net::State::Connected;
             wenv.mic_ok = g_in.ok() && g_in.slot() != dsp::MicSlot::None;
-            wenv.diag_busy = mode() != Mode::Idle || g_sound_playing.load() || g_out.busy();
+            // Голос ответа (поток) диагностикой не считается: слово слушается и во время ответа, чтобы его можно было перебить
+            wenv.diag_busy = mode() != Mode::Idle || g_sound_playing.load() || (g_out.busy() && !g_out.streaming());
             wake::tick(static_cast<uint32_t>(now), wenv);
         }
 
@@ -1334,7 +1346,7 @@ extern "C" void app_main(void)
     // и связи, а если не хватит или не найдутся модели, кнопка и весь остальной разговор работают как раньше
     if (!g_in.ok()) {
         ESP_LOGW(TAG, "WAKE: skipped, the microphone did not start (push-to-talk needs it too)");
-    } else if (wake::init(&g_out)) {
+    } else if (wake::init(&g_out, &g_in)) {
         g_in.set_tap(&wake::sink, nullptr);
     }
     main_loop();

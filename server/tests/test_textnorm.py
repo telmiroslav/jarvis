@@ -178,3 +178,16 @@ def test_strip_keeps_case_of_proper_words_and_digits():
     assert strip_wake_word("Джарвис, Москва далеко?", "wake") == "Москва далеко?"
     assert strip_wake_word("  Джарвис,   включи   свет ", "ptt") == "Включи свет"
     assert strip_wake_word("включи   свет ", "wake") == "включи свет"
+
+
+@pytest.mark.parametrize("heard, expected", [
+    ("Джарвис, который час?", "Который час?"),
+    ("привет жарвис привет, расскажи анекдот", "Привет, расскажи анекдот"),
+    ("Эй, Джарвис!", ""),  # только обращение: пусто (сервер ответит молча)
+    ("вис", ""),
+    ("Москва", "Москва"),  # игра в города: без обращения текст не меняется
+    ("угу", "угу"),
+    ("Расскажи про Джарвиса", "Расскажи про Джарвиса"),  # имя внутри фразы не трогаем
+])
+def test_follow_mode_strips_address_like_wake(heard, expected):
+    assert strip_wake_word(heard, "follow") == strip_wake_word(heard, "wake") == expected

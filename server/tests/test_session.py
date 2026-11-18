@@ -3,6 +3,7 @@ import asyncio
 import json
 import time
 
+import pytest
 
 from jarvis_server import __version__
 from jarvis_server.llm import FLUSH, MSG_NETWORK, LLMError
@@ -64,7 +65,7 @@ async def test_hello_ping_unknown_and_bad_json(link):
     await sess.on_text("не json")
     await sess.on_text("[]")
     assert link.jsons() == [{"type": "welcome", "proto": 1, "server": __version__, "tts_rate": 24000}, {"type": "pong"}]
-    assert __version__ == "0.2.0"
+    assert __version__ == "0.3.0"
     assert sess.state == "idle"
 
 
@@ -534,3 +535,364 @@ async def test_mode_is_per_utterance(link, caplog):
     await asyncio.sleep(0.05)
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("TURN ")]
     assert [ln.rsplit(" ", 1)[1] for ln in lines] == ["mode=wake", "mode=ptt"]
+
+
+# ------------------------------------------------------------- режим follow (продолжение без слова «Джарвис») ----
+
+
+class SpyLLM(ScriptedLLM):
+    """Запоминает, что спросили у ИИ."""
+
+    def __init__(self, items):
+        super().__init__(items)
+        self.asked = []
+
+    async def stream(self, history, user_text, tools, stats):
+        self.asked.append(user_text)
+        async for x in super().stream(history, user_text, tools, stats):
+            yield x
+
+
+def _turn_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("TURN ")]
+
+
+async def test_follow_mode_is_known_and_strips_address(link, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="jarvis.session")
+    llm = SpyLLM(["Сейчас четырнадцать тридцать два, сэр."])
+    sess, mem = new_session(link, llm=llm, stt=FakeSTT("Джарвис, который час?", avg_logprob=-0.2, no_speech_prob=0.01))
+    await say(sess, mode="follow")
+    await finish(sess, link)
+    assert sess._mode == "follow"
+    assert llm.asked == ["Который час?"] and {"type": "user_text", "text": "Который час?"} in link.jsons()
+    assert [e.user for e in mem.history()] == ["Который час?"]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]  # режим известен: предупреждения нет
+    await asyncio.sleep(0.05)
+    assert _turn_lines(caplog)[-1].endswith(" mode=follow")
+
+
+@pytest.mark.parametrize("heard", ["угу", "Ага.", "Хм...", "эм", "ха-ха-ха", "Ну, угу", "[Музыка]", "..."])
+async def test_follow_filler_or_junk_goes_idle_silently(link, caplog, heard):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="jarvis.session")
+    llm = SpyLLM(["не должен вызываться"])
+    stt = FakeSTT(heard, avg_logprob=-0.3, no_speech_prob=0.02)
+    if heard == "[Музыка]":  # пометки звука отсекает уже распознавание (stt.clean_transcript), сюда приходит пусто
+        stt = FakeSTT(reason="junk")
+    sess, mem = new_session(link, llm=llm, stt=stt)
+    await say(sess, mode="follow")
+    await finish(sess, link)
+    assert link.types() == ["state:thinking", "state:idle"]  # ни ошибки, ни user_text, ни звука
+    assert llm.asked == [] and link.audio_bytes() == 0 and len(mem) == 0 and sess.state == "idle"
+    await asyncio.sleep(0.05)
+    line = _turn_lines(caplog)[-1]
+    assert line.startswith("TURN empty(") and line.endswith("mode=follow"), line
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+async def test_follow_low_confidence_goes_idle_silently(link, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="jarvis.session")
+    for lp, ns in ((-1.3, 0.05), (-0.3, 0.8)):
+        link.items.clear()
+        llm = SpyLLM(["не должен вызываться"])
+        sess, _ = new_session(link, llm=llm, stt=FakeSTT("курс доллара вырос на два процента", avg_logprob=lp, no_speech_prob=ns))
+        await say(sess, mode="follow")
+        await finish(sess, link)
+        assert link.types() == ["state:thinking", "state:idle"] and llm.asked == [], (lp, ns)
+    await asyncio.sleep(0.05)
+    assert all("empty(low_conf)" in ln and ln.endswith("mode=follow") for ln in _turn_lines(caplog))
+
+
+@pytest.mark.parametrize("heard", ["Москва", "Анапа.", "да", "Нет", "спасибо", "Включи свет"])
+async def test_follow_real_words_pass_even_single_ones(link, heard):
+    llm = SpyLLM(["Принято, сэр."])
+    sess, _ = new_session(link, llm=llm, stt=FakeSTT(heard, avg_logprob=-0.45, no_speech_prob=0.05))
+    await say(sess, mode="follow")
+    await finish(sess, link)
+    assert llm.asked == [heard] and link.audio_bytes() > 0
+
+
+async def test_follow_wake_only_is_silent_and_guard_only_applies_to_follow(link, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="jarvis.session")
+    llm = SpyLLM(["Слушаю."])
+    sess, _ = new_session(link, llm=llm, stt=FakeSTT("Джарвис", avg_logprob=-0.2, no_speech_prob=0.01))
+    await say(sess, mode="follow")
+    await finish(sess, link)
+    assert link.types() == ["state:thinking", "state:idle"] and llm.asked == []
+    await asyncio.sleep(0.05)
+    assert "empty(wake_only)" in _turn_lines(caplog)[-1]
+    # в ptt и wake междометие и неуверенность не отсеиваются: человек сам решил говорить
+    for mode in ("ptt", "wake"):
+        link.items.clear()
+        llm = SpyLLM(["Да, сэр."])
+        sess, _ = new_session(link, llm=llm, stt=FakeSTT("угу", avg_logprob=-1.6, no_speech_prob=0.9))
+        await say(sess, mode=mode)
+        await finish(sess, link)
+        assert llm.asked == ["Угу"] or llm.asked == ["угу"], mode
+
+
+async def test_follow_guard_can_be_switched_off(link):
+    llm = SpyLLM(["Да, сэр."])
+    sess, _ = new_session(link, llm=llm, stt=FakeSTT("угу", avg_logprob=-1.6, no_speech_prob=0.9), follow_guard=False)
+    await say(sess, mode="follow")
+    await finish(sess, link)
+    assert llm.asked == ["угу"]
+
+
+async def test_follow_preroll_is_longer_than_ptt(link):
+    # follow: ~400 мс предзаписи, поэтому запись 0,6 с это всего 0,2 с речи (< 0,3 с): молча в idle
+    stt = FakeSTT()
+    sess, _ = new_session(link, stt=stt)
+    await say(sess, pcm_speech(0.6), mode="follow")
+    assert link.types() == ["state:idle"] and stt.calls == 0
+    link.items.clear()
+    await say(sess, pcm_speech(0.6), mode="ptt")  # в ptt предзапись 0,2 с: речи 0,4 с, идём в распознавание
+    await finish(sess, link)
+    assert stt.calls == 1
+
+
+# ----------------------------------------------------------- barge-in: abort / listen_start посреди ответа ----
+
+LONG_ANSWER = ["Первое длинное предложение ответа, которое звучит довольно долго, сэр. ",
+               "Второе длинное предложение ответа, которое тоже звучит долго. ",
+               "Третье длинное предложение ответа, чтобы хватило надолго. ",
+               "Четвёртое предложение, и на этом пока всё."]
+
+
+class FirstSlowTTS(MockTTS):
+    """Первый синтез долгий (как большая фраза на слабой карте), остальные быстрые; отмену замечает на ходу."""
+
+    def __init__(self, slow_s=3.0, **kw):
+        super().__init__(**kw)
+        self.slow_s = slow_s
+        self.starts: list[float] = []
+
+    def synth(self, text):
+        self.starts.append(time.perf_counter())
+        if len(self.starts) == 1:
+            self._sleep(self.slow_s)
+        return super().synth(text)
+
+
+async def _finish_new_turn(link, user_text, timeout=20):
+    """Дождаться конца хода, у которого user_text = user_text (старое state:idle в хронологии не считается)."""
+    mark = {"type": "user_text", "text": user_text}
+    assert await wait_for(lambda: mark in link.jsons(), timeout), link.types()
+    n = link.jsons().index(mark)
+    assert await wait_for(lambda: link.jsons().index(mark) == n and link.types()[-1] == "state:idle"
+                          and "audio_end" in [o["type"] for o in link.jsons()[n:]], timeout), link.types()
+
+
+async def _send_utterance(sess, text_mode="wake", seconds=1.0):
+    await sess.on_text(json.dumps({"type": "listen_start", "mode": text_mode}))
+    pcm = pcm_speech(seconds)
+    for i in range(0, len(pcm), 3200):
+        await sess.on_binary(pcm[i: i + 3200])
+    await sess.on_text('{"type":"listen_stop"}')
+
+
+async def test_bargein_abort_then_listen_start_during_long_answer(link):
+    """Плата услышала «Джарвис» посреди ответа: abort, сразу listen_start, звук, listen_stop."""
+    tts = MockTTS(seconds_per_char=0.12, min_s=1.0)  # звук долгий: ответ идёт секунд двадцать
+    llm = ScriptedLLM(LONG_ANSWER)
+    sess, mem = new_session(link, llm=llm, tts=tts, stt=FakeSTT("первый вопрос"))
+    await say(sess)
+    assert await wait_for(lambda: link.audio_bytes() > 20000)
+    t_abort = time.perf_counter()
+    await sess.on_text('{"type":"abort"}')
+    assert link.types()[-2:] == ["audio_end", "state:idle"]  # подтверждение: звук закрыт, плата в idle
+    ack = len(link.items)
+    sess.eng.stt.text = "второй вопрос"
+    llm.items, tts.seconds_per_char = ["Короткий новый ответ, сэр."], 0.03  # новый ход короткий
+    await _send_utterance(sess, "wake")  # без паузы: плата шлёт всё подряд
+    assert time.perf_counter() - t_abort < 0.5  # abort + новая запись приняты быстро, ничего не зависло
+    assert sess.state in ("busy", "idle")  # listen_stop принят: идёт новый ход
+    await _finish_new_turn(link, "второй вопрос")
+    # после подтверждения старый ход ничего не присылает: до state:thinking нового хода ни кадра звука, ни текста
+    new = link.items[ack:]
+    first_new = next(i for i, (_, k, o) in enumerate(new) if k == "json" and o["type"] == "state" and o["state"] == "thinking")
+    assert first_new == 0, [(k, o) for _, k, o in new[:first_new]]
+    assert {"type": "user_text", "text": "второй вопрос"} in link.jsons()
+    assert link.types()[-1] == "state:idle" and link.audio_bytes() > 0
+    # старый ход после abort не озвучивался дальше: ровно один audio_start в новом ходе
+    assert [o["type"] for _, k, o in new if k == "json"].count("audio_start") == 1
+    assert not [o for o in link.jsons()[link.jsons().index({"type": "user_text", "text": "второй вопрос"}):]
+                if o["type"] == "jarvis_text" and "длинное" in o["text"]]  # реплик прерванного ответа в новом ходе нет
+    assert len(mem) == 2  # и первый (то, что успели сказать), и второй обмен в памяти
+
+
+async def test_bargein_listen_start_without_abort_is_enough(link):
+    """Плата может сразу слать listen_start (без abort): ответ отменяется молча, новая запись обрабатывается."""
+    sess, _ = new_session(link, tts=MockTTS(seconds_per_char=0.12, min_s=1.0), llm=ScriptedLLM(LONG_ANSWER))
+    await say(sess)
+    assert await wait_for(lambda: link.audio_bytes() > 20000)
+    ack = len(link.items)
+    sess.eng.stt.text = "новый вопрос"
+    sess.eng.llm.items, sess.eng.tts.seconds_per_char = ["Короткий новый ответ."], 0.03
+    await _send_utterance(sess, "follow")
+    await _finish_new_turn(link, "новый вопрос")
+    new = link.items[ack:]
+    assert [o["type"] + (":" + o["state"] if o["type"] == "state" else "") for _, k, o in new if k == "json"][0] == "state:thinking"
+    assert {"type": "user_text", "text": "новый вопрос"} in link.jsons()
+
+
+async def test_abort_interrupts_tts_synthesis_in_the_worker_thread(link):
+    """Синтез первой фразы идёт 3 с; abort на 0,3 с: поток прерывается сразу, новый ход не ждёт его конца."""
+    tts = FirstSlowTTS(slow_s=3.0, seconds_per_char=0.03, min_s=0.3)
+    sess, _ = new_session(link, tts=tts, llm=ScriptedLLM(["Первая фраза ответа. ", "Вторая."]), stt=FakeSTT("вопрос"))
+    await say(sess)
+    assert await wait_for(lambda: len(tts.starts) == 1)
+    await asyncio.sleep(0.3)
+    await sess.on_text('{"type":"abort"}')
+    assert link.types()[-1] == "state:idle" and link.audio_bytes() == 0
+    sess.eng.stt.text = "новый вопрос"
+    t0 = time.perf_counter()
+    await _send_utterance(sess, "wake")
+    await _finish_new_turn(link, "новый вопрос", timeout=10)
+    assert tts.cancelled == 1  # старый синтез прерван, а не дождались его конца
+    assert time.perf_counter() - t0 < 2.0, "новый ответ не должен ждать конца прерванного синтеза (3 с)"
+    assert link.audio_bytes() > 0 and link.types()[-1] == "state:idle"
+
+
+async def test_engines_run_tts_cancel_frees_the_worker():
+    from jarvis_server.engines import Engines
+
+    tts = MockTTS(fixed_delay_s=5.0)
+    eng = make_engines(tts=tts)
+    t = asyncio.create_task(eng.run_tts("длинная фраза"))
+    await asyncio.sleep(0.1)
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    tts.fixed_delay_s = 0.0
+    t0 = time.perf_counter()
+    a = await eng.run_tts("короткая")
+    assert len(a) > 0 and time.perf_counter() - t0 < 1.0 and tts.cancelled == 1
+    assert isinstance(eng, Engines) and tts.cancel_event is None
+    eng.shutdown()
+
+
+async def test_abort_during_thinking_then_new_utterance_processed(link):
+    """abort, пока ИИ ещё думает (звука не было), и тут же новая запись."""
+    llm = ScriptedLLM(["Ответ, сэр. "], delay=3.0)
+    sess, _ = new_session(link, llm=llm, stt=FakeSTT("первый"))
+    await say(sess)
+    assert await wait_for(lambda: "user_text" in link.types())
+    await sess.on_text('{"type":"abort"}')
+    assert link.types()[-1] == "state:idle" and "audio_end" not in link.types()
+    llm.delay = 0.0
+    sess.eng.stt.text = "второй"
+    await _send_utterance(sess, "wake")
+    await _finish_new_turn(link, "второй", timeout=10)
+    assert link.audio_bytes() > 0
+    assert llm.history_seen[-1] == []  # прерванный ход, в котором ничего не сказали, в память не попал
+
+
+async def test_abort_after_follow_listen_start_is_handled(link):
+    """abort посреди записи follow: запись отброшена, ack idle, следующая запись обычная."""
+    sess, _ = new_session(link)
+    await sess.on_text('{"type":"listen_start","mode":"follow"}')
+    await sess.on_binary(pcm_speech(0.5))
+    await sess.on_text('{"type":"abort"}')
+    assert link.types() == ["state:idle"] and sess.state == "idle" and len(sess._rx) == 0
+
+
+async def test_own_name_never_reaches_the_speaker_but_subtitle_is_untouched(link, caplog):
+    """ИИ нарушил запрет и назвал себя: в синтезатор имя не попадает (плата приняла бы его за обращение), в логе строка об этом."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="jarvis.session")
+    tts = MockTTS(seconds_per_char=0.01, min_s=0.1)
+    sess, _ = new_session(link, llm=ScriptedLLM(["Меня зовут Джарвис, сэр."]), tts=tts)
+    await say(sess)
+    await finish(sess, link)
+    assert tts.calls == ["Меня зовут ваш помощник, сэр."]
+    assert [o["text"] for o in link.jsons() if o["type"] == "jarvis_text"][0] == "Меня зовут Джарвис, сэр."
+    assert [r for r in caplog.records if "назвал себя по имени" in r.getMessage()]
+
+
+async def test_first_sentence_is_spoken_in_two_chunks_with_identical_subtitles(link, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="jarvis.session")
+    first = ("Жил-был один дракон, который сжёг все книги в округе, а потом заскучал и завёл себе дворецкого, "
+             "чтобы хоть с кем-то вести беседы о погоде.")
+    tts = MockTTS(seconds_per_char=0.02, min_s=0.2)
+    sess, mem = new_session(link, llm=ScriptedLLM([first + " Вторая фраза, сэр."]), tts=tts)  # одним куском, как отдаёт Gemini
+    await say(sess)
+    await finish(sess, link)
+    jt = [o for o in link.jsons() if o["type"] == "jarvis_text"]
+    assert [o["text"] for o in jt] == ["Жил-был один дракон, который сжёг все книги в округе,",
+                                       "а потом заскучал и завёл себе дворецкого, чтобы хоть с кем-то вести беседы о погоде.",
+                                       "Вторая фраза, сэр."]
+    assert " ".join(o["text"] for o in jt[:2]) == first  # видимый текст тот же, что без деления
+    assert [o["final"] for o in jt] == [False, False, True]
+    assert len(tts.calls) == 3 and tts.calls[0].endswith("округе,")
+    assert mem.history()[0].assistant == first + " Вторая фраза, сэр."
+    await asyncio.sleep(0.05)
+    assert "first_split=53 " in _turn_lines(caplog)[-1]
+
+
+async def test_first_sentence_split_can_be_switched_off(link, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="jarvis.session")
+    first = ("Жил-был один дракон, который сжёг все книги в округе, а потом заскучал и завёл себе дворецкого, "
+             "чтобы хоть с кем-то вести беседы о погоде.")
+    tts = MockTTS(seconds_per_char=0.02, min_s=0.2)
+    sess, _ = new_session(link, llm=ScriptedLLM([first + " Вторая фраза, сэр."]), tts=tts, first_chunk_split=False)
+    await say(sess)
+    await finish(sess, link)
+    assert [o["text"] for o in link.jsons() if o["type"] == "jarvis_text"] == [first, "Вторая фраза, сэр."]
+    await asyncio.sleep(0.05)
+    assert "first_split=- " in _turn_lines(caplog)[-1]
+
+
+async def test_first_chunk_plays_before_second_is_synthesized_and_no_gap_with_fast_tts(link, caplog):
+    """Синтез быстрее речи: второй кусок успевает, пауза на стыке не возникает."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="jarvis.session")
+    first = ("Жил-был один дракон, который сжёг все книги в округе, а потом заскучал и завёл себе дворецкого, "
+             "чтобы хоть с кем-то вести беседы о погоде.")
+    # звук ~0,05 с на символ, синтез 0,3 с + 0,25 от длины звука
+    tts = MockTTS(seconds_per_char=0.05, min_s=0.2, fixed_delay_s=0.3, rtf=0.25)
+    sess, _ = new_session(link, llm=ScriptedLLM([first]), tts=tts)
+    await say(sess)
+    await finish(sess, link)
+    await asyncio.sleep(0.05)
+    line = _turn_lines(caplog)[-1]
+    assert "underruns=0" in line and "first_split=53" in line, line
+
+
+async def test_nothing_is_sent_once_the_turn_is_marked_cancelled(link):
+    """Отмена доходит до дочерних задач хода не мгновенно; за это время звук и текст уже не уходят (флаг ctx.cancelled)."""
+    sess, _ = new_session(link, tts=MockTTS(seconds_per_char=0.12, min_s=1.0), llm=ScriptedLLM(LONG_ANSWER))
+    await say(sess)
+    assert await wait_for(lambda: link.audio_bytes() > 5000)
+    sess._ctx.cancelled = True  # как делает _cancel_turn прямо перед task.cancel()
+    n = len(link.items)
+    await asyncio.sleep(0.5)  # сам ход не отменяли: остановить отправку может только флаг
+    assert len(link.items) == n, link.items[n:]
+    await sess._cancel_turn()
+
+
+async def test_cancel_turn_marks_context_and_new_turn_starts_clean(link):
+    sess, _ = new_session(link, tts=MockTTS(seconds_per_char=0.12, min_s=1.0), llm=ScriptedLLM(LONG_ANSWER))
+    await say(sess)
+    assert await wait_for(lambda: link.audio_bytes() > 5000)
+    old = sess._ctx
+    await sess.on_text('{"type":"abort"}')
+    assert old.cancelled and sess._turn is None
+    sess.eng.llm.items, sess.eng.tts.seconds_per_char = ["Новый короткий ответ."], 0.03
+    sess.eng.stt.text = "ещё вопрос"
+    await _send_utterance(sess, "wake")
+    await _finish_new_turn(link, "ещё вопрос")
+    assert sess._ctx is not old and sess._ctx.cancelled is False
