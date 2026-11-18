@@ -138,6 +138,91 @@ const char *skip_spaces(const char *p)
     return p;
 }
 
+// Аргументы команды wake (после слова wake): слово, затем необязательное значение; хвостовые пробелы не в счёт
+Command parse_wake(const char *a)
+{
+    size_t alen = strlen(a);
+    while (alen > 0 && is_space(a[alen - 1])) {
+        alen--;
+    }
+    char buf[48];
+    if (alen >= sizeof(buf)) {
+        return make_error("wake", "usage");
+    }
+    memcpy(buf, a, alen);
+    buf[alen] = '\0';
+    Command c;
+    c.kind = Kind::Wake;
+    if (alen == 0) {
+        c.wake_op = WakeOp::Status;
+        return c;
+    }
+    const char *p = buf;
+    const char *w = p;
+    while (*p && !is_space(*p)) {
+        p++;
+    }
+    const size_t wl = static_cast<size_t>(p - w);
+    const char *arg = skip_spaces(p);
+    if (word_eq(w, wl, "on") && *arg == '\0') {
+        c.wake_op = WakeOp::On;
+        return c;
+    }
+    if (word_eq(w, wl, "off") && *arg == '\0') {
+        c.wake_op = WakeOp::Off;
+        return c;
+    }
+    if (word_eq(w, wl, "beep")) {
+        const size_t al = strlen(arg);
+        if (word_eq(arg, al, "on")) {
+            c.wake_op = WakeOp::BeepOn;
+            return c;
+        }
+        if (word_eq(arg, al, "off")) {
+            c.wake_op = WakeOp::BeepOff;
+            return c;
+        }
+        return make_error("wake", "usage");
+    }
+    if (word_eq(w, wl, "thr") || word_eq(w, wl, "threshold")) {
+        if (*arg == '\0') {
+            return make_error("wake", "usage");
+        }
+        c.wake_op = WakeOp::Threshold;
+        if (word_eq(arg, strlen(arg), "default")) {
+            c.wake_thr = 0.0f;
+            return c;
+        }
+        char *endp = nullptr;
+        const double v = strtod(arg, &endp);
+        if (endp == arg || *endp != '\0' || !(v == v)) {
+            return make_error("wake", "usage");
+        }
+        if (v < 0.40 || v > 0.9999) {
+            return make_error("wake", "thr_range");
+        }
+        c.wake_thr = static_cast<float>(v);
+        return c;
+    }
+    if (word_eq(w, wl, "silence")) {
+        if (*arg == '\0') {
+            return make_error("wake", "usage");
+        }
+        char *endp = nullptr;
+        const long v = strtol(arg, &endp, 10);
+        if (endp == arg || *endp != '\0') {
+            return make_error("wake", "usage");
+        }
+        if (v < 300 || v > 3000) {
+            return make_error("wake", "silence_range");
+        }
+        c.wake_op = WakeOp::Silence;
+        c.wake_ms = static_cast<uint32_t>(v);
+        return c;
+    }
+    return make_error("wake", "usage");
+}
+
 }  // namespace
 
 bool is_valid_posix_tz(const char *tz)
@@ -312,6 +397,9 @@ Command parse_command(const char *line)
         c.kind = Kind::Echo;
         return c;
     }
+    if (word_eq(w, wlen, "wake")) {
+        return parse_wake(skip_spaces(rest));
+    }
     if (word_eq(w, wlen, "status")) {
         Command c;
         c.kind = Kind::Status;
@@ -353,6 +441,8 @@ const char *describe_error(const char *reason)
         {"tz_too_long", "строка часового пояса длиннее 63 символов"},
         {"lcd_range", "номер варианта экрана от 1 до 6"},
         {"bad_url", "адрес сервера должен выглядеть так: ws://192.168.1.5:47801/ws (или server auto)"},
+        {"thr_range", "порог слова от 0.40 до 0.9999 (или default); меньше = чувствительнее"},
+        {"silence_range", "пауза после речи в миллисекундах, от 300 до 3000"},
     };
     for (const Item &it : kItems) {
         if (strcmp(it.key, reason) == 0) {

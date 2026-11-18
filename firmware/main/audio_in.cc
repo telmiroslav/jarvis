@@ -284,6 +284,9 @@ void AudioIn::process_block(const int32_t *words, size_t frames)
     if (const SinkFn sink = sink_.load()) {
         sink(sink_ctx_.load(), pcm_, frames);
     }
+    if (const SinkFn tap = tap_.load()) {
+        tap(tap_ctx_.load(), pcm_, frames);
+    }
 
     seq_.store(b.seq);
 }
@@ -292,6 +295,12 @@ void AudioIn::set_sink(SinkFn fn, void *ctx)
 {
     sink_ctx_.store(ctx);
     sink_.store(fn);
+}
+
+void AudioIn::set_tap(SinkFn fn, void *ctx)
+{
+    tap_ctx_.store(ctx);
+    tap_.store(fn);
 }
 
 }  // namespace jarvis

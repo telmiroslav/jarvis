@@ -21,6 +21,7 @@ struct State {
     size_t head = 0;
     size_t count = 0;
     bool capturing = false;
+    bool injected = false;   // звук подаёт inject(), а не sink()
     std::atomic<uint32_t> dropped{0};
 };
 
@@ -46,15 +47,9 @@ bool init(size_t capacity_samples)
     return true;
 }
 
-void sink(void *, const int16_t *pcm, size_t n)
+// Кладёт отсчёты в кольцо; вызывающий держит S.mu
+static void push_locked(const int16_t *pcm, size_t n)
 {
-    if (!S.buf) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(S.mu);
-    if (!S.capturing) {
-        return;
-    }
     const size_t room = S.cap - S.count;
     const size_t take = n < room ? n : room;
     size_t tail = S.head + S.count;
@@ -72,18 +67,53 @@ void sink(void *, const int16_t *pcm, size_t n)
     }
 }
 
+void sink(void *, const int16_t *pcm, size_t n)
+{
+    if (!S.buf) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(S.mu);
+    if (!S.capturing || S.injected) {
+        return;
+    }
+    push_locked(pcm, n);
+}
+
+void inject(const int16_t *pcm, size_t n)
+{
+    if (!S.buf || n == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(S.mu);
+    if (!S.capturing || !S.injected) {
+        return;
+    }
+    push_locked(pcm, n);
+}
+
 void begin_capture()
 {
     std::lock_guard<std::mutex> lock(S.mu);
     S.head = 0;
     S.count = 0;
     S.capturing = true;
+    S.injected = false;
+}
+
+void begin_capture_injected()
+{
+    std::lock_guard<std::mutex> lock(S.mu);
+    S.head = 0;
+    S.count = 0;
+    S.capturing = true;
+    S.injected = true;
 }
 
 void cancel_capture()
 {
     std::lock_guard<std::mutex> lock(S.mu);
     S.capturing = false;
+    S.injected = false;
     S.head = 0;
     S.count = 0;
 }
@@ -92,6 +122,7 @@ void end_capture()
 {
     std::lock_guard<std::mutex> lock(S.mu);
     S.capturing = false;
+    S.injected = false;
 }
 
 bool capturing()

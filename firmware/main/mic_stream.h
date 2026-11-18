@@ -8,6 +8,8 @@
 //                     иначе пропали бы, а человек начинает говорить сразу после нажатия;
 //   cancel_capture()  оказалось коротким нажатием или связь пропала: выбросить всё;
 //   end_capture()     кнопка отпущена: новые блоки больше не принимаются, а накопленное link дошлёт целиком.
+// Запись по слову «Джарвис» (wake.cc) идёт иначе: begin_capture_injected() включает приём, но блоки микрофона через sink()
+// сюда не попадают (в них писк и слово), звук подаёт wake.cc сам через inject() с точностью до отсчёта.
 // Кольцо рассчитано на 2 с: link забирает звук каждые 10-20 мс, запас на случай, если сеть на секунду споткнулась.
 
 #include <stddef.h>
@@ -24,6 +26,10 @@ bool init(size_t capacity_samples);
 void sink(void *ctx, const int16_t *pcm, size_t n);
 
 void begin_capture();
+// Приём включён, но sink() игнорируется: звук приходит только через inject()
+void begin_capture_injected();
+// Добавляет отсчёты в запись (только после begin_capture_injected(); иначе игнорируется)
+void inject(const int16_t *pcm, size_t n);
 void cancel_capture();
 void end_capture();
 bool capturing();

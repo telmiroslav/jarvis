@@ -79,6 +79,9 @@ public:
     // (int16, kSampleRate, с усилением kPcmGain). Должен быть быстрым и не ждать сеть.
     using SinkFn = void (*)(void *ctx, const int16_t *pcm, size_t n);
     void set_sink(SinkFn fn, void *ctx);
+    // Второй получатель, независимый от первого: все блоки подряд, пока он установлен (слово «Джарвис», wake.cc). Те же
+    // отсчёты и те же требования: быстро, не ждать сеть. Зовётся после sink.
+    void set_tap(SinkFn fn, void *ctx);
 
     uint32_t read_errors() const { return read_errors_.load(); }
     uint32_t blocks() const { return seq_.load(); }
@@ -119,6 +122,8 @@ private:
 
     std::atomic<SinkFn> sink_{nullptr};
     std::atomic<void *> sink_ctx_{nullptr};
+    std::atomic<SinkFn> tap_{nullptr};
+    std::atomic<void *> tap_ctx_{nullptr};
 
     std::atomic<uint32_t> seq_{0};
     std::atomic<uint32_t> read_errors_{0};

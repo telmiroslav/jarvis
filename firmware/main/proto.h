@@ -61,9 +61,9 @@ bool parse_server_message(const char *json, size_t len, ServerMsg *out);
 
 // ---- сообщения платы
 
-enum class OutMsg : uint8_t { ListenStart, ListenStop, Abort, Ping };
+enum class OutMsg : uint8_t { ListenStart, ListenStop, Abort, Ping, ListenStartWake };
 
-// Готовая строка для коротких сообщений ({"type":"listen_start","mode":"ptt"}, ...)
+// Готовая строка для коротких сообщений ({"type":"listen_start","mode":"ptt"}, {"type":"listen_start","mode":"wake"}, ...)
 const char *out_text(OutMsg m);
 
 // {"type":"hello","proto":1,"fw":"...","mac":"..","mic_rate":16000,"spk_rate":24000}; возвращает длину

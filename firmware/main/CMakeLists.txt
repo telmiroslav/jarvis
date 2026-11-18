@@ -23,6 +23,8 @@ idf_component_register(
          "text_util.cc"
          "ui.cc"
          "ui_logic.cc"
+         "wake.cc"
+         "wake_logic.cc"
          "fonts/jv_font_text_18.c"
          "fonts/jv_font_ui_14.c"
     INCLUDE_DIRS "."

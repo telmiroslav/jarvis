@@ -27,6 +27,7 @@
 #include "net_logic.h"
 #include "subtitle.h"
 #include "ui.h"
+#include "wake_logic.h"
 
 using namespace jarvis;
 
@@ -588,6 +589,48 @@ int main(int argc, char **argv)
         ui::clear_texts();
         ui::set_out_level(0.0f);
         ui::set_state(ui::State::Idle);
+        advance(500);
+    }
+
+    // v0.4: подсказки в покое про слово «Джарвис». Тексты из тех же констант, что и на плате.
+    {
+        ui::clear_texts();
+        ui::set_out_level(0.0f);
+        ui::set_mic_level(0.0f);
+        ui::set_state(ui::State::Idle);
+
+        // 19. На взводе: «Скажи «Джарвис»», глаза бодрые
+        ui::set_hint(wake_logic::kHintArmed);
+        advance(1500);
+        const Image armed = shot(++n, "idle_wake_hint");
+        const Box4 eyes = lit_box(armed, 0, 24, 240, 120);
+        CHECK(eyes.any() && eyes.y1 < 146);   // подсказка не залезла на глаза
+        const Box4 hint = lit_box(armed, 0, 150, 240, 90);
+        CHECK(hint.any() && hint.x0 >= 4 && hint.x1 <= 236 && hint.y1 <= 238);
+        CHECK(ui::testing::main_text_height() <= ui::testing::main_view_height());   // одна строка, без прокрутки
+        // кавычки-ёлочки нарисованы настоящими глифами, а не «?»: у строки с «?» на этих местах другое число пикселей
+        ui::set_hint("Скажи ?Джарвис?");
+        advance(900);
+        const Image qmarks = frame_to_image();   // только для сравнения: в файлы и общий лист не идёт
+        CHECK(lit_pixels(armed, 0, 150, 240, 90) != lit_pixels(qmarks, 0, 150, 240, 90));
+
+        // 20. Слово выключено или не поднялось: «Зажми BOOT и говори»
+        ui::set_hint(wake_logic::kHintBoot);
+        advance(900);
+        const Image boot = shot(++n, "idle_boot_hint");
+        const Box4 b_hint = lit_box(boot, 0, 150, 240, 90);
+        CHECK(b_hint.any() && b_hint.x0 >= 4 && b_hint.x1 <= 236 && b_hint.y1 <= 238);
+        CHECK(ui::testing::main_text_height() <= ui::testing::main_view_height());
+
+        // 21. Ничего не сказали после слова: «Не расслышал»
+        ui::set_hint(wake_logic::kHintDidntHear);
+        advance(900);
+        const Image didnt = shot(++n, "didnt_hear");
+        const Box4 d_hint = lit_box(didnt, 0, 150, 240, 90);
+        CHECK(d_hint.any() && d_hint.x0 >= 4 && d_hint.x1 <= 236 && d_hint.y1 <= 238);
+        CHECK(ui::testing::main_text_height() <= ui::testing::main_view_height());
+
+        ui::set_hint("");
         advance(500);
     }
 

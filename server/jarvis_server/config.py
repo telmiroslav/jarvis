@@ -105,6 +105,7 @@ class Settings:
     stt_compute: str = "auto"
     stt_beam: int = 0  # 0 = по устройству (GPU 5, CPU 1)
     stt_prompt: str = ""
+    stt_hotwords: str = "Джарвис"  # слова, к написанию которых Whisper склоняется (faster-whisper hotwords); пусто = выкл.
     # голос
     tts: str = "omnivoice"  # omnivoice | mock
     tts_device: str = "auto"
@@ -137,7 +138,7 @@ class Settings:
         key = "задан" if self.api_key else "НЕ задан"
         return (
             f"llm={self.llm}/{self.llm_backend}/{self.llm_model} ключ={key} stt={self.stt_model}/{self.stt_device}/"
-            f"{self.stt_compute} tts={self.tts}/{self.tts_device}/{self.tts_dtype}/steps={self.tts_steps} "
+            f"{self.stt_compute} подсказка_stt={self.stt_hotwords or '-'} tts={self.tts}/{self.tts_device}/{self.tts_dtype}/steps={self.tts_steps} "
             f"порты udp={self.discovery_port} ws={self.ws_port}"
         )
 
@@ -177,6 +178,7 @@ def load_settings(env_override: dict[str, str] | None = None, *, files: list[Pat
         stt_compute=(env.get("JARVIS_STT_COMPUTE") or base.stt_compute).strip().lower(),
         stt_beam=_int(env, "JARVIS_STT_BEAM", base.stt_beam),
         stt_prompt=env.get("JARVIS_STT_PROMPT", base.stt_prompt),
+        stt_hotwords=(env["JARVIS_STT_HOTWORDS"] if "JARVIS_STT_HOTWORDS" in env else base.stt_hotwords).strip(),
         tts=(env.get("JARVIS_TTS") or base.tts).strip().lower(),
         tts_device=(env.get("JARVIS_TTS_DEVICE") or dev).strip().lower(),
         tts_dtype=(env.get("JARVIS_TTS_DTYPE") or base.tts_dtype).strip().lower(),

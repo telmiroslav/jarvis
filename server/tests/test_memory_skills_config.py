@@ -108,6 +108,15 @@ def test_settings_defaults_and_overrides(tmp_path):
     assert load_settings({"JARVIS_TTS_STEPS": "мусор"}).tts_steps == 32
 
 
+def test_stt_hotwords_setting():
+    assert load_settings({}).stt_hotwords == "Джарвис"  # по умолчанию имя Джарвис (измерено, docs/SERVER.md)
+    assert load_settings({"JARVIS_STT_HOTWORDS": ""}).stt_hotwords == ""  # пустое значение отключает
+    assert load_settings({"JARVIS_STT_HOTWORDS": "  Джарвис, Джемини  "}).stt_hotwords == "Джарвис, Джемини"
+    assert load_settings({}).stt_prompt == ""  # initial_prompt по умолчанию выключен (в шуме повторяет саму подсказку)
+    assert load_settings({"JARVIS_STT_PROMPT": "Джарвис."}).stt_prompt == "Джарвис."
+    assert "Джарвис" in load_settings({}).describe()
+
+
 def test_env_file_precedence(tmp_path, monkeypatch):
     a = tmp_path / "server.env"
     b = tmp_path / "repo.env"

@@ -4,6 +4,7 @@ import json
 import time
 
 
+from jarvis_server import __version__
 from jarvis_server.llm import FLUSH, MSG_NETWORK, LLMError
 from jarvis_server.memory import ConversationMemory
 from jarvis_server.session import MSG_TTS, Session
@@ -19,9 +20,10 @@ def new_session(link, **kw):
     return Session(link, make_engines(**eng_kw), s, mem), mem
 
 
-async def say(sess, pcm=None, frame_s=0.1):
+async def say(sess, pcm=None, frame_s=0.1, mode="ptt"):
     pcm = pcm or pcm_speech(1.0)
-    await sess.on_text(json.dumps({"type": "listen_start", "mode": "ptt"}))
+    start = {"type": "listen_start"} if mode is None else {"type": "listen_start", "mode": mode}
+    await sess.on_text(json.dumps(start))
     step = int(16000 * frame_s) * 2
     for i in range(0, len(pcm), step):
         await sess.on_binary(pcm[i: i + step])
@@ -61,7 +63,8 @@ async def test_hello_ping_unknown_and_bad_json(link):
     await sess.on_text('{"type":"something_new"}')
     await sess.on_text("не json")
     await sess.on_text("[]")
-    assert link.jsons() == [{"type": "welcome", "proto": 1, "server": "0.1.0", "tts_rate": 24000}, {"type": "pong"}]
+    assert link.jsons() == [{"type": "welcome", "proto": 1, "server": __version__, "tts_rate": 24000}, {"type": "pong"}]
+    assert __version__ == "0.2.0"
     assert sess.state == "idle"
 
 
@@ -398,3 +401,136 @@ async def test_cuda_failure_requests_restart_but_oom_does_not(link):
     await say(sess)
     await finish(sess, link, "state:error")
     assert len(reasons) == 1 and "launch failure" in reasons[0]
+
+
+# ------------------------------------------------------------------ режим wake (прошивка v0.4) ----
+
+
+async def test_wake_mode_is_accepted_and_strips_address(link):
+    llm = ScriptedLLM(["Сейчас четырнадцать тридцать два, сэр."])
+    sess, mem = new_session(link, llm=llm, stt=FakeSTT("Джарис, который час?"))
+    await sess.on_text('{"type":"listen_start","mode":"wake"}')
+    assert sess.state == "listening"
+    await sess.on_binary(pcm_speech(1.0))
+    await sess.on_text('{"type":"listen_stop"}')
+    await finish(sess, link)
+    assert {"type": "user_text", "text": "Который час?"} in link.jsons()
+    assert llm.history_seen and link.audio_bytes() > 0
+    assert [e.user for e in mem.history()] == ["Который час?"]  # в память тоже без обращения
+
+
+async def test_wake_mode_llm_gets_text_without_address(link):
+    seen = []
+
+    class SpyLLM(ScriptedLLM):
+        async def stream(self, history, user_text, tools, stats):
+            seen.append(user_text)
+            async for x in super().stream(history, user_text, tools, stats):
+                yield x
+
+    sess, _ = new_session(link, llm=SpyLLM(["Слушаю."]), stt=FakeSTT("привет жарвис привет, расскажи анекдот"))
+    await say(sess, mode="wake")
+    await finish(sess, link)
+    assert seen == ["Привет, расскажи анекдот"]
+
+
+async def test_wake_only_goes_idle_without_llm_call(link, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="jarvis.session")
+    for heard in ("Джарвис", "Привет, Джарвис.", "привет жарвис привет жарвис", "вис", "Эй, Джарвис!"):
+        link.items.clear()
+        llm = ScriptedLLM(["не должен вызываться"])
+        sess, mem = new_session(link, llm=llm, stt=FakeSTT(heard))
+        await say(sess, mode="wake")
+        await finish(sess, link)
+        assert link.types() == ["state:thinking", "state:idle"], heard  # как при пустой речи: ни user_text, ни звука
+        assert llm.history_seen == [] and link.audio_bytes() == 0 and len(mem) == 0
+        assert sess.state == "idle"
+    await asyncio.sleep(0.05)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("TURN ")]
+    assert lines and all("empty(wake_only)" in ln and ln.endswith("mode=wake") for ln in lines), lines
+
+
+async def test_ptt_keeps_lone_name_and_asks_llm(link):
+    seen = []
+
+    class SpyLLM(ScriptedLLM):
+        async def stream(self, history, user_text, tools, stats):
+            seen.append(user_text)
+            async for x in super().stream(history, user_text, tools, stats):
+                yield x
+
+    sess, _ = new_session(link, llm=SpyLLM(["Да, сэр."]), stt=FakeSTT("Джарвис"))
+    await say(sess, mode="ptt")
+    await finish(sess, link)
+    assert seen == ["Джарвис"] and {"type": "user_text", "text": "Джарвис"} in link.jsons()
+
+
+async def test_ptt_strips_leading_address_when_words_follow(link):
+    sess, _ = new_session(link, stt=FakeSTT("Джарвис, ты меня слышишь?"))
+    await say(sess, mode="ptt")
+    await finish(sess, link)
+    assert {"type": "user_text", "text": "Ты меня слышишь?"} in link.jsons()
+
+
+async def test_missing_mode_is_ptt_and_unknown_mode_warns_but_works(link, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="jarvis.session")
+    sess, _ = new_session(link, stt=FakeSTT("Джарвис"))
+    await say(sess, mode=None)  # прошивка без поля mode
+    await finish(sess, link)
+    assert sess._mode == "ptt" and not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    link.items.clear()
+    sess, _ = new_session(link, stt=FakeSTT("Джарвис, включи свет"))
+    await say(sess, mode="future-mode")
+    await finish(sess, link)  # не отвергнут: ход прошёл как в ptt (имя снято, остальное осталось)
+    assert {"type": "user_text", "text": "Включи свет"} in link.jsons()
+    warn = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warn) == 1 and "future-mode" in warn[0]
+
+    link.items.clear()
+    sess, _ = new_session(link, stt=FakeSTT("Джарвис"))
+    await sess.on_text('{"type":"listen_start","mode":123}')  # не строка
+    await sess.on_binary(pcm_speech(1.0))
+    await sess.on_text('{"type":"listen_stop"}')
+    await finish(sess, link)
+    assert {"type": "user_text", "text": "Джарвис"} in link.jsons()
+
+
+async def test_turn_line_ends_with_mode(link, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="jarvis.session")
+    sess, _ = new_session(link)
+    await say(sess, mode="wake")
+    await finish(sess, link)
+    sess2, _ = new_session(link)
+    await say(sess2, mode="ptt")
+    await asyncio.sleep(0.3)
+    await finish(sess2, link)
+    await asyncio.sleep(0.05)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("TURN ")]
+    assert len(lines) == 2
+    assert lines[0].endswith(" mode=wake") and lines[1].endswith(" mode=ptt")
+    # формат key=value и порядок прежних ключей не изменились (report.sh ищет их регулярками)
+    assert lines[0].index("stt_ms=") < lines[0].index("total_turn_ms=") < lines[0].index("tools=") < lines[0].index("mode=")
+    assert "model=" in lines[0] and "mode=wake" in lines[0].split("model=")[1]
+
+
+async def test_mode_is_per_utterance(link, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="jarvis.session")
+    sess, _ = new_session(link, stt=FakeSTT("Джарвис, включи свет"))
+    await say(sess, mode="wake")
+    await finish(sess, link)
+    await asyncio.sleep(0.05)
+    link.items.clear()
+    await say(sess, mode="ptt")
+    await wait_for(lambda: link.types() and link.types()[-1] == "state:idle")
+    await asyncio.sleep(0.05)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("TURN ")]
+    assert [ln.rsplit(" ", 1)[1] for ln in lines] == ["mode=wake", "mode=ptt"]

@@ -50,6 +50,10 @@ Out decide(const In &in)
         o.hint = in.server_hint;
         return o;
     }
+    // 5. Всё в порядке: подсказка, как заговорить
+    if (in.idle_hint) {
+        o.hint = in.idle_hint;
+    }
     return o;
 }
 

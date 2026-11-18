@@ -53,15 +53,21 @@ void apply(const dialog::Out &o)
         ui::clear_texts();
     }
     if (o.listen_start) {
-        if (!mic_stream::capturing()) {
-            mic_stream::begin_capture();   // нажали, пока связи не было, а она вернулась: копим с этого момента
+        if (o.listen_wake) {
+            mic_stream::begin_capture_injected();   // звук подаёт wake.cc с точностью до отсчёта (без писка, с предзаписью)
+            link::send(proto::OutMsg::ListenStartWake);
+            ESP_LOGI(TAG, "WAKE: listening");
+        } else {
+            if (!mic_stream::capturing()) {
+                mic_stream::begin_capture();   // нажали, пока связи не было, а она вернулась: копим с этого момента
+            }
+            link::send(proto::OutMsg::ListenStart);
+            ESP_LOGI(TAG, "PTT: listening");
         }
-        link::send(proto::OutMsg::ListenStart);
-        ESP_LOGI(TAG, "PTT: listening");
     }
     if (o.listen_stop) {
         link::send(proto::OutMsg::ListenStop);
-        ESP_LOGI(TAG, "PTT: released, waiting for the answer");
+        ESP_LOGI(TAG, "listen_stop sent, waiting for the answer");
     }
     if (o.abort) {
         link::send(proto::OutMsg::Abort);
@@ -163,6 +169,34 @@ void on_button(bool pressed, uint32_t at_ms)
     }
 }
 
+bool wake_begin(uint32_t at_ms)
+{
+    std::lock_guard<std::mutex> lock(S.mu);
+    const dialog::Out o = S.dlg.on_wake_start(at_ms);
+    if (!o.listen_start) {
+        return false;
+    }
+    if (S.dlg.phase() == dialog::Phase::Listening) {
+        ESP_LOGI(TAG, "dialog: IDLE -> LISTENING (wake word)");
+    }
+    apply(o);
+    return true;
+}
+
+bool wake_end(uint32_t at_ms, bool no_speech)
+{
+    std::lock_guard<std::mutex> lock(S.mu);
+    const dialog::Phase before = S.dlg.phase();
+    const dialog::Out o = S.dlg.on_wake_end(at_ms, no_speech);
+    if (!o.listen_stop) {
+        return false;
+    }
+    apply(o);
+    ESP_LOGI(TAG, "dialog: %s -> %s (wake recording ended%s)", dialog::phase_name(before), dialog::phase_name(S.dlg.phase()),
+             no_speech ? ", nothing was said" : "");
+    return true;
+}
+
 void tick(uint32_t at_ms)
 {
     const bool drained = playback::drained();
@@ -188,6 +222,7 @@ View view()
     snprintf(v.error_msg, sizeof(v.error_msg), "%s", S.dlg.error_msg());
     v.link_ready = S.dlg.link_ready();
     v.button_down = S.dlg.pressed();
+    v.wake_listening = S.dlg.wake_listening();
     v.aborts = S.dlg.aborts();
     return v;
 }

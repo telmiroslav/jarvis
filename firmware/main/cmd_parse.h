@@ -12,6 +12,11 @@
 //   server                         показать, к какому серверу плата подключена
 //   server ws://ip:порт/путь       адрес сервера руками (поиск по UDP отключается)
 //   server auto                    забыть адрес и искать сервер по UDP
+//   wake                           слово «Джарвис»: состояние, порог, счётчики
+//   wake on | wake off             включить / выключить слово (запоминается; BOOT работает всегда)
+//   wake beep on | wake beep off   писк после слова
+//   wake thr <0.40..0.9999>|default  порог срабатывания (меньше = чувствительнее, больше ложных)
+//   wake silence <300..3000>       пауза в мс после речи, которая считается концом фразы (по умолчанию 800)
 //   echo                           диагностика звука: запись 4 с с микрофона и воспроизведение
 //   status                         одна строка состояния
 //   reboot                         перезагрузка
@@ -19,11 +24,14 @@
 // Пароль никуда не печатается: ни в ответ, ни в лог (за это отвечает код, который вызывает parse_command).
 
 #include <stddef.h>
+#include <stdint.h>
 
 namespace jarvis {
 namespace cmd {
 
-enum class Kind { Empty, WifiSet, WifiClear, Tz, Lcd, Server, Echo, Status, Reboot, Help, Error };
+enum class Kind { Empty, WifiSet, WifiClear, Tz, Lcd, Server, Echo, Wake, Status, Reboot, Help, Error };
+
+enum class WakeOp { Status, On, Off, BeepOn, BeepOff, Threshold, Silence };
 
 constexpr size_t kMaxSsid = 32;      // байт, предел стандарта 802.11
 constexpr size_t kMaxPass = 64;      // 8..63 символа или ровно 64 шестнадцатеричные цифры
@@ -39,6 +47,9 @@ struct Command {
     int lcd = 0;
     char url[kMaxServerUrl + 1] = {0};   // Kind::Server: адрес; пусто = только показать
     bool server_auto = false;            // Kind::Server: «server auto»
+    WakeOp wake_op = WakeOp::Status;     // Kind::Wake
+    float wake_thr = 0.0f;               // Kind::Wake, Threshold: 0 = default (стандартный порог модели)
+    uint32_t wake_ms = 0;                // Kind::Wake, Silence
     // для Kind::Error: имя команды (или "cmd") и причина, обе строки статические, без пробелов
     const char *err_cmd = "cmd";
     const char *err_reason = "";

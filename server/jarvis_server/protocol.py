@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,6 +18,10 @@ MIC_RATE = 16000  # плата -> сервер
 TTS_RATE = 24000  # сервер -> плата
 
 STATES = ("thinking", "speaking", "idle", "error")
+
+# listen_start.mode: ptt = зажата кнопка BOOT, wake = плата услышала слово «Джарвис» и сама решает, когда речь кончилась
+LISTEN_MODES = ("ptt", "wake")
+DEFAULT_LISTEN_MODE = "ptt"  # прошивки до v0.4 поле не присылают
 
 
 class ProtocolError(ValueError):
@@ -110,6 +115,16 @@ def audio_end() -> str:
 
 def pong() -> str:
     return dumps({"type": "pong"})
+
+
+def parse_listen_mode(raw: Any) -> tuple[str, bool]:
+    """Поле `mode` из listen_start -> (метка для лога, известен ли режим). Не бросает исключений: неизвестный режим
+    не отвергается (сервер ведёт себя как в ptt и пишет предупреждение). Метка безопасна для строки лога (a-z, 0-9, _, -)."""
+    if raw is None:
+        return DEFAULT_LISTEN_MODE, True
+    label = re.sub(r"[^a-z0-9_-]", "_", raw.strip().lower())[:16] if isinstance(raw, str) else "invalid"
+    label = label or "unknown"
+    return label, label in LISTEN_MODES
 
 
 @dataclass

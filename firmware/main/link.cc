@@ -434,7 +434,7 @@ void drain_commands()
         }
         const proto::OutMsg m = static_cast<proto::OutMsg>(cmd);
         if (!ready) {
-            if (m == proto::OutMsg::ListenStop || m == proto::OutMsg::ListenStart) {
+            if (m == proto::OutMsg::ListenStop || m == proto::OutMsg::ListenStart || m == proto::OutMsg::ListenStartWake) {
                 mic_stream::cancel_capture();
             }
             ESP_LOGW(TAG, "link is not ready: dropped %s", proto::out_text(m));
@@ -442,6 +442,7 @@ void drain_commands()
         }
         switch (m) {
         case proto::OutMsg::ListenStart:
+        case proto::OutMsg::ListenStartWake:
             C.streaming = true;
             send_text(proto::out_text(m));
             break;

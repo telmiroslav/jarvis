@@ -62,6 +62,7 @@ Out Dialog::on_link(bool ready, uint32_t now)
         }
         o.capture_cancel = true;
         phase_ = Phase::Idle;
+        listen_wake_ = false;
         audio_open_ = false;
         audio_ended_ = false;
         stale_ = false;
@@ -83,8 +84,58 @@ Out Dialog::on_press(uint32_t now)
     pressed_ = true;
     hold_fired_ = false;
     press_ms_ = now;
+    if (phase_ == Phase::Listening && listen_wake_) {
+        // BOOT во время записи, начатой словом: как обычное отпускание, то есть конец записи. Само это нажатие новой
+        // записи не начинает (hold_fired_), а его отпускание ничего не значит.
+        o.listen_stop = true;
+        phase_ = Phase::Thinking;
+        think_ms_ = now;
+        last_server_ms_ = now;
+        listen_wake_ = false;
+        hold_fired_ = true;
+        return o;
+    }
     if (link_) {
         o.capture_begin = true;
+    }
+    return o;
+}
+
+Out Dialog::on_wake_start(uint32_t now)
+{
+    Out o;
+    if (!link_ || pressed_ || phase_ != Phase::Idle) {
+        return o;
+    }
+    phase_ = Phase::Listening;
+    listen_ms_ = now;
+    listen_wake_ = true;
+    stale_ = false;
+    audio_open_ = false;
+    audio_ended_ = false;
+    err_msg_[0] = '\0';
+    texts_clear_set_ = false;
+    o.listen_start = true;
+    o.listen_wake = true;
+    o.clear_texts = true;
+    return o;
+}
+
+Out Dialog::on_wake_end(uint32_t now, bool no_speech)
+{
+    Out o;
+    if (phase_ != Phase::Listening || !listen_wake_) {
+        return o;
+    }
+    listen_wake_ = false;
+    o.listen_stop = true;
+    if (no_speech) {
+        to_idle(now, &o);
+        texts_clear_set_ = false;
+    } else {
+        phase_ = Phase::Thinking;
+        think_ms_ = now;
+        last_server_ms_ = now;
     }
     return o;
 }
@@ -151,6 +202,7 @@ Out Dialog::on_tick(uint32_t now, bool playback_drained)
     case Phase::Listening:
         if (now - listen_ms_ >= kMaxListenMs) {
             o.listen_stop = true;
+            listen_wake_ = false;
             phase_ = Phase::Thinking;
             think_ms_ = now;
             last_server_ms_ = now;

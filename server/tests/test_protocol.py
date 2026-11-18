@@ -41,7 +41,7 @@ def test_allowed_nets_narrow():
 
 
 def test_message_builders_match_protocol_md():
-    assert json.loads(P.welcome("0.1.0")) == {"type": "welcome", "proto": 1, "server": "0.1.0", "tts_rate": 24000}
+    assert json.loads(P.welcome("0.2.0")) == {"type": "welcome", "proto": 1, "server": "0.2.0", "tts_rate": 24000}
     assert json.loads(P.state("thinking")) == {"type": "state", "state": "thinking"}
     assert json.loads(P.state("error", "Нет связи")) == {"type": "state", "state": "error", "msg": "Нет связи"}
     assert "msg" not in json.loads(P.state("idle", "ignored"))
@@ -63,3 +63,20 @@ def test_parse_client_message():
     for bad in ["", "not json", "[]", '{"no_type":1}', '{"type":5}']:
         with pytest.raises(P.ProtocolError):
             P.parse_client_message(bad)
+
+
+@pytest.mark.parametrize("raw,label,known", [
+    ("ptt", "ptt", True), ("wake", "wake", True), ("WAKE", "wake", True), (" wake ", "wake", True),
+    (None, "ptt", True),  # прошивки до v0.4 поле не присылают
+    ("future", "future", False), ("", "unknown", False), (5, "invalid", False), (["wake"], "invalid", False),
+    ("wake word!\n", "wake_word_", False), ("x" * 100, "x" * 16, False),
+])
+def test_parse_listen_mode(raw, label, known):
+    assert P.parse_listen_mode(raw) == (label, known)
+
+
+def test_listen_start_with_wake_mode_parses():
+    m = P.parse_client_message('{"type":"listen_start","mode":"wake"}')
+    assert m.type == "listen_start" and P.parse_listen_mode(m.data.get("mode")) == ("wake", True)
+    m = P.parse_client_message('{"type":"listen_start"}')
+    assert P.parse_listen_mode(m.data.get("mode")) == ("ptt", True)

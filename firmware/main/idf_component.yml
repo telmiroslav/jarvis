@@ -6,3 +6,5 @@ dependencies:
   espressif/esp_lvgl_port: "2.7.2"
   # WebSocket-клиент для связи с ноутбуком (docs/PROTOCOL.md). Версия закреплена: сборка на GitHub такая же, как у нас
   espressif/esp_websocket_client: "1.7.0"
+  # Слово «Джарвис» на самой плате (WakeNet9 wn9_jarvis_tts) и детектор конца речи (VAD): ESP-SR. Версия закреплена
+  espressif/esp-sr: "2.6.1"

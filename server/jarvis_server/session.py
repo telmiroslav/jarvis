@@ -19,7 +19,7 @@ from .llm import FLUSH, LLMError, LLMStats, classify_exception
 from .memory import ConversationMemory
 from .pacing import AudioPacer
 from .sentences import SentenceSplitter, split_long
-from .textnorm import clean_markdown, normalize_ru
+from .textnorm import clean_markdown, normalize_ru, strip_wake_word
 from .timing import TurnTiming
 from .tts import TtsError, postprocess
 
@@ -81,6 +81,7 @@ class Session:
         self._turn: asyncio.Task | None = None
         self._ctx: _TurnCtx | None = None
         self._closed = False
+        self._mode = protocol.DEFAULT_LISTEN_MODE  # режим текущей записи (listen_start.mode)
         self.turns_done = 0
 
     # ------------------------------------------------------------- отправка ----
@@ -109,7 +110,11 @@ class Session:
                          msg.data.get("mic_rate"), msg.data.get("spk_rate"))
                 await self._send(protocol.welcome(__version__, protocol.TTS_RATE))
             elif t == "listen_start":
-                await self._listen_start(str(msg.data.get("mode", "ptt")))
+                mode, known = protocol.parse_listen_mode(msg.data.get("mode"))
+                if not known:
+                    log.warning("плата %s: неизвестный mode=%.40r в listen_start, обрабатываю как ptt",
+                                self.link.remote, msg.data.get("mode"))
+                await self._listen_start(mode)
             elif t == "listen_stop":
                 await self._listen_stop()
             elif t == "abort":
@@ -150,6 +155,7 @@ class Session:
         self._rx = bytearray()
         self._rx_overflow = False
         self._ctx = None
+        self._mode = mode
         self.state = "listening"
         log.debug("слушаю (mode=%s)", mode)
 
@@ -163,12 +169,13 @@ class Session:
         dur = len(pcm) / 2 / protocol.MIC_RATE
         # в начале записи ~200 мс «до-записи» (плата берёт её из кольца до listen_start): это не речь, но и не режем
         if dur - self.s.preroll_s < self.s.min_utterance_s:
-            log.info("запись %.2f с (из них ~%.1f с до-запись) слишком короткая: молча в idle", dur, self.s.preroll_s)
+            log.info("запись %.2f с (из них ~%.1f с до-запись, mode=%s) слишком короткая: молча в idle", dur,
+                     self.s.preroll_s, self._mode)
             self.state = "idle"
             await self._send_state("idle")
             return
         self.state = "busy"
-        self._turn = asyncio.create_task(self._turn_main(pcm, t_stop), name="turn")
+        self._turn = asyncio.create_task(self._turn_main(pcm, t_stop, self._mode), name="turn")
 
     async def _abort(self) -> None:
         """abort: всегда отвечаем state idle (плата до этого ответа выбрасывает старый звук); audio_end перед ним,
@@ -200,8 +207,8 @@ class Session:
         self._turn = None
 
     # ------------------------------------------------------------------ ход ----
-    async def _turn_main(self, pcm: bytes, t_stop: float) -> None:
-        tm = TurnTiming(t_stop=t_stop)
+    async def _turn_main(self, pcm: bytes, t_stop: float, mode: str = protocol.DEFAULT_LISTEN_MODE) -> None:
+        tm = TurnTiming(t_stop=t_stop, mode=mode)
         ctx = _TurnCtx()
         self._ctx = ctx
         try:
@@ -214,14 +221,25 @@ class Session:
                 self._maybe_fatal(e)
                 raise _TurnError(MSG_STT) from e
             tm.stt_ms = res.ms
-            if not res.text:
-                tm.outcome = f"empty({res.reason})"
-                log.info("речь не распознана (%s, %.1f с звука)", res.reason, res.audio_s)
+            text, reason = res.text, res.reason
+            if text:
+                text = strip_wake_word(text, mode)  # «Джарвис, ...» уходит и в ИИ, и в субтитр уже без обращения
+                if text != res.text:
+                    log.info("обращение снято (mode=%s): «%s» -> «%s»", mode, res.text, text)
+                if not text:
+                    reason = "wake_only"  # сказано только слово пробуждения: отвечать нечего
+            if not text:
+                tm.outcome = f"empty({reason})"
+                if reason == "wake_only":
+                    log.info("после снятия обращения ничего не осталось (%.1f с звука, mode=%s): отвечать нечего",
+                             res.audio_s, mode)
+                else:
+                    log.info("речь не распознана (%s, %.1f с звука, mode=%s)", reason, res.audio_s, mode)
                 await self._send_state("idle")
                 return
-            log.info("Вы: %s", res.text)
-            await self._send(protocol.user_text(res.text))
-            await self._answer(res.text, tm, ctx)
+            log.info("Вы (%s): %s", mode, text)
+            await self._send(protocol.user_text(text))
+            await self._answer(text, tm, ctx)
             if ctx.error is not None:
                 raise ctx.error
             await self._send_state("idle")

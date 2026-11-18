@@ -250,3 +250,86 @@ def normalize_ru(text: str) -> str:
     t = re.sub(r"\s*,\s*,", ",", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Обращение «Джарвис» в начале распознанной фразы (режим wake: плата уже услышала слово пробуждения; режим ptt:
+# человек просто назвал Джарвиса по имени). Whisper пишет имя по-разному, перечень вариантов закрытый, чтобы не
+# задеть обычные слова («дарвинизм», «через», «сервис»).
+# ---------------------------------------------------------------------------------------------------------------
+
+_WAKE_SEP = r"[\s,.:;!?…—–\-\"«»“”]"
+_WAKE_NAME = (
+    r"(?:дж|ж|дз)[аеэ]р[вбг][иеы][сз]"  # джарвис, жарвис, джервис, джарвиз, джарвес, дзарвис, жарбис, жаргиз
+    r"|(?:дж|ж)[аеэ]р[иы][сз]"  # джарис, жарис, джерис
+    r"|(?:дж|ж)[аеэ]рви"  # джарви
+    r"|джавис"
+    r"|(?:д|х|г|ч)[аеэ]р[вб][иеы][сз]"  # дарвис, харвис, гарвис, чарвис
+    r"|ярв[иеы][сз]"  # ярвис
+    r"|[jy][ae]rv[iy][sz]"  # jarvis, jervis, yarvis (латиницей)
+)
+# «вис», «рвис»: хвост слова пробуждения, который плата не успела отрезать (только в самом начале)
+_WAKE_FRAG = r"(?:[аеи]?р)?в[иы][сз]"
+_WAKE_FILLER = (
+    r"привет(?:ствую)?|здравствуй(?:те)?|эй|хэй|хей|слушай|слышишь|слышь|ну|окей|ок|ладно|"
+    r"hey|hi|hello|okay|ok"
+)
+
+# звук клика кнопки BOOT Whisper иногда пишет словом перед «привет, Джарвис»: снимаем его, только если дальше идёт обращение
+_CLICK_RE = re.compile(
+    rf"^{_WAKE_SEP}*(?:кнопк[аиуе]|клик|щелчок){_WAKE_SEP}+"
+    rf"(?=(?:(?:{_WAKE_FILLER}){_WAKE_SEP}+){{0,3}}(?:{_WAKE_NAME})(?!\w))", re.I)
+_WAKE_RE = re.compile(rf"^{_WAKE_SEP}*(?:(?:{_WAKE_FILLER}){_WAKE_SEP}+){{0,3}}(?:{_WAKE_NAME})(?!\w){_WAKE_SEP}*", re.I)
+_WAKE_FRAG_RE = re.compile(rf"^{_WAKE_SEP}*(?:{_WAKE_FRAG})(?!\w){_WAKE_SEP}*", re.I)
+_NAME_RE = re.compile(rf"^{_WAKE_SEP}*(?:{_WAKE_NAME})(?!\w){_WAKE_SEP}*", re.I)
+
+
+def _capitalize_first(s: str) -> str:
+    """Первая буква заглавная (для субтитра), кроме слов вроде iPhone."""
+    for i, ch in enumerate(s):
+        if ch.isalpha():
+            if ch.islower() and not (i + 1 < len(s) and s[i + 1].isupper()):
+                return s[:i] + ch.upper() + s[i + 1:]
+            return s
+        if ch.isdigit():
+            return s
+    return s
+
+
+def strip_wake_word(text: str, mode: str = "ptt") -> str:
+    """Убирает обращение к Джарвису в начале распознанной фразы.
+
+    Перед обращением снимается слово-«клик» от кнопки («кнопки привет джарвис ...»).
+
+    mode="wake": снимает в начале «Джарвис» во всех написаниях Whisper (жарвис, джарис, ярвис, jarvis ...) вместе с
+    «привет/эй/слушай» перед ним и запятой после, повторно («привет жарвис привет жарвис»), а также хвост слова
+    пробуждения «вис» в самом начале. Результат может быть пустым (сказано только слово пробуждения).
+    Любой другой режим (ptt и неизвестные): снимает только имя в самом начале и только если за ним есть ещё слова,
+    результат никогда не пустеет. Имя внутри фразы не трогается никогда.
+    """
+    t = re.sub(r"\s+", " ", text or "").strip()
+    if not t:
+        return ""
+    wake = mode == "wake"
+    if wake and not any(c.isalnum() for c in t):
+        return ""
+    cur, changed = t, False
+    m = _CLICK_RE.match(cur)
+    if m is not None:
+        cur, changed = cur[m.end():], True
+    for i in range(4 if wake else 3):
+        m = _WAKE_RE.match(cur) if wake else _NAME_RE.match(cur)
+        if m is None and wake and i == 0:
+            m = _WAKE_FRAG_RE.match(cur)
+        if m is None:
+            break
+        rest = cur[m.end():]
+        if not wake and not any(c.isalnum() for c in rest):
+            break  # ptt: «Джарвис?» целиком остаётся как есть
+        cur, changed = rest, True
+    if not changed:
+        return t
+    cur = cur.strip()
+    if not any(c.isalnum() for c in cur):
+        return ""
+    return _capitalize_first(cur)

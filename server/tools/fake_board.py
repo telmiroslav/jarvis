@@ -5,6 +5,7 @@
   fake_board.py question.wav                       # найти сервер по UDP, задать вопрос из WAV, сохранить ответ
   fake_board.py --url ws://127.0.0.1:47801/ws q1.wav q2.wav     # два хода подряд на одном подключении
   fake_board.py q.wav --abort-after-audio 2        # через 2 с после первого звука нажать «abort»
+  fake_board.py q.wav --mode wake                  # как плата v0.4 после слова «Джарвис»: listen_start с mode=wake
 
 Звук на этой машине не проигрывается: ответ только сохраняется в WAV (папка --out-dir).
 Код возврата: 0 ход завершён штатно, 3 сервер прислал state error, 2 нарушение протокола или тайм-аут.
@@ -140,8 +141,9 @@ class Recorder:
 
 async def run_turn(ws, rec: Recorder, pcm: np.ndarray, args, idx: int) -> int:
     chunk = int(MIC_RATE * args.chunk_ms / 1000)
-    rec.log("->", {"type": "listen_start", "mode": "ptt"})
-    await ws.send(json.dumps({"type": "listen_start", "mode": "ptt"}))
+    start = {"type": "listen_start", "mode": args.mode}
+    rec.log("->", start)
+    await ws.send(json.dumps(start))
     t_send = time.perf_counter()
     n = 0
     for off in range(0, len(pcm), chunk):
@@ -290,6 +292,7 @@ def main() -> int:
     ap.add_argument("--discover-timeout", type=float, default=9.0)
     ap.add_argument("--out-dir", default="fake_board_out", help="куда сохранять звук ответа")
     ap.add_argument("--name", default="reply", help="префикс имени файла ответа")
+    ap.add_argument("--mode", default="ptt", help="значение listen_start.mode: ptt (кнопка) или wake (слово «Джарвис»)")
     ap.add_argument("--chunk-ms", type=int, default=40)
     ap.add_argument("--fast", action="store_true", help="слать звук не по часам, а сразу")
     ap.add_argument("--tail-silence", type=float, default=0.3, help="секунд тишины перед listen_stop")

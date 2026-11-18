@@ -17,7 +17,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # v0.4.0: к сборке добавился ESP-SR (скачивается компонент около 300 МБ, компилируется esp-dl), запас побольше
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:

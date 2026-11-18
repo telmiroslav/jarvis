@@ -8,6 +8,7 @@
 #include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
@@ -16,6 +17,7 @@
 #include "link.h"
 #include "net.h"
 #include "net_logic.h"
+#include "wake.h"
 
 namespace jarvis {
 namespace console {
@@ -62,6 +64,7 @@ const char *kind_name(cmd::Kind k)
     case cmd::Kind::Lcd:       return "lcd";
     case cmd::Kind::Server:    return "server";
     case cmd::Kind::Echo:      return "echo";
+    case cmd::Kind::Wake:      return "wake";
     case cmd::Kind::Status:    return "status";
     case cmd::Kind::Reboot:    return "reboot";
     case cmd::Kind::Help:      return "help";
@@ -77,6 +80,94 @@ void log_rx(const cmd::Command &c, size_t len)
         ESP_LOGW(TAG, "cmd rx: rejected (%s: %s), %u bytes", c.err_cmd, c.err_reason, static_cast<unsigned>(len));
     } else if (c.kind != cmd::Kind::Empty) {
         ESP_LOGI(TAG, "cmd rx: %s, %u bytes", kind_name(c.kind), static_cast<unsigned>(len));
+    }
+}
+
+// Команда wake: «WAKE OK ...» при успехе, «ERR wake ...» при ошибке, а без аргументов одна строка состояния
+void run_wake(const cmd::Command &c)
+{
+    using cmd::WakeOp;
+    const uint32_t now = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    switch (c.wake_op) {
+    case WakeOp::Status: {
+        const wake::Status s = wake::status(now);
+        char state[80];
+        if (!s.enabled) {
+            snprintf(state, sizeof(state), "off");
+        } else if (!s.available) {
+            snprintf(state, sizeof(state), "unavailable(%s)", s.why);
+        } else if (s.state == wake_logic::State::Waiting) {
+            snprintf(state, sizeof(state), "waiting(%s)", s.blocker);
+        } else {
+            snprintf(state, sizeof(state), "%s", wake_logic::state_name(s.state));
+        }
+        char thr[40];
+        if (s.available) {
+            snprintf(thr, sizeof(thr), "%.3f(%s)", static_cast<double>(s.thr), s.thr_custom ? "set" : "default");
+        } else {
+            snprintf(thr, sizeof(thr), "n/a");
+        }
+        char last[24];
+        if (s.last_ago_s >= 0) {
+            snprintf(last, sizeof(last), "%ds_ago", s.last_ago_s);
+        } else {
+            snprintf(last, sizeof(last), "never");
+        }
+        reply("WAKE %s state=%s engine=%s model=%s thr=%s default_thr=%.3f beep=%s silence_ms=%u detections=%u ignored=%u speech_stops=%u "
+              "false_stops=%u cap_stops=%u button_stops=%u last=%s mic=%.1fdBFS peak=%.1fdBFS frames=%u dropped=%u/%u speech=%u%% "
+              "chunk=%d",
+              s.enabled ? "on" : "off", state, s.available ? "running" : s.why, s.model, thr, static_cast<double>(s.thr_default), s.beep ? "on" : "off",
+              static_cast<unsigned>(s.silence_ms), static_cast<unsigned>(s.stats.detections), static_cast<unsigned>(s.stats.rejected),
+              static_cast<unsigned>(s.stats.silence_stops), static_cast<unsigned>(s.stats.nospeech_stops),
+              static_cast<unsigned>(s.stats.cap_stops), static_cast<unsigned>(s.stats.button_stops), last,
+              static_cast<double>(s.mic_rms_dbfs), static_cast<double>(s.mic_peak_dbfs), static_cast<unsigned>(s.frames),
+              static_cast<unsigned>(s.ring_overruns), static_cast<unsigned>(s.afe_errors), static_cast<unsigned>(s.speech_pct),
+              s.feed_chunk);
+        break;
+    }
+    case WakeOp::On:
+    case WakeOp::Off: {
+        const bool on = (c.wake_op == WakeOp::On);
+        if (wake::set_enabled(on)) {
+            const wake::Status s = wake::status(now);
+            if (on && !s.available) {
+                reply("WAKE OK on (the engine is not running: %s; send reboot)", s.why);
+            } else {
+                reply("WAKE OK %s", on ? "on" : "off");
+            }
+        } else {
+            reply("ERR wake save_failed");
+        }
+        break;
+    }
+    case WakeOp::BeepOn:
+    case WakeOp::BeepOff: {
+        const bool on = (c.wake_op == WakeOp::BeepOn);
+        if (wake::set_beep(on)) {
+            reply("WAKE OK beep %s", on ? "on" : "off");
+        } else {
+            reply("ERR wake save_failed");
+        }
+        break;
+    }
+    case WakeOp::Threshold:
+        if (wake::set_threshold(c.wake_thr)) {
+            if (c.wake_thr == 0.0f) {
+                reply("WAKE OK thr default");
+            } else {
+                reply("WAKE OK thr %.4f", static_cast<double>(c.wake_thr));
+            }
+        } else {
+            reply("ERR wake thr_failed");
+        }
+        break;
+    case WakeOp::Silence:
+        if (wake::set_silence_ms(c.wake_ms)) {
+            reply("WAKE OK silence %u", static_cast<unsigned>(c.wake_ms));
+        } else {
+            reply("ERR wake save_failed");
+        }
+        break;
     }
 }
 
@@ -134,6 +225,9 @@ void run_command(const cmd::Command &c)
         }
         break;
     }
+    case cmd::Kind::Wake:
+        run_wake(c);
+        break;
     case cmd::Kind::Echo:
         if (g_hooks.start_echo && g_hooks.start_echo()) {
             reply("ECHO OK recording 4 s, then playing back");
@@ -155,7 +249,8 @@ void run_command(const cmd::Command &c)
         esp_restart();
         break;
     case cmd::Kind::Help:
-        reply("HELP wifi_set <ssid><TAB><password> | wifi_clear | tz <POSIX TZ> | lcd <1-6> | server [ws://ip:port/ws|auto] | echo | status | reboot");
+        reply("HELP wifi_set <ssid><TAB><password> | wifi_clear | tz <POSIX TZ> | lcd <1-6> | server [ws://ip:port/ws|auto] | "
+              "wake [on|off|beep on|beep off|thr <0.40-0.9999|default>|silence <300-3000 ms>] | echo | status | reboot");
         break;
     case cmd::Kind::Error:
         reply("ERR %s %s", c.err_cmd, c.err_reason);

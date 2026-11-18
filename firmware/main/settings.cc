@@ -8,6 +8,7 @@
 #include "nvs_flash.h"
 
 #include "lcd_cfg.h"
+#include "wake_logic.h"
 
 namespace jarvis {
 namespace settings {
@@ -22,6 +23,11 @@ const char *kKeyTz = "tz";
 const char *kKeyLcd = "lcd_cfg";
 const char *kKeySrvUrl = "srv_url";
 const char *kKeySrvManual = "srv_manual";
+const char *kKeyWakeOn = "wake_on";
+const char *kKeyWakeBeep = "wake_beep";
+const char *kKeyWakeThr = "wake_thr";
+const char *kKeyWakeSil = "wake_sil";
+const char *kKeyWakeGuard = "wake_guard";
 
 bool g_ready = false;
 
@@ -252,6 +258,107 @@ bool set_lcd(int n)
         return false;
     }
     return commit_close(h, nvs_set_u8(h, kKeyLcd, static_cast<uint8_t>(n)));
+}
+
+WakeSettings get_wake()
+{
+    WakeSettings w;
+    w.silence_ms = wake_logic::kSilenceDefaultMs;
+    if (!g_ready) {
+        return w;
+    }
+    nvs_handle_t h;
+    if (nvs_open(kNs, NVS_READONLY, &h) != ESP_OK) {
+        return w;   // ничего не сохраняли: всё по умолчанию
+    }
+    uint8_t u8 = 0;
+    if (nvs_get_u8(h, kKeyWakeOn, &u8) == ESP_OK) {
+        w.enabled = (u8 != 0);
+    }
+    if (nvs_get_u8(h, kKeyWakeBeep, &u8) == ESP_OK) {
+        w.beep = (u8 != 0);
+    }
+    uint16_t u16 = 0;
+    if (nvs_get_u16(h, kKeyWakeThr, &u16) == ESP_OK && u16 != 0) {
+        const float t = static_cast<float>(u16) / 10000.0f;
+        if (wake_logic::thr_valid(t)) {
+            w.threshold = t;   // мусор в NVS игнорируем: останется стандартный
+        }
+    }
+    if (nvs_get_u16(h, kKeyWakeSil, &u16) == ESP_OK && u16 != 0) {
+        if (u16 >= wake_logic::kSilenceMinMs && u16 <= wake_logic::kSilenceMaxMs) {
+            w.silence_ms = u16;
+        }
+    }
+    nvs_close(h);
+    return w;
+}
+
+bool set_wake_enabled(bool on)
+{
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u8(h, kKeyWakeOn, on ? 1 : 0));
+}
+
+bool set_wake_beep(bool on)
+{
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u8(h, kKeyWakeBeep, on ? 1 : 0));
+}
+
+bool set_wake_threshold(float thr)
+{
+    if (thr != 0.0f && !wake_logic::thr_valid(thr)) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    const uint16_t v = thr == 0.0f ? 0 : static_cast<uint16_t>(thr * 10000.0f + 0.5f);
+    return commit_close(h, nvs_set_u16(h, kKeyWakeThr, v));
+}
+
+bool set_wake_silence_ms(uint32_t ms)
+{
+    if (ms < wake_logic::kSilenceMinMs || ms > wake_logic::kSilenceMaxMs) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u16(h, kKeyWakeSil, static_cast<uint16_t>(ms)));
+}
+
+bool get_wake_guard()
+{
+    if (!g_ready) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (nvs_open(kNs, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    uint8_t v = 0;
+    const bool set = (nvs_get_u8(h, kKeyWakeGuard, &v) == ESP_OK && v != 0);
+    nvs_close(h);
+    return set;
+}
+
+bool set_wake_guard(bool set)
+{
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u8(h, kKeyWakeGuard, set ? 1 : 0));
 }
 
 }  // namespace settings

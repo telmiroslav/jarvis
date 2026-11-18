@@ -422,6 +422,7 @@ const char *out_text(OutMsg m)
 {
     switch (m) {
     case OutMsg::ListenStart: return "{\"type\":\"listen_start\",\"mode\":\"ptt\"}";
+    case OutMsg::ListenStartWake: return "{\"type\":\"listen_start\",\"mode\":\"wake\"}";
     case OutMsg::ListenStop:  return "{\"type\":\"listen_stop\"}";
     case OutMsg::Abort:       return "{\"type\":\"abort\"}";
     case OutMsg::Ping:

@@ -1,16 +1,20 @@
-// Jarvis v0.3: голосовой помощник. Плата слушает кнопку BOOT, отправляет голос серверу на ноутбуке, показывает лицо
-// и субтитры и играет ответ (поверх проверки железа из v0.1 и экрана, Wi-Fi и часов из v0.2).
+// Jarvis v0.4: голосовой помощник. Плата слышит слово «Джарвис» сама (ESP-SR, wake.cc) или слушает кнопку BOOT, отправляет
+// голос серверу на ноутбуке, показывает лицо и субтитры и играет ответ (поверх проверки железа из v0.1 и экрана, Wi-Fi и
+// часов из v0.2).
 //
 // Что делает:
+//   - СЛОВО «ДЖАРВИС» (wake.cc, wake_logic.cc): пока Wi-Fi и связь с ноутбуком есть, а разговор в покое, плата слушает слово
+//     на самой плате (без интернета). Услышала: писк, лицо LISTENING, запись; конец фразы по VAD (пауза 800 мс), 5 с тишины
+//     после слова или 12 с записи = конец. Пока Jarvis думает и говорит, слово не слушается (эхо одним микрофоном не убрать);
 //   - РАЗГОВОР (docs/PROTOCOL.md, session.cc, dialog.cc): BOOT зажата дольше 200 мс = запись (лицо LISTENING, голос идёт
 //     серверу по WebSocket), отпустил = ответ (THINKING, потом SPEAKING со звуком и субтитрами). Короткое нажатие во время
-//     ответа = замолчать. Максимум записи 15 с;
+//     ответа = замолчать. Максимум записи 15 с. BOOT работает всегда, в том числе посреди записи по слову (конец записи);
 //   - СВЯЗЬ (link.cc): поиск сервера по UDP, WebSocket, hello/welcome, ping, возврат связи с паузами 1, 2, 4, 8, 10 с;
 //   - ЭКРАН: LVGL 9 (gui.cc, ui.cc): строка состояния (Wi-Fi, часы), лицо IDLE / LISTENING / THINKING / SPEAKING /
 //     NO_WIFI / NO_SERVER / ERROR / SLEEP, субтитры и подсказки («Ищу ноутбук…», «Нет связи с ноутбуком…», «Нет Wi-Fi…»);
 //   - Wi-Fi и время: net.cc. Сеть и пароль задаются командой по серийному порту (./tools/flash.sh wifi),
 //     время по SNTP (серверы, доступные из Китая, первыми), часовой пояс по умолчанию CST-8;
-//   - серийные команды: console.cc (wifi_set, wifi_clear, tz, lcd, server, echo, status, reboot). Слушаются оба порта платы;
+//   - серийные команды: console.cc (wifi_set, wifi_clear, tz, lcd, server, wake, echo, status, reboot). Слушаются оба порта платы;
 //   - при старте: отчёт о плате, тест PSRAM, звонок + проверка «динамик услышан микрофоном» (LOOPBACK);
 //   - каждые 30 с одна строка "STATUS: ..." (Wi-Fi, сервер, время, память, loopback, сброс);
 //   - светодиод: ожидание плавно зелёный, слушает красный, думает янтарный пульс, говорит синий, нет сервера или
@@ -60,6 +64,8 @@
 #include "text_util.h"
 #include "ui.h"
 #include "ui_logic.h"
+#include "wake.h"
+#include "wake_logic.h"
 
 static const char *TAG = "jarvis";
 
@@ -540,6 +546,7 @@ void ui_sync(int64_t now_ms)
     fin.wifi_hint = no_wifi ? net_logic::hint_text(ns.has_creds, ns.last_fail) : nullptr;
     // Про сервер говорим, когда Wi-Fi уже есть, а связи с ноутбуком нет (пока связь не стартовала, молчим)
     fin.server_hint = g_link_started ? link_logic::server_hint(hin.connected, ls.ready, ls.down_ms) : nullptr;
+    fin.idle_hint = wake::idle_hint(static_cast<uint32_t>(now_ms));
     const face_logic::Out fo = face_logic::decide(fin);
 
     const ui::State want = static_cast<ui::State>(fo.face);
@@ -1002,13 +1009,22 @@ void print_status_line()
     const playback::Stats ps = playback::stats();
     const session::View sv = session::view();
     const bool good = (ns.state == net::State::Connected || !ns.has_creds) && (ls.ready || ns.state != net::State::Connected);
-    char line[900];
+    const wake::Status ws = wake::status(static_cast<uint32_t>(uptime_ms()));
+    char wake_v[72];
+    if (!ws.enabled) {
+        snprintf(wake_v, sizeof(wake_v), "off");
+    } else if (!ws.available) {
+        snprintf(wake_v, sizeof(wake_v), "unavailable(%s)", ws.why);
+    } else {
+        snprintf(wake_v, sizeof(wake_v), "%s det=%u", wake_logic::state_name(ws.state), static_cast<unsigned>(ws.stats.detections));
+    }
+    char line[1000];
     snprintf(line, sizeof(line),
-             "STATUS: wifi=%s | server=%s | time=%s tz=%s | state=%s dialog=%s | heap=%uKB min=%uKB largest=%uKB psram=%uKB | "
+             "STATUS: wifi=%s | server=%s | time=%s tz=%s | state=%s dialog=%s wake=%s | heap=%uKB min=%uKB largest=%uKB psram=%uKB | "
              "audio: rx=%uKB tx_frames=%u underruns=%u overflow=%u mic_drop=%u | loopback=%s mic=%s mic30s=%.1fdBFS | "
              "ui_frames=%u | up=%" PRIu32 "s reset=%s fw=%s",
              wifi, srv, tm, net::timezone(), ui::state_name(static_cast<ui::State>(g_ui_state.load())),
-             dialog::phase_name(sv.phase), static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             dialog::phase_name(sv.phase), wake_v, static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024),
              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
@@ -1038,13 +1054,16 @@ void build_status_json(char *out, size_t cap)
     text::json_escape(net::timezone(), tz_esc, sizeof(tz_esc));
     char url_esc[200];
     text::json_escape(ls.url, url_esc, sizeof(url_esc));
+    const wake::Status ws = wake::status(static_cast<uint32_t>(uptime_ms()));
+    const char *wake_json = !ws.enabled ? "off" : !ws.available ? "unavailable" : wake_logic::state_name(ws.state);
     snprintf(out, cap,
              "{\"fw\":\"%s\",\"wifi\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"ch\":%d,\"time\":\"%s\","
              "\"tz\":\"%s\",\"state\":\"%s\",\"server\":\"%s\",\"server_mode\":\"%s\",\"link\":\"%s\","
-             "\"connected\":%s,\"rtt\":%d,\"reconnects\":%u,\"heap\":%u,\"heap_min\":%u,\"psram\":%u,\"up\":%" PRIu32 "}",
+             "\"connected\":%s,\"rtt\":%d,\"reconnects\":%u,\"wake\":\"%s\",\"heap\":%u,\"heap_min\":%u,\"psram\":%u,\"up\":%" PRIu32 "}",
              app->version, net::state_name(ns.state), ssid_esc, ns.ip, ns.rssi, ns.channel, tm, tz_esc,
              ui::state_name(static_cast<ui::State>(g_ui_state.load())), url_esc, ls.manual ? "manual" : "auto",
              link_logic::phase_name(ls.phase), ls.ready ? "true" : "false", ls.rtt_ms, static_cast<unsigned>(ls.reconnects),
+             wake_json,
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
              static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)), uptime_s());
@@ -1080,7 +1099,7 @@ bool apply_lcd_cfg(int n)
 void print_greeting()
 {
     ESP_LOGI(TAG, "################################################################");
-    ESP_LOGI(TAG, "# JARVIS v0.3: голос. BOOT зажата = говоришь, отпустил = ответ");
+    ESP_LOGI(TAG, "# JARVIS v0.4: слово «Джарвис» без кнопки. Или BOOT зажата = говоришь, отпустил = ответ");
     ESP_LOGI(TAG, "################################################################");
     ESP_LOGI(TAG, "Привет, Давид! Что должно быть:");
     ESP_LOGI(TAG, "  1. ЭКРАН: два бирюзовых глаза. Без Wi-Fi внизу подсказка, с Wi-Fi без ноутбука «Ищу ноутбук…» и «Нет связи…».");
@@ -1089,7 +1108,8 @@ void print_greeting()
     ESP_LOGI(TAG, "  4. BOOT коротко, пока Jarvis думает или говорит: замолчать. Новая запись во время ответа тоже прерывает его.");
     ESP_LOGI(TAG, "  5. СВЕТОДИОД: зелёный плавно (ждёт), красный (слушает), янтарный пульс (думает), синий (говорит), янтарный медленно (нет связи).");
     ESP_LOGI(TAG, "  6. Диагностика звука без сервера: команда echo по серийному порту (запись 4 с и воспроизведение).");
-    ESP_LOGI(TAG, "Пришли мне весь лог и скажи, что видел и слышал. В логе главное: «STATUS:», «HWCHECK RESULT», «WIFI», «link», «session».");
+    ESP_LOGI(TAG, "  7. СЛОВО: когда внизу «Скажи «Джарвис»», скажи «Джарвис», дождись писка и говори. Пауза в речи 0,8 с = конец. Команды: wake, wake thr 0.55, wake off.");
+    ESP_LOGI(TAG, "Пришли мне весь лог и скажи, что видел и слышал. В логе главное: «STATUS:», «HWCHECK RESULT», «WIFI», «link», «session», «WAKE».");
 }
 
 // ---------------------------------------------------------------- основной цикл
@@ -1161,6 +1181,15 @@ void main_loop()
             ignore_press = false;
         }
         session::tick(static_cast<uint32_t>(now));
+
+        // Слово «Джарвис»: условия, запись по слову, конец фразы. BOOT всегда главнее (решает dialog)
+        {
+            wake::Env wenv;
+            wenv.wifi_up = net_status(now).state == net::State::Connected;
+            wenv.mic_ok = g_in.ok() && g_in.slot() != dsp::MicSlot::None;
+            wenv.diag_busy = mode() != Mode::Idle || g_sound_playing.load() || g_out.busy();
+            wake::tick(static_cast<uint32_t>(now), wenv);
+        }
 
         // Диагностическое эхо (серийная команда echo): только когда разговор молчит
         if (mode() == Mode::Idle && g_echo_request.exchange(false)) {
@@ -1299,6 +1328,14 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "server link did NOT start (%s): the board works as a face with no voice", esp_err_to_name(link_err));
     } else {
         g_link_started = true;
+    }
+
+    // Слово «Джарвис» поднимается последним: ему достаётся то, что осталось от внутренней памяти после Wi-Fi, экрана, звука
+    // и связи, а если не хватит или не найдутся модели, кнопка и весь остальной разговор работают как раньше
+    if (!g_in.ok()) {
+        ESP_LOGW(TAG, "WAKE: skipped, the microphone did not start (push-to-talk needs it too)");
+    } else if (wake::init(&g_out)) {
+        g_in.set_tap(&wake::sink, nullptr);
     }
     main_loop();
 }

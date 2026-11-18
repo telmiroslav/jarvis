@@ -15,6 +15,9 @@
 //   - state idle от сервера приходит сразу вслед за audio_end, когда в буфере платы ещё до 3 с звука: лицо остаётся
 //     SPEAKING, пока динамик не доиграл, и только потом IDLE;
 //   - зависание: сервер молчит после listen_stop дольше kThinkTimeoutMs, звук встал на kSpeakStallMs без audio_end;
+//   - слово «Джарвис» (wake_logic.h, wake.cc) начинает такую же запись без кнопки: on_wake_start() даёт listen_start с
+//     mode=wake, а закончить её может on_wake_end() (конец фразы по VAD) или нажатие BOOT (оно работает как отпускание:
+//     listen_stop и THINKING, а само нажатие запись PTT не начинает);
 //   - ошибка сервера (state error): лицо ERROR с текстом msg на kErrorShowMs.
 // Метод on_* возвращает Out: что сделать плате (послать серверу, замолчать, очистить субтитры). Состояние читается
 // через phase(), error_msg(), accept_audio().
@@ -39,6 +42,7 @@ constexpr uint32_t kSubtitleHoldMs = 8000;   // сколько субтитры 
 
 struct Out {
     bool listen_start = false;      // послать серверу listen_start и начать отправку звука с микрофона
+    bool listen_wake = false;       // вместе с listen_start: запись начата словом, а не кнопкой (mode "wake", звук подаёт wake.cc)
     bool listen_stop = false;       // дослать остаток, потом listen_stop
     bool abort = false;             // послать серверу abort
     bool stop_playback = false;     // сразу замолчать и очистить буфер ответа
@@ -64,6 +68,13 @@ public:
     Out on_press(uint32_t now);
     Out on_release(uint32_t now);
 
+    // Слово «Джарвис»: начать запись без кнопки. Принимается только в покое (Idle), при связи и отпущенной кнопке;
+    // иначе пустой Out (автомат слова узнает по phase()). Запись заканчивает on_wake_end() или нажатие BOOT.
+    Out on_wake_start(uint32_t now);
+    // Конец записи, начатой словом (конец фразы): listen_stop и THINKING. no_speech = ничего не сказали: сразу в покой,
+    // ответа ждать не надо (сервер на пустую запись отвечает state idle, это безвредно).
+    Out on_wake_end(uint32_t now, bool no_speech);
+
     // Каждые ~10-40 мс. playback_drained: динамик доиграл ответ целиком (ответ закончен и буфер пуст).
     Out on_tick(uint32_t now, bool playback_drained);
 
@@ -80,6 +91,7 @@ public:
     const char *error_msg() const { return err_msg_; }
     bool pressed() const { return pressed_; }
     bool link_ready() const { return link_; }
+    bool wake_listening() const { return phase_ == Phase::Listening && listen_wake_; }
     // Сервер сейчас шлёт или готов слать звук, и мы его берём
     bool accept_audio() const { return phase_ == Phase::Speaking && !stale_ && audio_open_ && !audio_ended_; }
     uint32_t aborts() const { return aborts_; }
@@ -93,6 +105,7 @@ private:
     bool link_ = false;
     bool pressed_ = false;
     bool hold_fired_ = false;       // для этого нажатия запись уже началась (или отвергнута): повторно не начинать
+    bool listen_wake_ = false;      // текущая запись (Listening) начата словом, а не кнопкой
     uint32_t press_ms_ = 0;
     uint32_t listen_ms_ = 0;
     uint32_t think_ms_ = 0;

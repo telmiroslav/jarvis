@@ -9,7 +9,7 @@
 #   ./tools/flash.sh wifi           передать плате имя Wi-Fi и пароль (спросит их сам; пароль не показывается и нигде не сохраняется).
 #                                   Сначала по серийному порту, если не вышло, сам запишет сеть прямо в память платы (esptool)
 #   ./tools/flash.sh wifi-nvs       то же, но сразу запасным путём (запись в память платы через esptool)
-#   ./tools/flash.sh cmd status     отправить плате серийную команду (status, server auto, server ws://ip:47801/ws, echo, help)
+#   ./tools/flash.sh cmd status     отправить плате серийную команду (status, wake, wake thr 0.55, server auto, server ws://ip:47801/ws, echo, help)
 #
 # Переменные: PORT=/dev/ttyACM0 (порт руками), BAUD=460800 (скорость прошивки).
 # Нужны: curl (или wget), esptool, python3 + pyserial (скрипт сам скажет, чего не хватает).

@@ -27,6 +27,7 @@ class TurnTiming:
     underruns: int = 0
     max_gap_s: float = 0.0
     outcome: str = "ok"
+    mode: str = "ptt"  # listen_start.mode (ptt | wake); в строке TURN всегда последний ключ
 
     def line(self) -> str:
         rtf = f"{self.tts_ms_total / 1000 / self.audio_s:.2f}" if self.audio_s > 0 else "-"
@@ -36,5 +37,5 @@ class TurnTiming:
             f"total_to_first_audio_ms={_ms(self.total_to_first_audio_ms)} total_turn_ms={_ms(self.total_turn_ms)} "
             f"audio_s={self.audio_s:.1f} | sentences={self.sentences} tts_ms={_ms(self.tts_ms_total)} tts_rtf={rtf} "
             f"underruns={self.underruns} max_gap_s={self.max_gap_s:.2f} chars={self.chars} model={self.model or '-'} "
-            f"tools={','.join(self.tools) or '-'}"
+            f"tools={','.join(self.tools) or '-'} mode={self.mode}"
         )

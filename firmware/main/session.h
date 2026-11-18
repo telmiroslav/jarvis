@@ -22,11 +22,18 @@ void on_button(bool pressed, uint32_t now_ms);
 // Каждый проход главного цикла (10 мс)
 void tick(uint32_t now_ms);
 
+// Слово «Джарвис» (wake.cc, главный цикл): начать запись без кнопки. true: разговор принял (лицо LISTENING, listen_start с
+// mode=wake ушёл в очередь, запись микрофона включена в режиме inject: звук подаёт wake.cc). false: занят, ничего не сделано.
+bool wake_begin(uint32_t now_ms);
+// Конец записи, начатой словом: listen_stop и THINKING (no_speech: сразу в покой). false: разговор уже не слушает.
+bool wake_end(uint32_t now_ms, bool no_speech);
+
 struct View {
     dialog::Phase phase = dialog::Phase::Idle;
     char error_msg[proto::kMaxErrMsg + 1] = {0};
     bool link_ready = false;
     bool button_down = false;
+    bool wake_listening = false;   // идёт запись, начатая словом
     uint32_t aborts = 0;
 };
 View view();

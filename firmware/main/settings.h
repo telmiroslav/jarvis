@@ -5,6 +5,7 @@
 // (так делает и сам ESP-IDF), но никогда не пишется в лог.
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -43,6 +44,25 @@ bool clear_server();
 // Номер варианта экрана 1..6. Без сохранённого (или с мусором) возвращает значение по умолчанию.
 int get_lcd();
 bool set_lcd(int n);
+
+// Слово «Джарвис» (wake.cc, консоль: wake on|off, wake beep on|off, wake thr <число>, wake silence <мс>).
+// Ключи в NVS: wake_on, wake_beep (по умолчанию включены), wake_thr (порог*10000, 0 = стандартный для модели),
+// wake_sil (пауза после речи, мс; 0 = 800 по умолчанию).
+struct WakeSettings {
+    bool enabled = true;
+    bool beep = true;
+    float threshold = 0.0f;       // 0 = стандартный порог модели
+    uint32_t silence_ms = 800;
+};
+WakeSettings get_wake();
+bool set_wake_enabled(bool on);
+bool set_wake_beep(bool on);
+bool set_wake_threshold(float thr);         // 0 = вернуть стандартный; иначе 0,40..0,9999
+bool set_wake_silence_ms(uint32_t ms);
+// Сторож запуска движка слова: ставится перед созданием AFE и снимается через 30 с работы. Если плата упала за это время,
+// при следующем запуске движок не поднимается (кнопка работает), пока не отправят «wake on» и не перезагрузят плату.
+bool get_wake_guard();
+bool set_wake_guard(bool set);
 
 }  // namespace settings
 }  // namespace jarvis

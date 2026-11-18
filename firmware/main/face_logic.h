@@ -25,6 +25,7 @@ struct In {
     bool no_wifi = false;                // пора показывать «нет Wi-Fi»
     const char *wifi_hint = nullptr;     // подсказка про Wi-Fi (когда no_wifi)
     const char *server_hint = nullptr;   // подсказка про сервер (nullptr: связь есть или нет Wi-Fi)
+    const char *idle_hint = nullptr;     // подсказка в покое, когда всё в порядке («Скажи «Джарвис»», «Зажми BOOT и говори»)
 };
 
 struct Out {

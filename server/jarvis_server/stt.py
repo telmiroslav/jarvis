@@ -16,8 +16,13 @@ log = logging.getLogger("jarvis.stt")
 
 # Типичные «галлюцинации» Whisper на тишине и шуме (русский): такие фразы считаем пустой речью.
 _JUNK = re.compile(
-    r"(субтитры\s+(сделал|создавал|подогнал)|редактор субтитров|корректор\s+[а-я]\.|продолжение следует|"
-    r"спасибо за просмотр|подписывайтесь на канал|dimatorzok|ставьте лайк)", re.I)
+    r"(субтитры\s+(сделал|делал|создавал|подогнал|добавил|предоставил)|редактор субтитров|корректор\s+[а-я]\.|"
+    r"продолжение следует|спасибо за просмотр|подписывайтесь на канал|dimatorzok|ставьте лайк)", re.I)
+# Фразы, которые мусор только когда они единственное, что распознано (по отдельности человек их тоже может сказать):
+# пометки звука «[Музыка]», «(аплодисменты)» и прощания из конца видео.
+_JUNK_WHOLE = re.compile(
+    r"^\W*(?:[\[(*][^\])*]{1,40}[\])*]|спасибо за (?:внимание|субтитры)|благодарю за (?:внимание|просмотр)|"
+    r"всем пока|до новых встреч|увидимся в следующем видео|подписывайтесь на (?:мой )?канал)\W*$", re.I)
 
 
 @dataclass
@@ -33,7 +38,7 @@ def clean_transcript(text: str) -> str:
     t = re.sub(r"\s+", " ", text).strip()
     if not any(c.isalnum() for c in t):
         return ""
-    if _JUNK.search(t):
+    if _JUNK.search(t) or _JUNK_WHOLE.match(t):
         return ""
     return t
 
@@ -96,7 +101,8 @@ class WhisperSTT:
                     f"(он докачает модели)."
                 ) from e
             raise
-        log.info("STT: %s на %s (%s), загрузка %.1f с", self.s.stt_model, dev, compute, time.perf_counter() - t0)
+        log.info("STT: %s на %s (%s), подсказка «%s», загрузка %.1f с", self.s.stt_model, dev, compute,
+                 self.s.stt_hotwords or "-", time.perf_counter() - t0)
 
     def transcribe(self, pcm16: bytes | np.ndarray, sample_rate: int = 16000) -> SttResult:
         """Блокирующий вызов (запускать в отдельном потоке). pcm16: int16 little-endian или float32 в [-1, 1]."""
@@ -108,17 +114,30 @@ class WhisperSTT:
         audio = audio - float(np.mean(audio))
         if rms_db(audio) < -62.0:  # цифровая тишина: Whisper зря не гоняем
             return SttResult("", audio_s=dur, ms=(time.perf_counter() - t0) * 1000, reason="silence")
+        raw, language = self._raw_text(audio)
+        text = clean_transcript(raw)
+        ms = (time.perf_counter() - t0) * 1000
+        reason = ""
+        if not text:
+            reason = "junk" if any(c.isalnum() for c in raw) else "no_speech"
+            if reason == "junk":
+                log.info("STT: отброшен мусор Whisper: %.80s", raw)
+        return SttResult(text, language=language, audio_s=dur, ms=ms, reason=reason)
+
+    def _raw_text(self, audio: np.ndarray, vad: bool = True) -> tuple[str, str]:
+        """Whisper -> (текст всех сегментов как есть, язык). Без фильтра мусора; vad=False только для опытов."""
         segments, info = self.model.transcribe(
             audio,
             language="ru",
             task="transcribe",
             beam_size=self.beam,
-            vad_filter=True,
+            vad_filter=vad,
             vad_parameters={"min_silence_duration_ms": 600, "speech_pad_ms": 250},
             condition_on_previous_text=False,
             temperature=[0.0, 0.3],
             without_timestamps=True,
             initial_prompt=self.s.stt_prompt or None,
+            hotwords=self.s.stt_hotwords or None,
             no_speech_threshold=0.6,
             log_prob_threshold=-1.0,
         )
@@ -127,10 +146,7 @@ class WhisperSTT:
             if getattr(seg, "no_speech_prob", 0.0) > 0.7 and getattr(seg, "avg_logprob", 0.0) < -1.0:
                 continue
             parts.append(seg.text)
-        text = clean_transcript(" ".join(parts))
-        ms = (time.perf_counter() - t0) * 1000
-        return SttResult(text, language=getattr(info, "language", "ru"), audio_s=dur, ms=ms,
-                         reason="" if text else "no_speech")
+        return " ".join(parts), getattr(info, "language", "ru")
 
     def warmup(self) -> None:
         """Прогон на секунде шума: прогревает CUDA-ядра."""
