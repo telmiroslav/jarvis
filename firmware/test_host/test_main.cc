@@ -19,6 +19,7 @@
 #include "heap_logic.h"
 #include "lcd_cfg.h"
 #include "link_logic.h"
+#include "mww_logic.h"
 #include "net_logic.h"
 #include "pcm_queue.h"
 #include "proto.h"
@@ -3330,10 +3331,10 @@ static void test_wake_perf()
     n = format_frames(FrameAcc(), buf, sizeof(buf));
     CHECK(strcmp(buf, "fetch: no frames") == 0 && n == strlen(buf));
     n = format_cpu(s, buf, sizeof(buf));
-    CHECK(n == strlen(buf) && strncmp(buf, "cpu% fetch 50 feed 0 lvgl 70 main 0 link 3 audio 0 wifi 0 other 5 | idle0 30 idle1 25", 40) == 0);
+    CHECK(n == strlen(buf) && strncmp(buf, "cpu% fetch 50 mww 0 feed 0 lvgl 70 main 0 link 3 audio 0 wifi 0 other 5 | idle0 30 idle1 25", 47) == 0);
     CHECK(strstr(buf, "| idle0 30 idle1 25") != nullptr);
     n = format_cpu(s, buf, sizeof(buf), true);
-    CHECK(strncmp(buf, "cpu%=fetch:50,feed:0,lvgl:70,", 29) == 0 && strstr(buf, ",idle0:30,idle1:25") != nullptr && strchr(buf, ' ') == nullptr);
+    CHECK(strncmp(buf, "cpu%=fetch:50,mww:0,feed:0,lvgl:70,", 35) == 0 && strstr(buf, ",idle0:30,idle1:25") != nullptr && strchr(buf, ' ') == nullptr);
     format_cpu(CpuShare(), buf, sizeof(buf));
     CHECK(strcmp(buf, "cpu% n/a") == 0);
     format_cpu(CpuShare(), buf, sizeof(buf), true);
@@ -5061,6 +5062,690 @@ static void test_settings_logic_v042()
     CHECK(strcmp(idle_hint(true, false), kHintArmed) == 0 && strcmp(idle_hint(false, false), kHintBoot) == 0);
 }
 
+// ---------------------------------------------------------------- v0.5.0: второй движок слова (microWakeWord), чистая логика
+
+// Манифест нашей модели (main/models/jarvis_ru.json), как он лежит в репозитории
+static const char kMwwManifest[] =
+    "{\n"
+    "  \"type\": \"micro\",\n"
+    "  \"wake_word\": \"\xD0\x94\xD0\xB6\xD0\xB0\xD1\x80\xD0\xB2\xD0\xB8\xD1\x81\",\n"
+    "  \"author\": \"Jarvis project\",\n"
+    "  \"website\": \"https://github.com/telmiroslav/jarvis\",\n"
+    "  \"model\": \"jarvis_ru.tflite\",\n"
+    "  \"trained_languages\": [\n    \"ru\"\n  ],\n"
+    "  \"version\": 2,\n"
+    "  \"micro\": {\n"
+    "    \"probability_cutoff\": 0.9,\n"
+    "    \"feature_step_size\": 10,\n"
+    "    \"sliding_window_size\": 5,\n"
+    "    \"tensor_arena_size\": 34000,\n"
+    "    \"minimum_esphome_version\": \"2024.7.0\"\n"
+    "  }\n"
+    "}\n";
+
+// Подменяет первое вхождение from на to (для проверок испорченных манифестов)
+static std::string mww_mutate(const char *from, const char *to)
+{
+    std::string s(kMwwManifest);
+    const size_t p = s.find(from);
+    if (p != std::string::npos) {
+        s.replace(p, strlen(from), to);
+    }
+    return s;
+}
+
+static mww_logic::ManifestStatus mww_parse(const std::string &s, mww_logic::Manifest *m = nullptr)
+{
+    return mww_logic::parse_manifest(s.data(), s.size(), m);
+}
+
+static void test_mww_manifest()
+{
+    using namespace mww_logic;
+    // наш манифест
+    Manifest m;
+    CHECK(parse_manifest(kMwwManifest, strlen(kMwwManifest), &m) == ManifestStatus::Ok);
+    CHECK(m.version == 2 && m.window == 5 && m.step_ms == 10 && m.arena_bytes == 34000);
+    CHECK(m.cutoff == 0.9);   // ровно как в эталоне (double), не 0.9f
+    CHECK(strcmp(m.wake_word, "\xD0\x94\xD0\xB6\xD0\xB0\xD1\x80\xD0\xB2\xD0\xB8\xD1\x81") == 0 && strcmp(m.model, "jarvis_ru.tflite") == 0);
+    CHECK(strcmp(manifest_status_text(ManifestStatus::Ok), "ok") == 0);
+    // буфер без нуля в конце (так лежит встроенный файл) и с хвостовыми пробелами и CRLF
+    {
+        char tight[sizeof(kMwwManifest)];
+        memcpy(tight, kMwwManifest, strlen(kMwwManifest));
+        CHECK(parse_manifest(tight, strlen(kMwwManifest), nullptr) == ManifestStatus::Ok);
+        std::string crlf;
+        for (const char *p = kMwwManifest; *p; p++) {
+            if (*p == '\n') {
+                crlf += '\r';
+            }
+            crlf += *p;
+        }
+        crlf += "  \r\n\t";
+        CHECK(mww_parse(crlf) == ManifestStatus::Ok);
+    }
+    // версия
+    CHECK(mww_parse(mww_mutate("\"version\": 2", "\"version\": 1")) == ManifestStatus::BadVersion);
+    CHECK(mww_parse(mww_mutate("\"version\": 2", "\"version\": 3")) == ManifestStatus::BadVersion);
+    CHECK(mww_parse(mww_mutate("\"version\": 2", "\"version\": 2.5")) == ManifestStatus::BadVersion);
+    CHECK(mww_parse(mww_mutate("\"version\": 2,", "")) == ManifestStatus::BadVersion);
+    CHECK(mww_parse(mww_mutate("\"version\": 2", "\"version\": \"2\"")) == ManifestStatus::BadVersion);   // строка не число
+    CHECK(mww_parse(mww_mutate("\"version\": 2", "\"version\": 2.0")) == ManifestStatus::Ok);
+    // тип
+    CHECK(mww_parse(mww_mutate("\"type\": \"micro\"", "\"type\": \"openwakeword\"")) == ManifestStatus::NotMicro);
+    CHECK(mww_parse(mww_mutate("\"type\": \"micro\",", "")) == ManifestStatus::Ok);   // без type допустимо
+    // объект micro и его числа
+    CHECK(mww_parse(mww_mutate("\"micro\": {", "\"micr0\": {")) == ManifestStatus::NoMicro);
+    CHECK(mww_parse(mww_mutate("\"probability_cutoff\": 0.9", "\"probability_cutoff\": 0.49")) == ManifestStatus::BadCutoff);
+    CHECK(mww_parse(mww_mutate("\"probability_cutoff\": 0.9", "\"probability_cutoff\": 0.995")) == ManifestStatus::BadCutoff);
+    CHECK(mww_parse(mww_mutate("\"probability_cutoff\": 0.9", "\"probability_cutoff\": 1.0")) == ManifestStatus::BadCutoff);
+    CHECK(mww_parse(mww_mutate("\"probability_cutoff\": 0.9,", "")) == ManifestStatus::BadCutoff);
+    CHECK(mww_parse(mww_mutate("\"probability_cutoff\": 0.9", "\"probability_cutoff\": 0.5")) == ManifestStatus::Ok);
+    CHECK(mww_parse(mww_mutate("\"probability_cutoff\": 0.9", "\"probability_cutoff\": 9e-1")) == ManifestStatus::Ok);
+    CHECK(mww_parse(mww_mutate("\"sliding_window_size\": 5", "\"sliding_window_size\": 0")) == ManifestStatus::BadWindow);
+    CHECK(mww_parse(mww_mutate("\"sliding_window_size\": 5", "\"sliding_window_size\": 17")) == ManifestStatus::BadWindow);
+    CHECK(mww_parse(mww_mutate("\"sliding_window_size\": 5", "\"sliding_window_size\": 2.5")) == ManifestStatus::BadWindow);
+    CHECK(mww_parse(mww_mutate("\"sliding_window_size\": 5", "\"sliding_window_size\": 16")) == ManifestStatus::Ok);
+    CHECK(mww_parse(mww_mutate("\"sliding_window_size\": 5", "\"sliding_window_size\": 1")) == ManifestStatus::Ok);
+    CHECK(mww_parse(mww_mutate("\"feature_step_size\": 10", "\"feature_step_size\": 20")) == ManifestStatus::BadStep);
+    CHECK(mww_parse(mww_mutate("\"feature_step_size\": 10,", "")) == ManifestStatus::BadStep);
+    CHECK(mww_parse(mww_mutate("\"tensor_arena_size\": 34000", "\"tensor_arena_size\": 1000")) == ManifestStatus::BadArena);
+    CHECK(mww_parse(mww_mutate("\"tensor_arena_size\": 34000", "\"tensor_arena_size\": 9999999")) == ManifestStatus::BadArena);
+    CHECK(mww_parse(mww_mutate("\"tensor_arena_size\": 34000", "\"tensor_arena_size\": 34000.5")) == ManifestStatus::BadArena);
+    CHECK(mww_parse(mww_mutate("\"tensor_arena_size\": 34000,", "")) == ManifestStatus::BadArena);
+    CHECK(mww_parse(mww_mutate("\"tensor_arena_size\": 34000", "\"tensor_arena_size\": -5")) == ManifestStatus::BadArena);
+    // порядок ключей другой, ключ micro раньше version, лишние вложенные значения пропускаются
+    CHECK(mww_parse("{\"micro\":{\"extra\":{\"a\":[1,2,{\"b\":null}]},\"tensor_arena_size\":30000,\"sliding_window_size\":4,"
+                    "\"feature_step_size\":10,\"probability_cutoff\":0.95},\"version\":2,\"wake_word\":\"x\"}") == ManifestStatus::Ok);
+    // \uXXXX в wake_word (так пишет json.dumps)
+    {
+        Manifest e;
+        CHECK(mww_parse(mww_mutate("\"\xD0\x94\xD0\xB6\xD0\xB0\xD1\x80\xD0\xB2\xD0\xB8\xD1\x81\"", "\"\\u0414\\u0436\\u0430\\u0440\\u0432\\u0438\\u0441\""), &e) ==
+              ManifestStatus::Ok);
+        CHECK(strcmp(e.wake_word, "\xD0\x94\xD0\xB6\xD0\xB0\xD1\x80\xD0\xB2\xD0\xB8\xD1\x81") == 0);
+    }
+    // слишком длинное имя обрезается по границе символа и не ломает разбор
+    {
+        std::string longname(200, 'a');
+        Manifest e;
+        const std::string repl = "\"model\": \"" + longname + "\"";
+        CHECK(mww_parse(mww_mutate("\"model\": \"jarvis_ru.tflite\"", repl.c_str()), &e) == ManifestStatus::Ok);
+        CHECK(strlen(e.model) == sizeof(e.model) - 1);
+    }
+    // не JSON, обрывки, мусор после объекта
+    CHECK(parse_manifest(nullptr, 0, nullptr) == ManifestStatus::Syntax);
+    CHECK(mww_parse("") == ManifestStatus::Syntax);
+    CHECK(mww_parse("[]") == ManifestStatus::Syntax);
+    CHECK(mww_parse("{}") == ManifestStatus::Syntax);
+    CHECK(mww_parse("{\"version\":2") == ManifestStatus::Syntax);
+    CHECK(mww_parse("{\"version\":2,}") == ManifestStatus::Syntax);
+    CHECK(mww_parse(std::string(kMwwManifest) + "garbage") == ManifestStatus::Syntax);
+    CHECK(mww_parse(std::string(kMwwManifest).substr(0, 150)) == ManifestStatus::Syntax);
+    CHECK(mww_parse("{\"version\":\"unterminated}") == ManifestStatus::Syntax);
+    CHECK(mww_parse("{\"version\":2,\"micro\":{\"probability_cutoff\":0.9,\"feature_step_size\":10 \"x\":1}}") == ManifestStatus::Syntax);
+    // любая обрезка нашего манифеста даёт отказ, а не падение (ASan проверит выход за границы)
+    for (size_t n = 0; n + 1 < strlen(kMwwManifest); n++) {   // без одного последнего перевода строки манифест ещё целый
+        CHECK(parse_manifest(kMwwManifest, n, nullptr) != ManifestStatus::Ok);
+    }
+    // у каждого статуса есть текст
+    for (int i = 0; i <= static_cast<int>(ManifestStatus::BadArena); i++) {
+        CHECK(manifest_status_text(static_cast<ManifestStatus>(i))[0] != '\0' && strcmp(manifest_status_text(static_cast<ManifestStatus>(i)), "?") != 0);
+    }
+    // подбор арены: размер из манифеста, потом больше, кратно 16
+    CHECK(arena_attempt_bytes(34000, 0) == 34000 && arena_attempt_bytes(34000, 1) == 42512 && arena_attempt_bytes(34000, 2) == 51008 &&
+          arena_attempt_bytes(34000, 3) == 68000);
+    for (int a = 0; a < kArenaAttempts; a++) {
+        CHECK(arena_attempt_bytes(33001, a) % 16 == 0 && arena_attempt_bytes(33001, a) >= 33001);
+        if (a > 0) {
+            CHECK(arena_attempt_bytes(33001, a) > arena_attempt_bytes(33001, a - 1));
+        }
+    }
+}
+
+static void test_mww_quant()
+{
+    using namespace mww_logic;
+    // вход нашей модели: scale 0.10196078568696976 (26/255), zero point -128. Эталон (numpy.round(f / 25.6 / scale + zp)) посчитан отдельно.
+    const InputQuant q = make_input_quant(0.10196078568696976f, -128);
+    CHECK(quantize_feature(0, q) == -128 && quantize_feature(1, q) == -128 && quantize_feature(25, q) == -118);
+    CHECK(quantize_feature(100, q) == -90 && quantize_feature(372, q) == 15 && quantize_feature(445, q) == 42);
+    CHECK(quantize_feature(512, q) == 68 && quantize_feature(640, q) == 117 && quantize_feature(670, q) == 127);
+    CHECK(quantize_feature(700, q) == 127 && quantize_feature(1000, q) == 127 && quantize_feature(65535, q) == 127);   // насыщение
+    // монотонно по всей шкале и ни одного выхода за int8
+    int prev = -129;
+    for (uint32_t u = 0; u <= 65535; u++) {
+        const int v = quantize_feature(static_cast<uint16_t>(u), q);
+        CHECK(v >= -128 && v <= 127 && v >= prev);
+        prev = v;
+    }
+    // округление к чётному на ровной половинке (как numpy.round): scale 0.078125 даёт v = u / 2 - 128
+    const InputQuant h = make_input_quant(0.078125f, -128);
+    CHECK(quantize_feature(1, h) == -128 && quantize_feature(3, h) == -126 && quantize_feature(5, h) == -126 && quantize_feature(7, h) == -124);
+    CHECK(quantize_feature(2, h) == -127 && quantize_feature(254, h) == -1 && quantize_feature(255, h) == 0);
+    // другой zero point сдвигает, нулевой или отрицательный scale не даёт мусора
+    CHECK(quantize_feature(0, make_input_quant(0.10196078568696976f, 0)) == 0);
+    CHECK(quantize_feature(372, make_input_quant(0.10196078568696976f, -100)) == 43);
+    CHECK(quantize_feature(372, make_input_quant(0.0f, -128)) == 0 && quantize_feature(372, make_input_quant(-1.0f, -128)) == 0);
+    // выход: uint8 / 256, а при другом zero point сдвиг
+    CHECK_NEAR(dequantize_prob(0, 0.00390625f, 0), 0.0, 1e-12);
+    CHECK_NEAR(dequantize_prob(231, 0.00390625f, 0), 0.90234375, 1e-9);
+    CHECK_NEAR(dequantize_prob(255, 0.00390625f, 0), 0.99609375, 1e-9);
+    CHECK_NEAR(dequantize_prob(-128, 0.00390625f, -128), 0.0, 1e-12);
+    CHECK_NEAR(dequantize_prob(127, 0.00390625f, -128), 0.99609375, 1e-9);
+    // константы признаков те же, что при обучении
+    CHECK(kChannels == 40 && kWindowMs == 30 && kStepMs == 10 && kStepSamples == 160 && kWindowSamples == 480 && kSampleRate == 16000);
+    CHECK(kLogScaleShift == 6 && kPcanGainBits == 21 && kNoiseSmoothingBits == 10);
+    CHECK_NEAR(kLowerBandHz, 125.0, 1e-6);
+    CHECK_NEAR(kUpperBandHz, 7500.0, 1e-6);
+    CHECK_NEAR(kPcanStrength, 0.95, 1e-6);
+    CHECK_NEAR(kPcanOffset, 80.0, 1e-6);
+    CHECK_NEAR(kNoiseEvenSmoothing, 0.025, 1e-6);
+    CHECK_NEAR(kNoiseOddSmoothing, 0.06, 1e-6);
+    CHECK_NEAR(kNoiseMinSignalRemaining, 0.05, 1e-6);
+    CHECK_NEAR(kFeatureDivisor, 25.6, 1e-6);
+}
+
+// Подаёт n одинаковых вероятностей, возвращает событие, если слово было
+static mww_logic::Event mww_feed(mww_logic::Detector &d, double p, int n, uint32_t &t)
+{
+    mww_logic::Event last;
+    for (int i = 0; i < n; i++) {
+        t += 30;
+        const mww_logic::Event e = d.push(p, t);
+        if (e.detected) {
+            last = e;
+        }
+    }
+    return last;
+}
+
+static void test_mww_detector()
+{
+    using namespace mww_logic;
+
+    // ---- окно: пока оно не заполнено, среднего нет и слова нет
+    {
+        Detector d;
+        d.configure(5, 0.90);
+        uint32_t t = 5000;
+        for (int i = 0; i < 4; i++) {
+            t += 30;
+            const Event e = d.push(1.0, t);
+            CHECK(!e.detected && d.avg_now() == 0.0);
+        }
+        t += 30;
+        const Event e = d.push(1.0, t);   // пятая: окно заполнено, среднее 1.0 > 0.9
+        CHECK(e.detected && e.avg == 1.0 && e.peak == 1.0 && d.detections() == 1 && d.have_last_peak() && d.last_peak() == 1.0);
+    }
+    // ---- строго больше порога, как в эталоне: среднее ровно 0.9 слова не даёт
+    {
+        const double p230 = 230.0 / 256.0, p231 = 231.0 / 256.0;   // выход модели кратен 1/256
+        Detector d;
+        d.configure(5, 0.9);
+        d.reset(0);
+        uint32_t t = 2000;
+        const double a[5] = {p230, p230, p230, p231, p231};   // сумма 1152/256 = 4.5, среднее ровно 0.9
+        Event e;
+        for (double v : a) {
+            t += 30;
+            e = d.push(v, t);
+        }
+        CHECK(!e.detected && d.avg_now() == 0.9);
+        t += 30;
+        e = d.push(p231, t);   // 230,230,231,231,231: среднее чуть больше
+        CHECK(e.detected && e.avg > 0.9 && e.avg < 0.91 && e.peak == p231);
+    }
+    // ---- скользящее: слово, которое пришло одним всплеском, не даёт среднего выше порога
+    {
+        Detector d;
+        d.configure(5, 0.90);
+        uint32_t t = 3000;
+        mww_feed(d, 0.0, 10, t);
+        Event e;
+        t += 30;
+        e = d.push(1.0, t);
+        CHECK(!e.detected);
+        for (int i = 0; i < 3; i++) {
+            t += 30;
+            e = d.push(1.0, t);
+        }
+        CHECK(!e.detected && d.avg_now() == 0.8);   // четыре из пяти
+        t += 30;
+        e = d.push(1.0, t);
+        CHECK(e.detected && e.avg == 1.0);
+    }
+    // ---- прогрев: до kWarmupMs после reset() слова нет (но порог превышен: это учтено), потом есть
+    {
+        Detector d;
+        d.configure(5, 0.90);
+        d.reset(10000);
+        uint32_t t = 10000;
+        Event e = mww_feed(d, 1.0, 20, t);   // 600 мс
+        CHECK(!e.detected && d.suppressed() >= 15 && d.detections() == 0);
+        e = mww_feed(d, 1.0, 20, t);         // до 1200 мс
+        CHECK(e.detected);
+        // граница: ровно kWarmupMs
+        Detector d2;
+        d2.configure(1, 0.90);
+        d2.reset(0);
+        CHECK(!d2.push(1.0, kWarmupMs - 1).detected);
+        CHECK(d2.push(1.0, kWarmupMs).detected);
+    }
+    // ---- после слова пауза kRefractoryMs, окно пустое; потом снова можно
+    {
+        Detector d;
+        d.configure(5, 0.90);
+        uint32_t t = 0;
+        Event e = mww_feed(d, 1.0, 5, t);
+        CHECK(e.detected && d.detections() == 1);
+        const uint32_t t_word = t;
+        // слово ещё звучит: высокие вероятности подряд не дают второго слова, пока не прошла секунда
+        int extra = 0;
+        while (t - t_word < kRefractoryMs - 30) {
+            t += 30;
+            if (d.push(1.0, t).detected) {
+                extra++;
+            }
+        }
+        CHECK(extra == 0 && d.detections() == 1 && d.suppressed() > 0);
+        // через секунду следующее слово принимается
+        t += 60;
+        e = d.push(1.0, t);
+        CHECK(e.detected && d.detections() == 2);
+    }
+    // ---- смена порога на лету (перебивание: на время ответа порог выше)
+    {
+        Detector d;
+        d.configure(5, 0.90);
+        uint32_t t = 0;
+        mww_feed(d, 0.0, 6, t);
+        d.set_cutoff(0.93);
+        CHECK(d.cutoff() == 0.93);
+        Event e = mww_feed(d, 0.915, 5, t);
+        CHECK(!e.detected);   // 0.915 выше обычного порога, но не выше порога на время ответа
+        d.set_cutoff(0.90);
+        e = mww_feed(d, 0.915, 1, t);
+        CHECK(e.detected);
+    }
+    // ---- «почти слово»: всплеск среднего выше 0.60, не дошедший до порога
+    {
+        Detector d;
+        d.configure(5, 0.90);
+        uint32_t t = 10000;
+        mww_feed(d, 0.0, 10, t);
+        Event e = mww_feed(d, 0.75, 8, t);
+        CHECK(!e.detected && d.near_misses() == 0);   // всплеск ещё идёт
+        Event last;
+        for (int i = 0; i < 6; i++) {
+            t += 30;
+            const Event x = d.push(0.0, t);
+            if (x.near_miss) {
+                last = x;
+            }
+        }
+        CHECK(last.near_miss && last.near_miss_log && last.near_peak == 0.75 && d.near_misses() == 1);
+        CHECK(d.have_last_peak() && d.last_peak() == 0.75 && d.detections() == 0);
+        // второй в пределах 3 с: счётчик растёт, в лог не просится
+        t += 100;
+        mww_feed(d, 0.7, 8, t);
+        last = Event();
+        for (int i = 0; i < 6; i++) {
+            t += 30;
+            const Event x = d.push(0.0, t);
+            if (x.near_miss) {
+                last = x;
+            }
+        }
+        CHECK(last.near_miss && !last.near_miss_log && d.near_misses() == 2);
+        CHECK_NEAR(d.last_peak(), 0.7, 1e-6);
+        // третий через >= 3 с после первой записи в лог: снова просится
+        t += kNearMissLogGapMs;
+        mww_feed(d, 0.8, 8, t);
+        last = Event();
+        for (int i = 0; i < 6; i++) {
+            t += 30;
+            const Event x = d.push(0.0, t);
+            if (x.near_miss) {
+                last = x;
+            }
+        }
+        CHECK(last.near_miss && last.near_miss_log && d.near_misses() == 3);
+        CHECK_NEAR(last.near_peak, 0.8, 1e-6);
+        // ниже 0.60 это не «почти слово»
+        t += kNearMissLogGapMs;
+        mww_feed(d, 0.55, 10, t);
+        mww_feed(d, 0.0, 6, t);
+        CHECK(d.near_misses() == 3);
+        // граница: среднее ровно 0.60 уже всплеск
+        mww_feed(d, 0.6, 5, t);
+        mww_feed(d, 0.0, 6, t);
+        CHECK(d.near_misses() == 4);
+    }
+    // ---- слово не «почти слово», всплеск с подавленным словом (прогрев, пауза) тоже
+    {
+        Detector d;
+        d.configure(5, 0.90);
+        uint32_t t = 0;
+        mww_feed(d, 0.0, 40, t);
+        Event e = mww_feed(d, 1.0, 5, t);
+        CHECK(e.detected);
+        mww_feed(d, 0.0, 10, t);
+        CHECK(d.near_misses() == 0);
+        // хвост того же слова в паузе: всплеск 0.7 после слова, начатый в паузе, в «почти слово» не идёт
+        t += 30;
+        d.push(0.0, t);
+        mww_feed(d, 0.7, 6, t);   // первые 150 мс после слова
+        mww_feed(d, 0.0, 6, t);
+        CHECK(d.near_misses() == 0);
+        // прогрев после reset: шум запуска тоже не считается
+        Detector w;
+        w.configure(5, 0.90);
+        w.reset(0);
+        uint32_t tw = 0;
+        mww_feed(w, 0.7, 6, tw);
+        mww_feed(w, 0.0, 6, tw);
+        CHECK(w.near_misses() == 0);
+    }
+    // ---- максимум за период забирается и сбрасывается
+    {
+        Detector d;
+        d.configure(5, 0.90);
+        uint32_t t = 0;
+        mww_feed(d, 0.2, 10, t);
+        CHECK_NEAR(d.period_max(), 0.2, 1e-6);
+        mww_feed(d, 0.4, 10, t);
+        CHECK_NEAR(d.take_period_max(), 0.4, 1e-6);
+        CHECK(d.period_max() == 0.0);
+        mww_feed(d, 0.1, 10, t);
+        CHECK_NEAR(d.take_period_max(), 0.34, 1e-6);   // среднее уходит вниз по мере того, как 0.4 вытесняются из окна
+        mww_feed(d, 0.1, 10, t);
+        CHECK_NEAR(d.take_period_max(), 0.1, 1e-6);
+    }
+    // ---- reset(): окно пустое, счётчики остаются, не сбрасывается и порог
+    {
+        Detector d;
+        d.configure(5, 0.90);
+        uint32_t t = 0;
+        mww_feed(d, 1.0, 6, t);
+        const uint32_t det = d.detections();
+        d.reset(t);
+        CHECK(d.avg_now() == 0.0 && d.detections() == det && d.cutoff() == 0.90);
+        Event e = mww_feed(d, 1.0, 5, t);
+        CHECK(!e.detected);   // прогрев
+    }
+    // ---- окно 1 и 16, мусорные размеры зажимаются
+    {
+        Detector d1;
+        d1.configure(1, 0.90);
+        CHECK(d1.window() == 1 && d1.push(0.95, 50).detected);
+        Detector d16;
+        d16.configure(16, 0.90);
+        uint32_t t = 0;
+        Event e = mww_feed(d16, 1.0, 15, t);
+        CHECK(!e.detected);
+        e = mww_feed(d16, 1.0, 1, t);
+        CHECK(e.detected);
+        Detector dx;
+        dx.configure(0, 0.90);
+        CHECK(dx.window() == 1);
+        dx.configure(1000, 0.90);
+        CHECK(dx.window() == kMaxWindow);
+    }
+    // ---- время переходит через 2^32 мс (49 суток): пауза и прогрев работают
+    {
+        Detector d;
+        d.configure(1, 0.90);
+        d.reset(0xFFFFFF00u);   // прогрев кончается уже после переполнения
+        CHECK(!d.push(1.0, 0xFFFFFF00u + 100).detected);
+        CHECK(d.push(1.0, 0xFFFFFF00u + kWarmupMs).detected);
+        CHECK(!d.push(1.0, 0xFFFFFF00u + kWarmupMs + 500).detected);
+        CHECK(d.push(1.0, 0xFFFFFF00u + kWarmupMs + kRefractoryMs).detected);
+    }
+    // ---- позиция звука -> «время»: 16 отсчётов = 1 мс, по модулю 2^32
+    CHECK(audio_ms(0) == 0 && audio_ms(16) == 1 && audio_ms(16000) == 1000 && audio_ms(-5) == 0);
+    CHECK(audio_ms(static_cast<int64_t>(0x100000000LL) * 16 + 160) == 10);
+}
+
+static void test_mww_thresholds()
+{
+    using namespace mww_logic;
+    CHECK(cutoff_valid(0.50) && cutoff_valid(0.90) && cutoff_valid(0.99) && !cutoff_valid(0.4999) && !cutoff_valid(0.9901) && !cutoff_valid(1.0) &&
+          !cutoff_valid(0.0) && !cutoff_valid(-1.0));
+    // строже на время ответа: обычный + 0.03, не выше 0.99, никогда не ниже обычного
+    CHECK(barge_cutoff(0.90, 0.0) == 0.93);
+    CHECK(barge_cutoff(0.88, 0.0) == 0.91);
+    CHECK(barge_cutoff(0.97, 0.0) == 0.99 && barge_cutoff(0.99, 0.0) == 0.99 && barge_cutoff(0.985, 0.0) == 0.99);
+    CHECK(barge_cutoff(0.90, 0.95) == 0.95);      // заданный командой
+    CHECK(barge_cutoff(0.90, 0.80) == 0.90);      // ниже обычного не бывает
+    CHECK(barge_cutoff(0.90, 0.9999) == 0.99);    // и выше kCutoffMax тоже
+    CHECK(barge_cutoff(0.0, 0.0) == 0.0 && barge_cutoff(0.0, 0.95) == 0.0);
+    CHECK(barge_cutoff(0.5, 0.0) == 0.53);
+    // запас от обычного порога виден: 0.03, чтобы перебивание не убивать (на живых записях вершина среднего 0.98 и выше)
+    CHECK_NEAR(kBargeMargin, 0.03, 1e-12);
+    // NVS: целое *10000, мусор и значения вне области = 0 («из манифеста»)
+    CHECK(cutoff_from_saved(9000) == 0.9 && cutoff_from_saved(8800) == 0.88 && cutoff_from_saved(5000) == 0.5 && cutoff_from_saved(9900) == 0.99);
+    CHECK(cutoff_from_saved(0) == 0.0 && cutoff_from_saved(4999) == 0.0 && cutoff_from_saved(9901) == 0.0 && cutoff_from_saved(65535) == 0.0);
+    CHECK(cutoff_to_saved(0.9) == 9000 && cutoff_to_saved(0.88) == 8800 && cutoff_to_saved(0.93) == 9300 && cutoff_to_saved(0.0) == 0 &&
+          cutoff_to_saved(-1.0) == 0 && cutoff_to_saved(7.0) == 0);
+    for (int v = 5000; v <= 9900; v += 7) {
+        CHECK(cutoff_to_saved(cutoff_from_saved(static_cast<uint16_t>(v))) == v);
+    }
+    // ESP-SR сохраняет свои пороги (область 0.40..0.9999) отдельно: порог ESP-SR 0.627 не годится как порог mww
+    CHECK(!cutoff_valid(0.40) && wake_logic::thr_valid(0.40));
+}
+
+static void test_mww_engine_choice()
+{
+    using namespace mww_logic;
+    // имена и разбор
+    CHECK(strcmp(engine_name(Engine::Mww), "mww") == 0 && strcmp(engine_name(Engine::Esp), "esp") == 0);
+    Engine e = Engine::Esp;
+    CHECK(parse_engine("mww", &e) && e == Engine::Mww);
+    CHECK(parse_engine("ESP", &e) && e == Engine::Esp);
+    CHECK(parse_engine("MwW", &e) && e == Engine::Mww);
+    CHECK(!parse_engine("", &e) && !parse_engine("mw", &e) && !parse_engine("mwwx", &e) && !parse_engine(nullptr, &e) && !parse_engine("wn9", &e));
+    // NVS: по умолчанию mww (нет ключа, мусор), явный выбор уважается
+    CHECK(engine_from_saved(false, 0) == Engine::Mww && engine_from_saved(false, 1) == Engine::Mww);
+    CHECK(engine_from_saved(true, 0) == Engine::Esp && engine_from_saved(true, 1) == Engine::Mww && engine_from_saved(true, 2) == Engine::Mww &&
+          engine_from_saved(true, 255) == Engine::Mww);
+    CHECK(engine_to_saved(Engine::Esp) == 0 && engine_to_saved(Engine::Mww) == 1);
+    // выбор движка и запасной путь
+    EngineChoice c = choose_engine(Engine::Mww, true);
+    CHECK(c.active == Engine::Mww && !c.fell_back);
+    c = choose_engine(Engine::Mww, false);
+    CHECK(c.active == Engine::Esp && c.fell_back);          // mww не поднялся: ESP-SR, причина в логе
+    c = choose_engine(Engine::Esp, true);
+    CHECK(c.active == Engine::Esp && !c.fell_back);         // esp выбран: mww не трогаем, это не «запасной путь»
+    c = choose_engine(Engine::Esp, false);
+    CHECK(c.active == Engine::Esp && !c.fell_back);
+    // сторож запуска: плата упала на запуске
+    CHECK(guard_action(Engine::Mww, false) == GuardAction::Proceed && guard_action(Engine::Esp, false) == GuardAction::Proceed);
+    CHECK(guard_action(Engine::Mww, true) == GuardAction::DemoteToEsp);    // с mww переходим на проверенный ESP-SR
+    CHECK(guard_action(Engine::Esp, true) == GuardAction::Fail);           // с esp как в v0.4.2: слова нет до «wake on» и перезагрузки
+}
+
+static void test_mww_commands()
+{
+    using namespace cmd;
+    Command c = parse_command("wake engine mww");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::Engine && c.wake_engine_mww);
+    c = parse_command("wake engine esp");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::Engine && !c.wake_engine_mww);
+    c = parse_command("WAKE Engine ESP  ");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::Engine && !c.wake_engine_mww);
+    c = parse_command("wake engine");
+    CHECK(c.kind == Kind::Error && strcmp(c.err_reason, "usage") == 0);
+    c = parse_command("wake engine wn9");
+    CHECK(c.kind == Kind::Error && strcmp(c.err_cmd, "wake") == 0 && strcmp(c.err_reason, "engine_value") == 0);
+    c = parse_command("wake engine mww now");
+    CHECK(c.kind == Kind::Error);
+    // пороги разбираются как раньше: выбор области (0.50..0.99 у mww, 0.40..0.9999 у ESP-SR) делает активный движок при записи
+    c = parse_command("wake thr 0.88");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::Threshold && fabsf(c.wake_thr - 0.88f) < 1e-6f);
+    c = parse_command("wake thr 0.93");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::Threshold && fabsf(c.wake_thr - 0.93f) < 1e-6f);
+    c = parse_command("wake thr default");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::Threshold && c.wake_thr == 0.0f);
+    c = parse_command("wake barge thr 0.95");
+    CHECK(c.kind == Kind::Wake && c.wake_op == WakeOp::BargeThr && fabsf(c.wake_thr - 0.95f) < 1e-6f);
+    c = parse_command("wake thr 0.3");
+    CHECK(c.kind == Kind::Error && strcmp(c.err_reason, "thr_range") == 0);
+}
+
+// Автомат слова и детектор mww вместе: слово из mww идёт тем же путём, что слово из ESP-SR (взвод, писк, запись, перебивание)
+static void test_mww_machine_flow()
+{
+    using namespace wake_logic;
+    using mww_logic::Detector;
+    // ---- слово на взводе: детектор -> автомат -> запись с писком, конец по паузе
+    {
+        Machine m;
+        Detector d;
+        d.configure(5, 0.90);
+        d.reset(0);
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 2000);   // взвод, а заодно и прогрев детектора прошёл
+        CHECK(m.armed());
+        uint32_t at = 2000;
+        mww_feed(d, 0.0, 10, at);
+        bool detected = false;
+        for (int i = 0; i < 6 && !detected; i++) {
+            at += 30;
+            detected = d.push(0.97, at).detected;
+        }
+        CHECK(detected);
+        const Out o = m.on_detect(t);
+        CHECK(o.start && o.beep && !o.barge && !o.follow && m.recording() && m.rec_kind() == RecKind::Wake);
+        CHECK(m.stats().detections == 1);
+        // дальше всё как у любого слова
+        c.dialog_idle = false;
+        c.dialog_listening = true;
+        wake_run(m, c, t, kSettleBeepMs + 20);
+        m.on_speech(t);
+        Out e;
+        for (int i = 0; i < 200 && !e.stop; i++) {
+            t += 10;
+            e = m.on_tick(c, t);
+        }
+        CHECK(e.stop && e.reason == StopReason::Silence);
+    }
+    // ---- не на взводе (диалог занят): слово услышано, но не принято, как у ESP-SR
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        c.dialog_idle = false;
+        m.on_tick(c, t += 10);
+        const Out o = m.on_detect(t);
+        CHECK(!o.start && o.rejected && m.stats().rejected == 1 && m.stats().detections == 0);
+    }
+    // ---- перебивание: на время ответа порог строже. 0.92 проходит обычный порог 0.90, но не порог на время ответа 0.93
+    {
+        Machine m;
+        uint32_t t = 0;
+        Cond c = all_ok_cond();
+        wake_run(m, c, t, 1000);
+        c.dialog_idle = false;
+        c.dialog_answering = c.dialog_speaking = true;
+        wake_run(m, c, t, 700);
+        CHECK(m.barge_ready());
+        const double normal = 0.90;
+        const double on_answer = mww_logic::barge_cutoff(normal, 0.0);
+        CHECK(on_answer == 0.93);
+        Detector quiet;
+        quiet.configure(5, on_answer);
+        uint32_t at = 5000;
+        mww_feed(quiet, 0.0, 10, at);
+        CHECK(!mww_feed(quiet, 0.92, 8, at).detected);          // чужой голос или слабое слово: не перебивает
+        Detector loud;
+        loud.configure(5, on_answer);
+        at = 5000;
+        mww_feed(loud, 0.0, 10, at);
+        CHECK(mww_feed(loud, 0.96, 8, at).detected);            // настоящее слово: перебивает
+        const Out o = m.on_detect(t);
+        CHECK(o.start && o.barge && o.beep && m.rec_kind() == RecKind::Barge && m.stats().barge_ins == 1);
+    }
+    // ---- положение слова для окна записи: всё до позиции модели относится к слову и в запись не идёт, остальное (в пределах предзаписи) идёт
+    {
+        const int64_t edge = 160000;              // принято в кольцо
+        const int64_t oldest = edge - 16384;
+        // модель дошла до позиции 158 000 (до неё слово): запись начинается не раньше неё
+        Plan p = plan_capture(edge, oldest, 158000, 20, true);
+        CHECK(p.keep_from >= 158000 && p.keep_from <= edge);
+        // модель отстала сильнее предзаписи: берём предзапись от «сейчас», а не слово
+        p = plan_capture(edge, oldest, 150000, 20, true);
+        CHECK(p.keep_from == edge + ms_to_samples(20) - ms_to_samples(kPreRollMs) || p.keep_from == edge);
+        CHECK(p.keep_from >= 150000);
+        // модель опережает край кольца (бывает на границе блока): ничего позже края нет
+        p = plan_capture(edge, oldest, edge + 400, 20, true);
+        CHECK(p.keep_from == edge);
+    }
+}
+
+static void test_wake_perf_mww()
+{
+    using namespace wake_perf;
+    MwwAcc a;
+    CHECK(a.inf == 0 && a.fe == 0 && a.inf_avg_ms() == 0.0f && a.busy_pct() == 0.0f);
+    a.add_inf(2000);
+    a.add_inf(4000);
+    a.add_inf(31000);          // дольше 30 мс: медленнее звука
+    a.add_fe(500);
+    a.add_fe(700);
+    a.add_fe(1500);
+    a.note_lag(40);
+    a.note_lag(120);
+    a.note_lag(60);
+    a.note_p(0.2);
+    a.note_p(0.7);
+    a.note_p(0.4);
+    CHECK(a.inf == 3 && a.fe == 3 && a.slow == 1 && a.inf_max_us == 31000 && a.fe_max_us == 1500 && a.lag_max_ms == 120 && a.p_max == 0.7);
+    CHECK_NEAR(a.inf_avg_ms(), 12.333, 0.01);
+    CHECK_NEAR(a.inf_max_ms(), 31.0, 1e-4);
+    CHECK_NEAR(a.fe_avg_ms(), 0.9, 0.01);
+    CHECK_NEAR(a.fe_max_ms(), 1.5, 1e-4);
+    // доля одного ядра: (37000 + 2700) мкс на 3 запуска * 30 мс звука
+    CHECK_NEAR(a.busy_pct(), 100.0 * 39700.0 / 90000.0, 0.01);
+    MwwAcc b;
+    b.add_inf(1000);
+    b.add_fe(100);
+    b.note_lag(500);
+    b.note_p(0.9);
+    merge(&a, b);
+    CHECK(a.inf == 4 && a.fe == 4 && a.inf_max_us == 31000 && a.lag_max_ms == 500 && a.p_max == 0.9 && a.slow == 1);
+    char buf[300];
+    const size_t n = format_mww(a, buf, sizeof(buf));
+    CHECK(n == strlen(buf));
+    CHECK(strstr(buf, "mww inference avg 9.5 max 31.0 ms (slow 1 of 4)") != nullptr);
+    CHECK(strstr(buf, "features avg 0.70 max 1.50 ms") != nullptr && strstr(buf, "lag max 500 ms") != nullptr && strstr(buf, "p_max 0.90") != nullptr);
+    CHECK(strstr(buf, "% of a core") != nullptr);
+    format_mww(MwwAcc(), buf, sizeof(buf));
+    CHECK(strcmp(buf, "mww: no inferences") == 0);
+    // короткие буферы: обрезается, ноль на месте, за границы не выходит
+    for (size_t cap = 0; cap < 30; cap++) {
+        char small[40];
+        memset(small, 'x', sizeof(small));
+        const size_t w = format_mww(a, small, cap);
+        CHECK(cap == 0 ? small[0] == 'x' : (w < cap && small[w] == '\0'));
+    }
+    a.clear();
+    CHECK(a.inf == 0 && a.fe == 0 && a.p_max == 0.0 && a.lag_max_ms == 0);
+    // задача mww считается отдельно от fetch, группа названа
+    CHECK(classify_task("mww") == Group::Mww && strcmp(group_name(Group::Mww), "mww") == 0 && classify_task("wake_fetch") == Group::Fetch);
+    CpuShare s;
+    s.valid = true;
+    s.window_ms = 1000;
+    s.pct[static_cast<size_t>(Group::Fetch)] = 12.0f;
+    s.pct[static_cast<size_t>(Group::Mww)] = 7.0f;
+    s.pct[static_cast<size_t>(Group::Idle0)] = 60.0f;
+    format_cpu(s, buf, sizeof(buf));
+    CHECK(strncmp(buf, "cpu% fetch 12 mww 7 feed 0 ", 27) == 0);
+    format_cpu(s, buf, sizeof(buf), true);
+    CHECK(strncmp(buf, "cpu%=fetch:12,mww:7,feed:0,", 27) == 0);
+}
+
 int main()
 {
     test_dbfs();
@@ -5110,6 +5795,14 @@ int main()
     test_wake_gain();
     test_ui_logic();
     test_lcd_cfg();
+    test_mww_manifest();
+    test_mww_quant();
+    test_mww_detector();
+    test_mww_thresholds();
+    test_mww_engine_choice();
+    test_mww_commands();
+    test_mww_machine_flow();
+    test_wake_perf_mww();
     printf("%d checks, %d failed\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

@@ -44,6 +44,36 @@ struct FrameAcc {
 // Складывает b в a (суммы складываются, максимумы берутся наибольшие)
 void merge(FrameAcc *a, const FrameAcc &b);
 
+// v0.5.0, движок microWakeWord (mww.cc). Задача mww каждые 10 мс звука считает признак (микрофронтенд) и каждые 30 мс запускает модель
+// (три признака подряд). Здесь копится время того и другого и самая большая вероятность за период.
+constexpr uint32_t kMwwInferenceMs = 30;   // один запуск модели приходится на 30 мс звука
+
+struct MwwAcc {
+    uint32_t inf = 0;             // запусков модели
+    uint32_t fe = 0;              // признаков
+    uint64_t inf_sum_us = 0;
+    uint64_t fe_sum_us = 0;
+    uint32_t inf_max_us = 0;
+    uint32_t fe_max_us = 0;
+    uint32_t slow = 0;            // запусков дольше kMwwInferenceMs (модель не успевает за звуком)
+    uint32_t lag_max_ms = 0;      // сколько звука лежало в кольце ещё не обработанного (наибольшее)
+    double p_max = 0.0;           // наибольшее среднее скользящего окна
+
+    void add_inf(uint32_t us);
+    void add_fe(uint32_t us);
+    void note_lag(uint32_t ms) { if (ms > lag_max_ms) lag_max_ms = ms; }
+    void note_p(double p) { if (p > p_max) p_max = p; }
+    void clear() { *this = MwwAcc(); }
+
+    float inf_avg_ms() const { return inf ? static_cast<float>(inf_sum_us) / static_cast<float>(inf) / 1000.0f : 0.0f; }
+    float inf_max_ms() const { return static_cast<float>(inf_max_us) / 1000.0f; }
+    float fe_avg_ms() const { return fe ? static_cast<float>(fe_sum_us) / static_cast<float>(fe) / 1000.0f : 0.0f; }
+    float fe_max_ms() const { return static_cast<float>(fe_max_us) / 1000.0f; }
+    // Сколько процентов одного ядра ушло на счёт (без вытеснения другими задачами): время признаков и модели на время звука
+    float busy_pct() const;
+};
+void merge(MwwAcc *a, const MwwAcc &b);
+
 // Сколько кадров реально ждёт в кольце: подано минус получено, с поправкой на то, что счётчики читаются по отдельности и
 // «получено» может на единицу обогнать «подано». Никогда не отрицательно.
 uint32_t pending_frames(uint32_t fed, uint32_t fetched);
@@ -51,7 +81,8 @@ uint32_t pending_frames(uint32_t fed, uint32_t fetched);
 // ------------------------------------------------------------------ задачи
 
 enum class Group : uint8_t {
-    Fetch = 0,   // wake_fetch (здесь считаются VAD и WakeNet)
+    Fetch = 0,   // wake_fetch (здесь считаются VAD и WakeNet; с движком mww только VAD)
+    Mww,         // mww (v0.5.0: признаки и модель microWakeWord)
     Feed,        // wake_feed
     Lvgl,        // taskLVGL
     Main,        // main (главный цикл)
@@ -99,7 +130,11 @@ CpuShare cpu_share(const Snapshot &prev, const Snapshot &cur);
 // Нет кадров: «fetch: no frames». Возвращает длину.
 size_t format_frames(const FrameAcc &a, char *buf, size_t cap);
 
-// «cpu% fetch 41 feed 1 lvgl 62 main 5 link 3 audio 6 wifi 8 other 2 | idle0 33 idle1 38» для лога;
+// «mww inference avg 1.8 max 3.1 ms (slow 0 of 312), features avg 0.4 max 1.2 ms, ~7% of a core, lag max 140 ms, p_max 0.43».
+// Нет запусков: «mww: no inferences». Возвращает длину.
+size_t format_mww(const MwwAcc &a, char *buf, size_t cap);
+
+// «cpu% fetch 41 mww 7 feed 1 lvgl 62 main 5 link 3 audio 6 wifi 8 other 2 | idle0 33 idle1 38» для лога;
 // compact: без пробелов, «cpu%=fetch:41,feed:1,...,idle1:38» для ответа консоли (одна строка key=value).
 // Нет данных: «cpu% n/a».
 size_t format_cpu(const CpuShare &c, char *buf, size_t cap, bool compact = false);

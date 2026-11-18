@@ -197,6 +197,22 @@ Command parse_wake(const char *a)
         c.wake_beep_level = static_cast<int>(v);
         return c;
     }
+    if (word_eq(w, wl, "engine")) {
+        if (*arg == '\0') {
+            return make_error("wake", "usage");
+        }
+        if (word_eq(arg, strlen(arg), "mww")) {
+            c.wake_op = WakeOp::Engine;
+            c.wake_engine_mww = true;
+            return c;
+        }
+        if (word_eq(arg, strlen(arg), "esp")) {
+            c.wake_op = WakeOp::Engine;
+            c.wake_engine_mww = false;
+            return c;
+        }
+        return make_error("wake", "engine_value");
+    }
     if (word_eq(w, wl, "follow")) {
         if (*arg == '\0') {
             return make_error("wake", "usage");

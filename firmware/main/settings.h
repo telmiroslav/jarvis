@@ -53,6 +53,9 @@ bool set_lcd(int n);
 // слова, целые дБ 0..18, по умолчанию 0), wake_follow (окно «договорить без слова», мс: 0 = выключено или 2000..15000, по
 // умолчанию 6000), wake_barge (перебить голосом, по умолчанию включено), wake_bthr (порог слова, пока звучит ответ, *10000;
 // 0 = автоматически: обычный + 0,08, не выше 0,95).
+// v0.5.0, второй движок слова microWakeWord: wake_eng (какой движок: 0 = ESP-SR, 1 = microWakeWord; нет ключа или мусор = 1; смена
+// действует после перезагрузки), wake_mthr (порог mww*10000, 0 = из манифеста модели; wake_thr остаётся порогом ESP-SR), wake_mbthr
+// (порог mww на время ответа *10000, 0 = автоматически: обычный + 0,03).
 struct WakeSettings {
     bool enabled = true;
     int beep_level = 4;           // 0 = без писка, 1..5 громкость
@@ -62,6 +65,9 @@ struct WakeSettings {
     uint32_t follow_ms = 6000;    // окно «договорить без слова» после ответа, 0 = выключено
     bool barge = true;            // перебить ответ голосом
     float barge_thr = 0.0f;       // порог слова, пока звучит ответ: 0 = автоматически
+    bool engine_mww = true;       // движок слова: microWakeWord (true) или ESP-SR (false)
+    uint16_t mww_thr_q = 0;       // порог microWakeWord *10000, 0 = из манифеста
+    uint16_t mww_barge_thr_q = 0; // порог microWakeWord на время ответа *10000, 0 = автоматически
 };
 WakeSettings get_wake();
 bool set_wake_enabled(bool on);
@@ -72,6 +78,9 @@ bool set_wake_barge_thr(float thr);         // 0 = автоматически; �
 bool set_wake_threshold(float thr);         // 0 = вернуть стандартный; иначе 0,40..0,9999
 bool set_wake_silence_ms(uint32_t ms);
 bool set_wake_gain_db(int db);              // 0..18
+bool set_wake_engine_mww(bool mww);         // true = microWakeWord, false = ESP-SR; действует после перезагрузки
+bool set_wake_mww_threshold(double thr);    // 0 = из манифеста; иначе 0,50..0,99
+bool set_wake_mww_barge_thr(double thr);    // 0 = автоматически; иначе 0,50..0,99
 // Сторож запуска движка слова: ставится перед созданием AFE и снимается через 30 с работы. Если плата упала за это время,
 // при следующем запуске движок не поднимается (кнопка работает), пока не отправят «wake on» и не перезагрузят плату.
 bool get_wake_guard();

@@ -23,6 +23,8 @@
 #include "audio_in.h"
 #include "dsp.h"
 #include "mic_stream.h"
+#include "mww.h"
+#include "mww_logic.h"
 #include "session.h"
 #include "settings.h"
 #include "time_util.h"
@@ -99,6 +101,9 @@ struct Detection {
     float volume = 0.0f;
     int backlog_ms = 0;        // сколько мс звука лежало между движком и краем кольца
     uint32_t count = 0;        // сколько раз сработало за всё время (в том числе непринятых)
+    mww_logic::Engine engine = mww_logic::Engine::Esp;   // кто услышал слово
+    double prob_avg = 0.0;     // microWakeWord: среднее окна вероятностей в момент слова
+    double prob_peak = 0.0;    // и самая большая вероятность в окне
 };
 
 struct Ctx {
@@ -117,9 +122,20 @@ struct Ctx {
     int16_t *feed_buf = nullptr;
     char model_name[48] = {0};
     char vad_name[32] = {0};
-    float thr_default = 0.0f;
-    float thr_now = 0.0f;
+    float thr_default = 0.0f;              // ESP-SR: стандартный порог модели
+    float thr_now = 0.0f;                  // ESP-SR: порог сейчас
     bool thr_custom = false;
+    // ---- v0.5.0: два движка слова. engine: кто слышит слово сейчас (после запасного пути), engine_wanted: что выбрано в настройках
+    mww_logic::Engine engine = mww_logic::Engine::Esp;
+    mww_logic::Engine engine_wanted = mww_logic::Engine::Mww;
+    bool engine_fell_back = false;         // хотели mww, работаем на ESP-SR
+    char fallback_why[40] = {0};
+    int frame_ms = 32;                     // длительность кадра AFE (feed_chunk), для окна follow
+    double m_cutoff = 0.0;                 // microWakeWord: обычный порог сейчас (из манифеста или заданный wake thr)
+    double m_cutoff_default = 0.0;         // из манифеста
+    bool m_cutoff_custom = false;
+    double m_barge_custom = 0.0;           // wake barge thr для mww (0 = автоматически)
+    double m_barge_applied = 0.0;
     TaskHandle_t feed_task = nullptr;
     TaskHandle_t fetch_task = nullptr;
     int16_t *beep = nullptr;
@@ -178,6 +194,8 @@ struct Ctx {
         char rec_head[48];
         char rec_frames[200];
         char rec_cpu[160];
+        char period_mww[200];                // v0.5.0: строки движка mww (пустые с движком ESP-SR)
+        char rec_mww[200];
     };
     PerfBufs *pb = nullptr;
 
@@ -199,10 +217,11 @@ struct Ctx {
     uint32_t stat_prev_frames = 0;
     uint32_t stat_prev_vad = 0;
     uint32_t stat_prev_vad_speech = 0;
+    uint32_t stat_prev_near = 0;
     bool guard_pending = false;
     uint32_t guard_clear_at_ms = 0;
     // v0.4.2: окно follow, перебивание
-    float barge_thr_custom = 0.0f;           // wake barge thr, 0 = автоматически
+    float barge_thr_custom = 0.0f;           // wake barge thr (ESP-SR), 0 = автоматически
     bool thr_barge_on = false;               // в движке сейчас порог для ответа
     float thr_barge_applied = 0.0f;
     // Просьба fetch сменить порог в движке (-1 = просьбы нет, 0 = стандартный порог модели, иначе порог). Меняет его сама задача
@@ -274,6 +293,56 @@ int64_t afe_pos_locked()
 {
     const int64_t in_afe = static_cast<int64_t>(C.fed_frames.load()) - static_cast<int64_t>(C.fetched_frames.load());
     return C.feed_pos - (in_afe > 0 ? in_afe : 0) * C.feed_chunk;
+}
+
+// ---- звук для движка mww: задача mww читает то же кольцо eng_ring, что и feed_task, со своей позиции (mww.h)
+
+size_t src_read(int64_t *pos, int16_t *dst, size_t max, bool *skipped)
+{
+    std::lock_guard<std::mutex> lock(C.mu);
+    *skipped = false;
+    int64_t lag = C.ring_w - *pos;
+    if (lag > static_cast<int64_t>(kRingSamples)) {
+        // движок не успевает: самые старые отсчёты в кольце уже затёрты, прыгаем к живому звуку (как feed_task)
+        *pos = C.ring_w - static_cast<int64_t>(2 * mww_logic::kWindowSamples);
+        lag = C.ring_w - *pos;
+        *skipped = true;
+    }
+    if (lag <= 0) {
+        return 0;
+    }
+    const size_t n = lag < static_cast<int64_t>(max) ? static_cast<size_t>(lag) : max;
+    ring_read(C.eng_ring, *pos, n, dst);
+    *pos += static_cast<int64_t>(n);
+    return n;
+}
+
+// Усиление для движка: wake gain; пока звучит ответ, звук в кольце уже ослаблен на 12 дБ и усиление не применяется (как у feed_task)
+float src_gain() { return C.atten.load() ? 1.0f : C.gain_lin.load(); }
+
+bool src_running() { return C.run.load(); }
+
+int64_t src_edge()
+{
+    std::lock_guard<std::mutex> lock(C.mu);
+    return C.ring_w;
+}
+
+// Слово услышано (из задачи mww): та же ячейка C.det, что у AFE, tick() заберёт её и пропустит через автомат
+void src_hit(const mww::Hit &h)
+{
+    std::lock_guard<std::mutex> lock(C.mu);
+    C.det.pending = true;
+    C.det.engine = mww_logic::Engine::Mww;
+    C.det.afe_pos = h.pos;                 // всё до этого отсчёта относится к слову: после него начнётся запись
+    C.det.model_idx = 0;
+    C.det.word_idx = 0;
+    C.det.word_len = 0;
+    C.det.volume = C.last_volume.load();   // громкость по AFE (он по-прежнему считает VAD)
+    C.det.backlog_ms = static_cast<int>((C.ring_w - h.pos) * 1000 / wake_logic::kSampleRate);
+    C.det.prob_avg = h.avg;
+    C.det.prob_peak = h.peak;
+    C.det.count++;
 }
 
 // ---- задачи
@@ -426,9 +495,13 @@ void fetch_task(void *)
             C.vad_run.store(0);
         }
         C.last_volume.store(res->data_volume);
-        if (res->wakeup_state == WAKENET_DETECTED) {
+        // С движком mww AFE работает только как VAD (wakenet_init = false) и слова не сообщает; слово приходит из задачи mww (src_hit)
+        if (res->wakeup_state == WAKENET_DETECTED && C.engine == mww_logic::Engine::Esp) {
             std::lock_guard<std::mutex> lock(C.mu);
             C.det.pending = true;
+            C.det.engine = mww_logic::Engine::Esp;
+            C.det.prob_avg = 0.0;
+            C.det.prob_peak = 0.0;
             C.det.afe_pos = afe_pos_locked();
             C.det.model_idx = res->wakenet_model_index;
             C.det.word_idx = res->wake_word_index;
@@ -517,6 +590,9 @@ void perf_rec_begin()
     if (C.pb) {
         take_snapshot(&C.pb->base_rec);
     }
+    if (C.engine == mww_logic::Engine::Mww) {
+        mww::acc_rec_begin();
+    }
 }
 
 // Строка «WAKE perf» после конца записи по слову (rec_ms: сколько она шла)
@@ -536,10 +612,16 @@ void perf_rec_end(uint32_t rec_ms)
     wake_perf::format_frames(a, f, sizeof(f));
     wake_perf::format_cpu(share, c, sizeof(c));
     ESP_LOGI(TAG, "WAKE perf: recording %u ms | %s | %s", static_cast<unsigned>(rec_ms), f, c);
+    char mw[200] = {0};
+    if (C.engine == mww_logic::Engine::Mww) {
+        wake_perf::format_mww(mww::acc_rec(), mw, sizeof(mw));
+        ESP_LOGI(TAG, "WAKE perf (microWakeWord): recording %u ms | %s", static_cast<unsigned>(rec_ms), mw);
+    }
     if (C.pb) {
         snprintf(C.pb->rec_head, sizeof(C.pb->rec_head), "last_rec (%u ms)", static_cast<unsigned>(rec_ms));
         snprintf(C.pb->rec_frames, sizeof(C.pb->rec_frames), "%s", f);
         snprintf(C.pb->rec_cpu, sizeof(C.pb->rec_cpu), "%s", c);
+        snprintf(C.pb->rec_mww, sizeof(C.pb->rec_mww), "%s", mw);
     }
 }
 
@@ -639,15 +721,28 @@ void do_start(const Detection &d, const wake_logic::Out &o, uint32_t now, dialog
         return;
     }
     const char *label = (kind == RecKind::Barge) ? "WAKE barge-in" : "WAKE detected";
-    ESP_LOGI(TAG,
-             "%s #%u: model=%s (model idx %d, word idx %d) word_len=%d samples, volume=%.1f dB, thr=%.3f%s | mic "
-             "rms=%.1f peak=%.1f dBFS | pre-roll %d ms, beep %s, since the last mic block %d ms, AFE backlog %d ms | up=%us",
-             label, static_cast<unsigned>(C.machine.stats().detections), C.model_name, d.model_idx, d.word_idx, d.word_len,
-             static_cast<double>(d.volume), static_cast<double>(C.thr_barge_on && kind == RecKind::Barge ? C.thr_barge_applied : C.thr_now),
-             kind == RecKind::Barge ? (C.thr_barge_on ? " (barge threshold)" : " (normal)")
-                                    : (C.thr_custom ? " (set by hand)" : " (model default)"),
-             static_cast<double>(mic_rms), static_cast<double>(mic_peak), pre_ms,
-             beep ? "on" : "off", since_ms, d.backlog_ms, static_cast<unsigned>(now / 1000));
+    if (d.engine == mww_logic::Engine::Mww) {
+        // p = среднее окна вероятностей в момент слова, peak = самая большая вероятность в окне; по ним Давид видит запас до порога
+        const double cut = (C.thr_barge_on && kind == RecKind::Barge) ? C.m_barge_applied : C.m_cutoff;
+        ESP_LOGI(TAG,
+                 "%s #%u: engine=mww model=%s p=%.3f peak=%.3f cutoff=%.3f%s | volume=%.1f dB | mic rms=%.1f peak=%.1f dBFS | "
+                 "pre-roll %d ms, beep %s, since the last mic block %d ms, engine backlog %d ms | up=%us",
+                 label, static_cast<unsigned>(C.machine.stats().detections), C.model_name, d.prob_avg, d.prob_peak, cut,
+                 kind == RecKind::Barge ? (C.thr_barge_on ? " (barge cutoff)" : " (normal)")
+                                        : (C.m_cutoff_custom ? " (set by hand)" : " (model default)"),
+                 static_cast<double>(d.volume), static_cast<double>(mic_rms), static_cast<double>(mic_peak), pre_ms,
+                 beep ? "on" : "off", since_ms, d.backlog_ms, static_cast<unsigned>(now / 1000));
+    } else {
+        ESP_LOGI(TAG,
+                 "%s #%u: engine=esp model=%s (model idx %d, word idx %d) word_len=%d samples, volume=%.1f dB, thr=%.3f%s | mic "
+                 "rms=%.1f peak=%.1f dBFS | pre-roll %d ms, beep %s, since the last mic block %d ms, AFE backlog %d ms | up=%us",
+                 label, static_cast<unsigned>(C.machine.stats().detections), C.model_name, d.model_idx, d.word_idx, d.word_len,
+                 static_cast<double>(d.volume), static_cast<double>(C.thr_barge_on && kind == RecKind::Barge ? C.thr_barge_applied : C.thr_now),
+                 kind == RecKind::Barge ? (C.thr_barge_on ? " (barge threshold)" : " (normal)")
+                                        : (C.thr_custom ? " (set by hand)" : " (model default)"),
+                 static_cast<double>(mic_rms), static_cast<double>(mic_peak), pre_ms,
+                 beep ? "on" : "off", since_ms, d.backlog_ms, static_cast<unsigned>(now / 1000));
+    }
     if (kind == RecKind::Barge) {
         ESP_LOGI(TAG,
                  "WAKE barge-in #%u detail: the word came while the dialog was %s, +%u ms into the answer (speaking +%u ms), "
@@ -716,11 +811,94 @@ void print_stat(uint32_t now)
              static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024),
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024), wake_logic::state_name(C.machine.state()),
              C.gain_db, pf, pc);
+    if (C.engine == mww_logic::Engine::Mww) {
+        // Вторая строка: движок слова. Время признака и модели, самая большая вероятность за период, «почти слова» (по ним видно,
+        // не слишком ли высок порог), остаток стека задачи (если мал, надо сказать Мирославу)
+        const wake_perf::MwwAcc ma = mww::acc_take_period();
+        char mw[200];
+        wake_perf::format_mww(ma, mw, sizeof(mw));
+        const mww::Snapshot ms = mww::snapshot();
+        char last[24];
+        if (ms.have_last_peak) {
+            snprintf(last, sizeof(last), "%.3f", ms.last_peak);
+        } else {
+            snprintf(last, sizeof(last), "none");
+        }
+        ESP_LOGI(TAG,
+                 "WAKE stat (microWakeWord): %s | cutoff %.3f, window %d | near-misses +%u (total %u), last peak %s | suppressed %u | "
+                 "task stack free %u B, overruns %u, errors %u",
+                 mw, ms.cutoff, ms.window, static_cast<unsigned>(ms.near_misses - C.stat_prev_near),
+                 static_cast<unsigned>(ms.near_misses), last, static_cast<unsigned>(ms.suppressed),
+                 static_cast<unsigned>(ms.stack_free_bytes), static_cast<unsigned>(ms.overruns), static_cast<unsigned>(ms.step_errors));
+        C.stat_prev_near = ms.near_misses;
+        if (C.pb) {
+            snprintf(C.pb->period_mww, sizeof(C.pb->period_mww), "%s", mw);
+        }
+    }
     C.stat_prev = st;
     C.stat_prev_frames = frames;
     C.stat_prev_vad = vad;
     C.stat_prev_vad_speech = vsp;
     C.stat_at_ms = now;
+}
+
+// Создаёт AFE: VAD (конец фразы, окно follow) и, если with_wakenet, ещё WakeNet9. Один микрофон, без эхоподавления (опорного канала
+// нет), без шумоподавления и AGC (слово и конец фразы определяются по сырому звуку микрофона), режим для распознавания речи,
+// дешёвый по процессору. false: не вышло, причина в why. На успех кладёт C.afe, C.afe_data и размеры кадра.
+bool create_afe(bool with_wakenet, char *wn, const char *vadn, const char **why)
+{
+    afe_config_t *cfg = afe_config_init("M", C.models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
+    if (!cfg) {
+        *why = "afe_config_init returned NULL";
+        return false;
+    }
+    cfg->aec_init = false;
+    cfg->se_init = false;
+    cfg->ns_init = false;
+    cfg->agc_init = false;
+    cfg->wakenet_init = with_wakenet;       // v0.5.0: с движком mww слово не ищем, AFE только VAD (дешевле по процессору и памяти)
+    if (with_wakenet) {
+        if (!cfg->wakenet_model_name) {
+            cfg->wakenet_model_name = wn;
+        }
+        cfg->wakenet_model_name_2 = nullptr;
+        cfg->wakenet_mode = DET_MODE_90;
+    }
+    cfg->vad_init = true;
+    if (!cfg->vad_model_name && vadn) {
+        cfg->vad_model_name = const_cast<char *>(vadn);
+    }
+    cfg->vad_min_noise_ms = 100;   // конец фразы считаем сами (по часам), без второй выдержки в 1 с внутри VAD
+    cfg->vad_mute_playback = false;
+    cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    cfg->afe_linear_gain = 1.0f;
+    cfg->debug_init = false;
+    cfg->afe_perferred_core = kAfeConfigCore;        // в ESP-SR 2.6.1 для одного микрофона внутренней задачи нет: поля не работают
+    cfg->afe_perferred_priority = kAfeConfigPrio;
+    cfg = afe_config_check(cfg);
+    if (!cfg) {
+        *why = "afe_config_check returned NULL";
+        return false;
+    }
+    ESP_LOGI(TAG, "AFE config: wakenet=%s vad=%s mode=low_cost type=SR 1 mic, no AEC/NS/AGC/SE, alloc=more PSRAM; the AFE has no task "
+                  "of its own, VAD%s run inside fetch() in the wake_fetch task",
+             with_wakenet ? (cfg->wakenet_model_name ? cfg->wakenet_model_name : "NONE") : "OFF (microWakeWord hears the word)",
+             cfg->vad_model_name ? cfg->vad_model_name : "webrtc", with_wakenet ? " and WakeNet" : " only");
+    afe_config_print(cfg);
+
+    C.afe = esp_afe_handle_from_config(cfg);
+    if (!C.afe) {
+        afe_config_free(cfg);
+        *why = "esp_afe_handle_from_config returned NULL";
+        return false;
+    }
+    C.afe_data = C.afe->create_from_config(cfg);
+    afe_config_free(cfg);
+    if (!C.afe_data) {
+        *why = "create_from_config returned NULL (out of memory?)";
+        return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -744,13 +922,16 @@ bool init(AudioOut *out, AudioIn *in)
     C.machine.set_silence_ms(ws.silence_ms);
     C.gain_db = wake_logic::gain_valid(ws.gain_db) ? ws.gain_db : 0;
     C.gain_lin.store(wake_logic::gain_db_to_linear(C.gain_db));
+    C.engine_wanted = ws.engine_mww ? mww_logic::Engine::Mww : mww_logic::Engine::Esp;
+    C.m_barge_custom = mww_logic::cutoff_from_saved(ws.mww_barge_thr_q);
     ESP_LOGI(TAG,
-             "settings: wake %s, beep level %d (%.0f dBFS), silence %u ms, threshold %s, gain %d dB, follow window %u ms, barge-in %s, "
-             "barge threshold %s",
-             ws.enabled ? "on" : "off", C.machine.beep_level(), static_cast<double>(wake_logic::beep_level_dbfs(C.machine.beep_level())),
-             static_cast<unsigned>(C.machine.silence_ms()), ws.threshold > 0.0f ? "set by hand" : "model default", C.gain_db,
+             "settings: wake %s, word engine %s, beep level %d (%.0f dBFS), silence %u ms, threshold %s, gain %d dB, follow window %u ms, "
+             "barge-in %s, barge threshold %s",
+             ws.enabled ? "on" : "off", mww_logic::engine_name(C.engine_wanted), C.machine.beep_level(),
+             static_cast<double>(wake_logic::beep_level_dbfs(C.machine.beep_level())), static_cast<unsigned>(C.machine.silence_ms()),
+             (ws.engine_mww ? ws.mww_thr_q > 0 : ws.threshold > 0.0f) ? "set by hand" : "model default", C.gain_db,
              static_cast<unsigned>(C.machine.follow_ms()), C.machine.barge() ? "on" : "off",
-             C.barge_thr_custom > 0.0f ? "set by hand" : "automatic");
+             (ws.engine_mww ? ws.mww_barge_thr_q > 0 : C.barge_thr_custom > 0.0f) ? "set by hand" : "automatic");
 
     if (!ws.enabled) {
         // Выключено командой wake off: движок вообще не запускаем (ни памяти, ни процессора, ни риска). Включить: wake on + reboot
@@ -760,7 +941,19 @@ bool init(AudioOut *out, AudioIn *in)
                       "Push-to-talk (BOOT) works as always.");
         return false;
     }
-    if (settings::get_wake_guard()) {
+    const mww_logic::GuardAction guard = mww_logic::guard_action(C.engine_wanted, settings::get_wake_guard());
+    if (guard == mww_logic::GuardAction::DemoteToEsp) {
+        // Плата упала при запуске слова (или в первые 30 с работы) с движком microWakeWord. Чтобы не остаться без слова совсем,
+        // переходим на проверенный движок ESP-SR и запоминаем это: новый запуск microWakeWord только по команде wake engine mww
+        ESP_LOGE(TAG,
+                 "the board crashed during the previous start of the wake word engine while microWakeWord was selected: switching "
+                 "to the ESP-SR engine (saved). Send me the log of the crash. To try microWakeWord again: wake engine mww and reboot");
+        settings::set_wake_engine_mww(false);
+        settings::set_wake_guard(false);
+        C.engine_wanted = mww_logic::Engine::Esp;
+        C.engine_fell_back = true;
+        snprintf(C.fallback_why, sizeof(C.fallback_why), "%s", "mww_crashed_last_start");
+    } else if (guard == mww_logic::GuardAction::Fail) {
         return fail("previous_start_crashed",
                     "the board crashed during the previous start of the wake word engine, so it is skipped now. Send the command "
                     "'wake on' and reboot to try again, and send me the log of the crash");
@@ -804,7 +997,8 @@ bool init(AudioOut *out, AudioIn *in)
         ESP_LOGW(TAG, "no PSRAM for the performance buffers: the CPU share per task will not be shown");
     }
 
-    // Модели из раздела model (srmodels.bin на 0x820000)
+    // Модели из раздела model (srmodels.bin на 0x820000). Нужны всегда: VAD (конец фразы) и, для движка ESP-SR и как запасной
+    // путь, WakeNet9 «Jarvis»
     C.models = esp_srmodel_init("model");
     if (!C.models || C.models->num <= 0) {
         settings::set_wake_guard(false);
@@ -816,70 +1010,62 @@ bool init(AudioOut *out, AudioIn *in)
         ESP_LOGI(TAG, "model %d: %s [%s]", i, C.models->model_name[i], C.models->model_info ? C.models->model_info[i] : "?");
     }
     char *wn = esp_srmodel_filter(C.models, ESP_WN_PREFIX, "jarvis");
-    if (!wn) {
-        settings::set_wake_guard(false);
-        return fail("no_jarvis_model", "the model partition has no wn9_jarvis_tts (rebuild with CONFIG_SR_WN_WN9_JARVIS_TTS=y)");
-    }
-    snprintf(C.model_name, sizeof(C.model_name), "%s", wn);
-    const int wn_idx = esp_srmodel_exists(C.models, wn);
-    if (wn_idx >= 0 && C.models->model_info && wake_logic::parse_model_thresholds(C.models->model_info[wn_idx], &C.thr_default, nullptr)) {
-        // порог для режима DET_MODE_90 это первое число из строки info
-    } else {
-        C.thr_default = 0.0f;
-        ESP_LOGW(TAG, "cannot read the default threshold from the model info string");
+    if (wn) {
+        snprintf(C.model_name, sizeof(C.model_name), "%s", wn);
+        const int wn_idx = esp_srmodel_exists(C.models, wn);
+        if (wn_idx >= 0 && C.models->model_info && wake_logic::parse_model_thresholds(C.models->model_info[wn_idx], &C.thr_default, nullptr)) {
+            // порог для режима DET_MODE_90 это первое число из строки info
+        } else {
+            C.thr_default = 0.0f;
+            ESP_LOGW(TAG, "cannot read the default threshold from the model info string");
+        }
     }
     const char *vadn = esp_srmodel_filter(C.models, ESP_VADN_PREFIX, nullptr);
     snprintf(C.vad_name, sizeof(C.vad_name), "%s", vadn ? vadn : "webrtc");
 
-    // AFE: один микрофон (M), без эхоподавления (опорного канала нет), без шумоподавления и AGC (слово и конец фразы
-    // определяются по сырому звуку микрофона), режим для распознавания речи, дешёвый по процессору
-    afe_config_t *cfg = afe_config_init("M", C.models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
-    if (!cfg) {
+    // Движок слова. microWakeWord готовим до AFE (его память не должна мешаться с памятью AFE); не вышло, работаем на ESP-SR
+    bool mww_ok = false;
+    if (C.engine_wanted == mww_logic::Engine::Mww) {
+        mww::Source src;
+        src.read = &src_read;
+        src.gain = &src_gain;
+        src.running = &src_running;
+        src.edge = &src_edge;
+        src.hit = &src_hit;
+        char why[24] = {0};
+        mww_ok = mww::prepare(src, why, sizeof(why));
+        if (!mww_ok) {
+            snprintf(C.fallback_why, sizeof(C.fallback_why), "%s", why[0] ? why : "mww_prepare");
+        }
+    }
+    const mww_logic::EngineChoice choice = mww_logic::choose_engine(C.engine_wanted, mww_ok);
+    C.engine = choice.active;
+    if (choice.fell_back) {
+        C.engine_fell_back = true;
+        ESP_LOGE(TAG, "microWakeWord could not start (%s): falling back to the ESP-SR engine (WakeNet9). See the lines above for the reason",
+                 C.fallback_why);
+    }
+    if (C.engine == mww_logic::Engine::Esp && !wn) {
+        mww::shutdown();
         settings::set_wake_guard(false);
-        return fail("afe_config", "afe_config_init returned NULL");
+        return fail("no_jarvis_model", "the model partition has no wn9_jarvis_tts (rebuild with CONFIG_SR_WN_WN9_JARVIS_TTS=y)");
     }
-    cfg->aec_init = false;
-    cfg->se_init = false;
-    cfg->ns_init = false;
-    cfg->agc_init = false;
-    cfg->wakenet_init = true;
-    if (!cfg->wakenet_model_name) {
-        cfg->wakenet_model_name = wn;
-    }
-    cfg->wakenet_model_name_2 = nullptr;
-    cfg->wakenet_mode = DET_MODE_90;
-    cfg->vad_init = true;
-    if (!cfg->vad_model_name && vadn) {
-        cfg->vad_model_name = const_cast<char *>(vadn);
-    }
-    cfg->vad_min_noise_ms = 100;   // конец фразы считаем сами (по часам), без второй выдержки в 1 с внутри VAD
-    cfg->vad_mute_playback = false;
-    cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
-    cfg->afe_linear_gain = 1.0f;
-    cfg->debug_init = false;
-    cfg->afe_perferred_core = kAfeConfigCore;        // в ESP-SR 2.6.1 для одного микрофона внутренней задачи нет: поля не работают
-    cfg->afe_perferred_priority = kAfeConfigPrio;
-    cfg = afe_config_check(cfg);
-    if (!cfg) {
-        settings::set_wake_guard(false);
-        return fail("afe_config", "afe_config_check returned NULL");
-    }
-    ESP_LOGI(TAG, "AFE config: wakenet=%s vad=%s mode=low_cost type=SR 1 mic, no AEC/NS/AGC/SE, alloc=more PSRAM; the AFE has no task "
-                  "of its own, VAD and WakeNet run inside fetch() in the wake_fetch task",
-             cfg->wakenet_model_name ? cfg->wakenet_model_name : "NONE", cfg->vad_model_name ? cfg->vad_model_name : "webrtc");
-    afe_config_print(cfg);
 
-    C.afe = esp_afe_handle_from_config(cfg);
-    if (!C.afe) {
-        afe_config_free(cfg);
-        settings::set_wake_guard(false);
-        return fail("afe_create", "esp_afe_handle_from_config returned NULL");
+    // AFE. С microWakeWord только VAD; если так не поднялся, вторая попытка с WakeNet9 (проверенная конфигурация v0.4.2)
+    const char *afe_why = "";
+    bool afe_ok = create_afe(C.engine == mww_logic::Engine::Esp, wn, vadn, &afe_why);
+    if (!afe_ok && C.engine == mww_logic::Engine::Mww && wn) {
+        ESP_LOGE(TAG, "the AFE with VAD only did not start (%s): falling back to the ESP-SR engine", afe_why);
+        mww::shutdown();
+        C.engine = mww_logic::Engine::Esp;
+        C.engine_fell_back = true;
+        snprintf(C.fallback_why, sizeof(C.fallback_why), "%s", "afe_vad_only");
+        afe_ok = create_afe(true, wn, vadn, &afe_why);
     }
-    C.afe_data = C.afe->create_from_config(cfg);
-    afe_config_free(cfg);
-    if (!C.afe_data) {
+    if (!afe_ok) {
+        mww::shutdown();
         settings::set_wake_guard(false);
-        return fail("afe_create", "create_from_config returned NULL (out of memory?)");
+        return fail("afe_create", afe_why);
     }
     C.feed_chunk = C.afe->get_feed_chunksize(C.afe_data);
     C.feed_nch = C.afe->get_feed_channel_num(C.afe_data);
@@ -893,12 +1079,15 @@ bool init(AudioOut *out, AudioIn *in)
     if (C.feed_nch != 1 || C.feed_chunk <= 0 || C.feed_chunk > 4096 || C.fetch_chunk != C.feed_chunk) {
         C.afe->destroy(C.afe_data);
         C.afe_data = nullptr;
+        mww::shutdown();
         settings::set_wake_guard(false);
         return fail("chunk_unsupported", "unexpected AFE chunk sizes (this firmware expects one channel and equal feed/fetch chunks)");
     }
+    C.frame_ms = C.feed_chunk * 1000 / static_cast<int>(wake_logic::kSampleRate);
     if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < kMinInternalAfterBytes) {
         C.afe->destroy(C.afe_data);
         C.afe_data = nullptr;
+        mww::shutdown();
         settings::set_wake_guard(false);
         return fail("low_memory", "the engine took too much internal RAM, the rest is needed for Wi-Fi and the server link");
     }
@@ -907,26 +1096,44 @@ bool init(AudioOut *out, AudioIn *in)
     if (!C.feed_buf) {
         C.afe->destroy(C.afe_data);
         C.afe_data = nullptr;
+        mww::shutdown();
         settings::set_wake_guard(false);
         return fail("low_memory", "no memory for the feed buffer");
     }
 
     // Порог из настроек (если задан руками)
-    C.thr_now = C.thr_default;
-    if (ws.threshold > 0.0f) {
-        if (C.afe->set_wakenet_threshold(C.afe_data, 1, ws.threshold) == 1) {
-            C.thr_now = ws.threshold;
-            C.thr_custom = true;
-        } else {
-            ESP_LOGW(TAG, "the saved threshold %.3f was refused by the engine: using the model default", static_cast<double>(ws.threshold));
+    if (C.engine == mww_logic::Engine::Mww) {
+        C.m_cutoff_default = mww::default_cutoff();
+        C.m_cutoff = C.m_cutoff_default;
+        const double saved = mww_logic::cutoff_from_saved(ws.mww_thr_q);
+        if (saved > 0.0) {
+            C.m_cutoff = saved;
+            C.m_cutoff_custom = true;
+        }
+        mww::set_cutoff(C.m_cutoff);
+        const mww::Snapshot ms = mww::snapshot();
+        snprintf(C.model_name, sizeof(C.model_name), "%s", ms.model[0] ? ms.model : "jarvis_ru.tflite");
+    } else {
+        C.thr_now = C.thr_default;
+        if (ws.threshold > 0.0f) {
+            if (C.afe->set_wakenet_threshold(C.afe_data, 1, ws.threshold) == 1) {
+                C.thr_now = ws.threshold;
+                C.thr_custom = true;
+            } else {
+                ESP_LOGW(TAG, "the saved threshold %.3f was refused by the engine: using the model default", static_cast<double>(ws.threshold));
+            }
         }
     }
 
     if (xTaskCreatePinnedToCore(feed_task, "wake_feed", kFeedStack, nullptr, kFeedPrio, &C.feed_task, kFeedCore) != pdPASS ||
         xTaskCreatePinnedToCore(fetch_task, "wake_fetch", kFetchStack, nullptr, kFetchPrio, &C.fetch_task, kFetchCore) != pdPASS) {
         // Одна из задач могла стартовать: тогда AFE не трогаем (задача держит на него указатель), просто не подаём звук
+        mww::shutdown();
         settings::set_wake_guard(false);
         return fail("task_create", "cannot create the wake tasks (out of internal memory)");
+    }
+    if (C.engine == mww_logic::Engine::Mww) {
+        mww::go();
     }
 
     C.ok = true;
@@ -934,21 +1141,36 @@ bool init(AudioOut *out, AudioIn *in)
     C.guard_pending = true;
     C.guard_clear_at_ms = uptime_ms() + kGuardClearMs;
     log_memory("with the wake tasks running");
-    ESP_LOGI(TAG,
-             "WAKE ready: word \"Jarvis\" (%s), VAD %s, threshold %.3f%s, silence end %u ms, no-speech timeout %u s, cap %u s, "
-             "resume delay %u ms, beep level %d, wake %s, gain %d dB (engine only) | tasks: feed core %d prio %d, fetch core %d prio %d "
-             "(VAD + WakeNet run in fetch)",
-             C.model_name, C.vad_name, static_cast<double>(C.thr_now), C.thr_custom ? " (set by hand)" : " (model default)",
-             static_cast<unsigned>(C.machine.silence_ms()), static_cast<unsigned>(wake_logic::kNoSpeechMs / 1000),
-             static_cast<unsigned>(wake_logic::kMaxRecordMs / 1000), static_cast<unsigned>(wake_logic::kResumeMs),
-             C.machine.beep_level(), C.enabled ? "on" : "OFF in settings", C.gain_db, kFeedCore, kFeedPrio, kFetchCore,
-             kFetchPrio);
+    if (C.engine == mww_logic::Engine::Mww) {
+        ESP_LOGI(TAG,
+                 "WAKE ready: word \"Jarvis\" by microWakeWord (%s), VAD %s (AFE: VAD only), cutoff %.3f%s, silence end %u ms, no-speech timeout %u s, "
+                 "cap %u s, resume delay %u ms, beep level %d, wake %s, gain %d dB (engine only) | tasks: feed core %d prio %d, fetch "
+                 "core %d prio %d (VAD runs in fetch), mww core 0 prio 1 (features and model)",
+                 C.model_name, C.vad_name, C.m_cutoff, C.m_cutoff_custom ? " (set by hand)" : " (model default)",
+                 static_cast<unsigned>(C.machine.silence_ms()), static_cast<unsigned>(wake_logic::kNoSpeechMs / 1000),
+                 static_cast<unsigned>(wake_logic::kMaxRecordMs / 1000), static_cast<unsigned>(wake_logic::kResumeMs),
+                 C.machine.beep_level(), C.enabled ? "on" : "OFF in settings", C.gain_db, kFeedCore, kFeedPrio, kFetchCore, kFetchPrio);
+    } else {
+        ESP_LOGI(TAG,
+                 "WAKE ready: word \"Jarvis\" by ESP-SR (%s), VAD %s, threshold %.3f%s, silence end %u ms, no-speech timeout %u s, cap %u s, "
+                 "resume delay %u ms, beep level %d, wake %s, gain %d dB (engine only) | tasks: feed core %d prio %d, fetch core %d prio %d "
+                 "(VAD + WakeNet run in fetch)",
+                 C.model_name, C.vad_name, static_cast<double>(C.thr_now), C.thr_custom ? " (set by hand)" : " (model default)",
+                 static_cast<unsigned>(C.machine.silence_ms()), static_cast<unsigned>(wake_logic::kNoSpeechMs / 1000),
+                 static_cast<unsigned>(wake_logic::kMaxRecordMs / 1000), static_cast<unsigned>(wake_logic::kResumeMs),
+                 C.machine.beep_level(), C.enabled ? "on" : "OFF in settings", C.gain_db, kFeedCore, kFeedPrio, kFetchCore,
+                 kFetchPrio);
+    }
+    ESP_LOGI(TAG, "WAKE engine: %s%s%s (selected in the settings: %s; change with: wake engine mww|esp, then reboot)",
+             mww_logic::engine_name(C.engine), C.engine_fell_back ? " AFTER A FALLBACK, reason " : "",
+             C.engine_fell_back ? C.fallback_why : "", mww_logic::engine_name(C.engine_wanted));
     ESP_LOGI(TAG,
              "WAKE v0.4.2: follow window %u ms (voice >= %u ms starts a recording, pre-roll %u ms), barge-in %s (word threshold while "
              "the answer plays: %.3f, engine input %d dB quieter while it plays)",
              static_cast<unsigned>(C.machine.follow_ms()), static_cast<unsigned>(wake_logic::kFollowSpeechMs),
              static_cast<unsigned>(wake_logic::kFollowPreRollMs), C.machine.barge() ? "on" : "off",
-             static_cast<double>(wake_logic::barge_threshold(C.thr_now, C.barge_thr_custom)),
+             C.engine == mww_logic::Engine::Mww ? mww_logic::barge_cutoff(C.m_cutoff, C.m_barge_custom)
+                                                : static_cast<double>(wake_logic::barge_threshold(C.thr_now, C.barge_thr_custom)),
              wake_logic::kBargeAttenDb);
     return true;
 }
@@ -1018,6 +1240,9 @@ void sink(void *, const int16_t *pcm, const int16_t *engine_pcm, size_t n)
     if (C.feed_task) {
         xTaskNotifyGive(C.feed_task);
     }
+    if (C.engine == mww_logic::Engine::Mww) {
+        mww::notify();
+    }
 }
 
 // ---------------------------------------------------------------- главный цикл
@@ -1041,6 +1266,23 @@ static void apply_attenuation(bool on)
 static void apply_threshold(bool answer_playing)
 {
     if (!C.ok) {
+        return;
+    }
+    if (C.engine == mww_logic::Engine::Mww) {
+        // microWakeWord: порог лежит в атомарном целом, задача mww берёт его перед каждой вероятностью (просьба движку не нужна)
+        const double want = answer_playing ? mww_logic::barge_cutoff(C.m_cutoff, C.m_barge_custom) : 0.0;
+        if (want > 0.0) {
+            if (!C.thr_barge_on || C.m_barge_applied != want) {
+                mww::set_cutoff(want);
+                C.thr_barge_on = true;
+                C.m_barge_applied = want;
+                ESP_LOGI(TAG, "WAKE cutoff %.3f while the answer plays (normal %.3f)", want, C.m_cutoff);
+            }
+        } else if (C.thr_barge_on) {
+            mww::set_cutoff(C.m_cutoff);
+            C.thr_barge_on = false;
+            ESP_LOGI(TAG, "WAKE cutoff back to %.3f", C.m_cutoff);
+        }
         return;
     }
     const float want = answer_playing ? wake_logic::barge_threshold(C.thr_now, C.barge_thr_custom) : 0.0f;
@@ -1157,7 +1399,7 @@ void tick(uint32_t now, const Env &env)
             const uint32_t run = C.vad_run.load();
             const uint32_t since_open = C.vad_frames.load() - C.follow_frames0;
             const uint32_t frames = run < since_open ? run : since_open;
-            const wake_logic::Out f = C.machine.on_follow_speech(now, frames * wake_logic::kVadFrameMs);
+            const wake_logic::Out f = C.machine.on_follow_speech(now, frames * static_cast<uint32_t>(C.frame_ms));
             if (f.start) {
                 Detection fd;
                 {
@@ -1213,6 +1455,9 @@ void tick(uint32_t now, const Env &env)
             wake_perf::FrameAcc a;
             wake_perf::CpuShare sh;
             perf_period_take(&a, &sh);
+            if (C.engine == mww_logic::Engine::Mww) {
+                mww::acc_take_period();
+            }
             C.stat_at_ms = now;
         }
     }
@@ -1245,15 +1490,30 @@ Status status(uint32_t now)
         s.state = C.machine.state();
         s.blocker = C.machine.blocker();
         snprintf(s.model, sizeof(s.model), "%s", C.model_name[0] ? C.model_name : "none");
-        s.thr = C.thr_now;
-        s.thr_default = C.thr_default;
-        s.thr_custom = C.thr_custom;
+        s.engine = C.engine;
+        s.engine_wanted = C.engine_wanted;
+        s.fell_back = C.engine_fell_back;
+        s.fallback_why = C.fallback_why;
+        if (C.engine == mww_logic::Engine::Mww) {
+            s.thr = static_cast<float>(C.m_cutoff);
+            s.thr_default = static_cast<float>(C.m_cutoff_default);
+            s.thr_custom = C.m_cutoff_custom;
+        } else {
+            s.thr = C.thr_now;
+            s.thr_default = C.thr_default;
+            s.thr_custom = C.thr_custom;
+        }
         s.beep_level = C.machine.beep_level();
         s.follow_ms = C.machine.follow_ms();
         s.follow_open = C.machine.follow_open();
         s.barge = C.machine.barge();
-        s.barge_thr = wake_logic::barge_threshold(C.thr_now, C.barge_thr_custom);
-        s.barge_thr_custom = C.barge_thr_custom > 0.0f;
+        if (C.engine == mww_logic::Engine::Mww) {
+            s.barge_thr = static_cast<float>(mww_logic::barge_cutoff(C.m_cutoff, C.m_barge_custom));
+            s.barge_thr_custom = C.m_barge_custom > 0.0;
+        } else {
+            s.barge_thr = wake_logic::barge_threshold(C.thr_now, C.barge_thr_custom);
+            s.barge_thr_custom = C.barge_thr_custom > 0.0f;
+        }
         s.engine_atten = C.atten.load();
         s.silence_ms = C.machine.silence_ms();
         s.stats = C.machine.stats();
@@ -1265,6 +1525,9 @@ Status status(uint32_t now)
         std::lock_guard<std::mutex> lock(C.mu);
         s.mic_rms_dbfs = C.last_rms_db;
         s.mic_peak_dbfs = C.last_peak_db;
+    }
+    if (C.engine == mww_logic::Engine::Mww && C.ok) {
+        s.mww = mww::snapshot();
     }
     s.feed_chunk = C.feed_chunk;
     s.fetch_chunk = C.fetch_chunk;
@@ -1298,6 +1561,11 @@ PerfInfo perf_info()
         snprintf(p.rec_head, sizeof(p.rec_head), "%s", C.pb->rec_head);
         snprintf(p.rec_frames, sizeof(p.rec_frames), "%s", C.pb->rec_frames);
         snprintf(p.rec_cpu, sizeof(p.rec_cpu), "%s", C.pb->rec_cpu);
+        snprintf(p.period_mww, sizeof(p.period_mww), "%s", C.pb->period_mww);
+        snprintf(p.rec_mww, sizeof(p.rec_mww), "%s", C.pb->rec_mww);
+    }
+    if (C.engine == mww_logic::Engine::Mww && C.ok) {
+        wake_perf::format_mww(mww::acc_total(), p.mww_total, sizeof(p.mww_total));
     }
     return p;
 }
@@ -1374,6 +1642,19 @@ bool set_barge(bool on)
 
 bool set_barge_threshold(float thr)
 {
+    if (C.engine == mww_logic::Engine::Mww) {
+        const double t = static_cast<double>(thr);
+        if (thr != 0.0f && !mww_logic::cutoff_valid(t)) {
+            return false;
+        }
+        const bool saved = settings::set_wake_mww_barge_thr(t);
+        std::lock_guard<std::mutex> lock(C.ctl_mu);
+        C.m_barge_custom = t;
+        C.thr_barge_on = false;   // следующий tick выставит новый порог на время ответа, если он звучит
+        ESP_LOGI(TAG, "wake barge cutoff %s%.3f by command%s", thr == 0.0f ? "automatic, now " : "",
+                 mww_logic::barge_cutoff(C.m_cutoff, C.m_barge_custom), saved ? " (saved)" : " (NOT saved: NVS write failed)");
+        return saved;
+    }
     if (thr != 0.0f && !wake_logic::thr_valid(thr)) {
         return false;
     }
@@ -1388,6 +1669,27 @@ bool set_barge_threshold(float thr)
 
 bool set_threshold(float thr)
 {
+    if (C.engine == mww_logic::Engine::Mww) {
+        // У каждого движка свой порог (и своё место в NVS): порог ESP-SR 0,63 не годится microWakeWord, а 0,90 не годится ESP-SR
+        const double t = static_cast<double>(thr);
+        if (thr != 0.0f && !mww_logic::cutoff_valid(t)) {
+            return false;
+        }
+        const bool saved = settings::set_wake_mww_threshold(t);
+        std::lock_guard<std::mutex> lock(C.ctl_mu);
+        if (thr == 0.0f) {
+            C.m_cutoff = C.m_cutoff_default;
+            C.m_cutoff_custom = false;
+        } else {
+            C.m_cutoff = mww_logic::cutoff_from_saved(mww_logic::cutoff_to_saved(t));   // так же округлено, как после перезагрузки
+            C.m_cutoff_custom = true;
+        }
+        mww::set_cutoff(C.m_cutoff);
+        C.thr_barge_on = false;   // порог на время ответа (если ответ звучит) tick выставит заново от нового обычного, через 10 мс
+        ESP_LOGI(TAG, "wake cutoff %.3f by command%s%s", C.m_cutoff, thr == 0.0f ? " (model default)" : "",
+                 saved ? " (saved)" : " (NOT saved: NVS write failed)");
+        return saved;
+    }
     if (thr != 0.0f && !wake_logic::thr_valid(thr)) {
         return false;
     }
@@ -1427,6 +1729,16 @@ bool set_gain_db(int db)
     C.gain_lin.store(wake_logic::gain_db_to_linear(db));   // feed_task подхватывает со следующего кадра
     ESP_LOGI(TAG, "wake gain %d dB (x%.2f, engine only) by command%s", db, static_cast<double>(wake_logic::gain_db_to_linear(db)),
              saved ? " (saved)" : " (NOT saved: NVS write failed)");
+    return saved;
+}
+
+bool set_engine(mww_logic::Engine e)
+{
+    const bool saved = settings::set_wake_engine_mww(e == mww_logic::Engine::Mww);
+    std::lock_guard<std::mutex> lock(C.ctl_mu);
+    C.engine_wanted = e;
+    ESP_LOGI(TAG, "wake engine %s by command%s: it takes effect after a reboot (now running: %s)", mww_logic::engine_name(e),
+             saved ? " (saved)" : " (NOT saved: NVS write failed)", mww_logic::engine_name(C.engine));
     return saved;
 }
 

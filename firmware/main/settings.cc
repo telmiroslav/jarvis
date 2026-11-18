@@ -8,6 +8,7 @@
 #include "nvs_flash.h"
 
 #include "lcd_cfg.h"
+#include "mww_logic.h"
 #include "wake_logic.h"
 
 namespace jarvis {
@@ -33,6 +34,9 @@ const char *kKeyWakeThr = "wake_thr";
 const char *kKeyWakeSil = "wake_sil";
 const char *kKeyWakeGain = "wake_gain";
 const char *kKeyWakeGuard = "wake_guard";
+const char *kKeyWakeEngine = "wake_eng";        // v0.5.0
+const char *kKeyWakeMwwThr = "wake_mthr";
+const char *kKeyWakeMwwBargeThr = "wake_mbthr";
 
 bool g_ready = false;
 
@@ -315,6 +319,15 @@ WakeSettings get_wake()
     if (nvs_get_u8(h, kKeyWakeGain, &u8) == ESP_OK && wake_logic::gain_valid(u8)) {
         w.gain_db = u8;   // мусор в NVS игнорируем: останется 0
     }
+    if (nvs_get_u8(h, kKeyWakeEngine, &u8) == ESP_OK) {
+        w.engine_mww = mww_logic::engine_from_saved(true, u8) == mww_logic::Engine::Mww;
+    }
+    if (nvs_get_u16(h, kKeyWakeMwwThr, &u16) == ESP_OK && mww_logic::cutoff_from_saved(u16) > 0.0) {
+        w.mww_thr_q = u16;   // мусор в NVS игнорируем: останется порог из манифеста
+    }
+    if (nvs_get_u16(h, kKeyWakeMwwBargeThr, &u16) == ESP_OK && mww_logic::cutoff_from_saved(u16) > 0.0) {
+        w.mww_barge_thr_q = u16;
+    }
     nvs_close(h);
     return w;
 }
@@ -413,6 +426,39 @@ bool set_wake_gain_db(int db)
         return false;
     }
     return commit_close(h, nvs_set_u8(h, kKeyWakeGain, static_cast<uint8_t>(db)));
+}
+
+bool set_wake_engine_mww(bool mww)
+{
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u8(h, kKeyWakeEngine, mww_logic::engine_to_saved(mww ? mww_logic::Engine::Mww : mww_logic::Engine::Esp)));
+}
+
+bool set_wake_mww_threshold(double thr)
+{
+    if (thr != 0.0 && !mww_logic::cutoff_valid(thr)) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u16(h, kKeyWakeMwwThr, mww_logic::cutoff_to_saved(thr)));
+}
+
+bool set_wake_mww_barge_thr(double thr)
+{
+    if (thr != 0.0 && !mww_logic::cutoff_valid(thr)) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u16(h, kKeyWakeMwwBargeThr, mww_logic::cutoff_to_saved(thr)));
 }
 
 bool get_wake_guard()

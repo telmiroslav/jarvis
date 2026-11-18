@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Сборка и запуск тестов на обычном компьютере (нужны g++, gcc, make; для картинок ещё zlib-dev желательно, но не обязательно).
 #   ./run.sh               тесты чистой логики + проверки tools/ (Python) + картинки интерфейса в renders/
-#   ./run.sh --logic       только тесты чистой логики (секунды, LVGL не нужен)
+#   ./run.sh --logic       только тесты логики и движка слова (LVGL не нужен; движок слова собирается около минуты один раз)
 #   ./run.sh /путь/к/папке картинки интерфейса положить в эту папку (по умолчанию renders/ рядом)
 #
 # LVGL берётся из firmware/managed_components (появляется после первой сборки прошивки idf.py build);
@@ -35,9 +35,21 @@ python_tests() {
   fi
 }
 
+# Движок microWakeWord: настоящие признаки и модель на синтетическом звуке (test_mww_core.cc). Нужны управляемые компоненты
+# (появляются после первой сборки прошивки idf.py build); первый раз собираются около минуты и кэшируются рядом с LVGL.
+mww_core_test() {
+  if [[ -d ../managed_components/espressif__esp-tflite-micro/tensorflow && -d ../managed_components/esphome__esp-micro-speech-features/src ]]; then
+    make -s -j"$(nproc)" OUT="$OUT" "$OUT/test_mww_core" "$OUT/mww_check"
+    "$OUT/test_mww_core"
+  else
+    echo "test_mww_core: нет компонентов esp-tflite-micro и esp-micro-speech-features (сначала idf.py build в firmware/), пропускаю"
+  fi
+}
+
 if (( LOGIC_ONLY )); then
   make -s OUT="$OUT" "$OUT/test_main"
   "$OUT/test_main"
+  mww_core_test
   python_tests
   exit 0
 fi
@@ -53,5 +65,6 @@ fi
 
 make -s -j"$(nproc)" OUT="$OUT" LVGL="$LVGL" all
 "$OUT/test_main"
+mww_core_test
 python_tests
 "$OUT/render" "$RENDERS"

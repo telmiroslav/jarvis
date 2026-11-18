@@ -42,6 +42,56 @@ void merge(FrameAcc *a, const FrameAcc &b)
     }
 }
 
+void MwwAcc::add_inf(uint32_t us)
+{
+    inf++;
+    inf_sum_us += us;
+    if (us > inf_max_us) {
+        inf_max_us = us;
+    }
+    if (us > kMwwInferenceMs * 1000u) {
+        slow++;
+    }
+}
+
+void MwwAcc::add_fe(uint32_t us)
+{
+    fe++;
+    fe_sum_us += us;
+    if (us > fe_max_us) {
+        fe_max_us = us;
+    }
+}
+
+float MwwAcc::busy_pct() const
+{
+    if (inf == 0) {
+        return 0.0f;
+    }
+    return 100.0f * static_cast<float>(inf_sum_us + fe_sum_us) / (static_cast<float>(inf) * static_cast<float>(kMwwInferenceMs) * 1000.0f);
+}
+
+void merge(MwwAcc *a, const MwwAcc &b)
+{
+    a->inf += b.inf;
+    a->fe += b.fe;
+    a->inf_sum_us += b.inf_sum_us;
+    a->fe_sum_us += b.fe_sum_us;
+    a->slow += b.slow;
+    if (b.inf_max_us > a->inf_max_us) {
+        a->inf_max_us = b.inf_max_us;
+    }
+    if (b.fe_max_us > a->fe_max_us) {
+        a->fe_max_us = b.fe_max_us;
+    }
+    if (b.lag_max_ms > a->lag_max_ms) {
+        a->lag_max_ms = b.lag_max_ms;
+    }
+    if (b.p_max > a->p_max) {
+        a->p_max = b.p_max;
+    }
+}
+
 uint32_t pending_frames(uint32_t fed, uint32_t fetched)
 {
     const int32_t d = static_cast<int32_t>(fed - fetched);
@@ -54,6 +104,7 @@ const char *group_name(Group g)
 {
     switch (g) {
     case Group::Fetch: return "fetch";
+    case Group::Mww:   return "mww";
     case Group::Feed:  return "feed";
     case Group::Lvgl:  return "lvgl";
     case Group::Main:  return "main";
@@ -79,6 +130,7 @@ Group classify_task(const char *name)
     };
     static const Item kItems[] = {
         {"wake_fetch", Group::Fetch},
+        {"mww", Group::Mww},
         {"wake_feed", Group::Feed},
         {"taskLVGL", Group::Lvgl},
         {"main", Group::Main},
@@ -168,6 +220,23 @@ size_t format_frames(const FrameAcc &a, char *buf, size_t cap)
                 cap);
 }
 
+size_t format_mww(const MwwAcc &a, char *buf, size_t cap)
+{
+    if (cap == 0) {
+        return 0;
+    }
+    if (a.inf == 0) {
+        return clip(snprintf(buf, cap, "mww: no inferences"), cap);
+    }
+    return clip(snprintf(buf, cap,
+                         "mww inference avg %.1f max %.1f ms (slow %u of %u), features avg %.2f max %.2f ms, ~%.0f%% of a core, lag max %u ms, "
+                         "p_max %.2f",
+                         static_cast<double>(a.inf_avg_ms()), static_cast<double>(a.inf_max_ms()), static_cast<unsigned>(a.slow),
+                         static_cast<unsigned>(a.inf), static_cast<double>(a.fe_avg_ms()), static_cast<double>(a.fe_max_ms()),
+                         static_cast<double>(a.busy_pct()), static_cast<unsigned>(a.lag_max_ms), a.p_max),
+                cap);
+}
+
 size_t format_cpu(const CpuShare &c, char *buf, size_t cap, bool compact)
 {
     if (cap == 0) {
@@ -177,7 +246,7 @@ size_t format_cpu(const CpuShare &c, char *buf, size_t cap, bool compact)
         return clip(snprintf(buf, cap, "%s", compact ? "cpu%=n/a" : "cpu% n/a"), cap);
     }
     // Порядок: задачи, потом простой ядер
-    static const Group kOrder[] = {Group::Fetch, Group::Feed, Group::Lvgl, Group::Main, Group::Link,
+    static const Group kOrder[] = {Group::Fetch, Group::Mww, Group::Feed, Group::Lvgl, Group::Main, Group::Link,
                                    Group::Audio, Group::Wifi, Group::Other, Group::Idle0, Group::Idle1};
     const char *kv = compact ? ":" : " ";
     size_t n = 0;

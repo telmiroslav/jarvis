@@ -137,6 +137,43 @@ void run_wake(const cmd::Command &c)
                   static_cast<unsigned>(s.stats.follow_starts), static_cast<unsigned>(s.stats.follow_timeouts),
                   static_cast<unsigned>(s.stats.barge_ins));
         }
+        {
+            // v0.5.0: какой движок слышит слово. cutoff и barge_cutoff это пороги активного движка; near_miss и last_peak считает
+            // только microWakeWord («почти слово»: вероятность дошла до 0.60, но не до порога; по ним видно, что порог высок)
+            char eng[120];
+            if (s.fell_back) {
+                snprintf(eng, sizeof(eng), "%s(selected=%s, FELL BACK: %s)", mww_logic::engine_name(s.engine),
+                         mww_logic::engine_name(s.engine_wanted), s.fallback_why);
+            } else {
+                snprintf(eng, sizeof(eng), "%s(selected=%s%s)", mww_logic::engine_name(s.engine), mww_logic::engine_name(s.engine_wanted),
+                         s.engine == s.engine_wanted ? "" : ", reboot to apply");
+            }
+            char cut[40];
+            char bcut[40];
+            if (s.available) {
+                snprintf(cut, sizeof(cut), "%.3f(%s)", static_cast<double>(s.thr), s.thr_custom ? "set" : "default");
+                snprintf(bcut, sizeof(bcut), "%.3f(%s)", static_cast<double>(s.barge_thr), s.barge_thr_custom ? "set" : "auto");
+            } else {
+                snprintf(cut, sizeof(cut), "n/a");
+                snprintf(bcut, sizeof(bcut), "n/a");
+            }
+            reply("WAKE v0.5.0 word_engine=%s cutoff=%s barge_cutoff=%s", eng, cut, bcut);
+            if (s.mww.ready) {
+                char lp[24];
+                if (s.mww.have_last_peak) {
+                    snprintf(lp, sizeof(lp), "%.3f", s.mww.last_peak);
+                } else {
+                    snprintf(lp, sizeof(lp), "none");
+                }
+                reply("WAKE v0.5.0 mww model=%s window=%d near_miss=%u last_peak=%s avg_now=%.2f words=%u suppressed=%u overruns=%u errors=%u "
+                      "stack_free=%uB arena=%u/%uB(%d try) model_bytes=%u",
+                      s.mww.model, s.mww.window, static_cast<unsigned>(s.mww.near_misses), lp, s.mww.avg_now,
+                      static_cast<unsigned>(s.mww.detections), static_cast<unsigned>(s.mww.suppressed),
+                      static_cast<unsigned>(s.mww.overruns), static_cast<unsigned>(s.mww.step_errors),
+                      static_cast<unsigned>(s.mww.stack_free_bytes), static_cast<unsigned>(s.mww.arena_used),
+                      static_cast<unsigned>(s.mww.arena_bytes), s.mww.arena_attempts, static_cast<unsigned>(s.mww.model_bytes));
+            }
+        }
         if (s.available) {
             // Измерения движка: каждая строка короче 200 символов (./tools/flash.sh cmd обрезает длиннее)
             const wake::PerfInfo p = wake::perf_info();
@@ -150,6 +187,15 @@ void run_wake(const cmd::Command &c)
             if (p.rec_frames[0]) {
                 reply("WAKE perf %s: %s", p.rec_head, p.rec_frames);
                 reply("WAKE perf %s: %s", p.rec_head, p.rec_cpu);
+            }
+            if (p.mww_total[0]) {
+                reply("WAKE perf since_boot: %s", p.mww_total);
+            }
+            if (p.period_mww[0]) {
+                reply("WAKE perf last_30s: %s", p.period_mww);
+            }
+            if (p.rec_mww[0]) {
+                reply("WAKE perf %s: %s", p.rec_head, p.rec_mww);
             }
         }
         break;
@@ -205,28 +251,60 @@ void run_wake(const cmd::Command &c)
         }
         break;
     }
-    case WakeOp::BargeThr:
+    case WakeOp::BargeThr: {
+        const wake::Status s = wake::status(now);
         if (wake::set_barge_threshold(c.wake_thr)) {
             if (c.wake_thr == 0.0f) {
-                reply("WAKE OK barge thr automatic (normal + 0.08, at most 0.95)");
+                reply("WAKE OK barge thr automatic (normal + %s, at most %s)", s.engine == mww_logic::Engine::Mww ? "0.03" : "0.08",
+                      s.engine == mww_logic::Engine::Mww ? "0.99" : "0.95");
             } else {
-                reply("WAKE OK barge thr %.4f", static_cast<double>(c.wake_thr));
+                reply("WAKE OK barge thr %.4f (engine %s)", static_cast<double>(c.wake_thr), mww_logic::engine_name(s.engine));
             }
         } else {
-            reply("ERR wake barge_thr_failed");
+            double lo, hi;
+            wake::threshold_range(s.engine, &lo, &hi);
+            if (c.wake_thr != 0.0f && (static_cast<double>(c.wake_thr) < lo || static_cast<double>(c.wake_thr) > hi)) {
+                reply("ERR wake thr_range the %s engine takes %.2f..%.4f", mww_logic::engine_name(s.engine), lo, hi);
+            } else {
+                reply("ERR wake barge_thr_failed");
+            }
         }
         break;
-    case WakeOp::Threshold:
+    }
+    case WakeOp::Threshold: {
+        const wake::Status s = wake::status(now);
         if (wake::set_threshold(c.wake_thr)) {
             if (c.wake_thr == 0.0f) {
-                reply("WAKE OK thr default");
+                reply("WAKE OK thr default (engine %s)", mww_logic::engine_name(s.engine));
             } else {
-                reply("WAKE OK thr %.4f", static_cast<double>(c.wake_thr));
+                reply("WAKE OK thr %.4f (engine %s)", static_cast<double>(c.wake_thr), mww_logic::engine_name(s.engine));
             }
         } else {
-            reply("ERR wake thr_failed");
+            double lo, hi;
+            wake::threshold_range(s.engine, &lo, &hi);
+            if (c.wake_thr != 0.0f && (static_cast<double>(c.wake_thr) < lo || static_cast<double>(c.wake_thr) > hi)) {
+                reply("ERR wake thr_range the %s engine takes %.2f..%.4f", mww_logic::engine_name(s.engine), lo, hi);
+            } else {
+                reply("ERR wake thr_failed");
+            }
         }
         break;
+    }
+    case WakeOp::Engine: {
+        const mww_logic::Engine e = c.wake_engine_mww ? mww_logic::Engine::Mww : mww_logic::Engine::Esp;
+        const wake::Status s = wake::status(now);
+        if (wake::set_engine(e)) {
+            if (s.engine == e) {
+                reply("WAKE OK engine %s (saved; already running)", mww_logic::engine_name(e));
+            } else {
+                reply("WAKE OK engine %s (saved; takes effect after reboot, now running: %s; send reboot)", mww_logic::engine_name(e),
+                      mww_logic::engine_name(s.engine));
+            }
+        } else {
+            reply("ERR wake save_failed");
+        }
+        break;
+    }
     case WakeOp::Silence:
         if (wake::set_silence_ms(c.wake_ms)) {
             reply("WAKE OK silence %u", static_cast<unsigned>(c.wake_ms));
@@ -323,8 +401,8 @@ void run_command(const cmd::Command &c)
         break;
     case cmd::Kind::Help:
         reply("HELP wifi_set <ssid><TAB><password> | wifi_clear | tz <POSIX TZ> | lcd <1-6> | server [ws://ip:port/ws|auto] | "
-              "wake [on|off|beep on|off|0-5|thr <0.40-0.9999|default>|silence <300-3000 ms>|gain <0-18 dB>|follow <0|2000-15000 ms>|"
-              "barge on|off|barge thr <0.40-0.9999|default>] | echo | status | reboot");
+              "wake [on|off|engine mww|esp|beep on|off|0-5|thr <0.50-0.99 mww, 0.40-0.9999 esp|default>|silence <300-3000 ms>|gain <0-18 dB>|"
+              "follow <0|2000-15000 ms>|barge on|off|barge thr <as thr|default>] | echo | status | reboot");
         break;
     case cmd::Kind::Error:
         reply("ERR %s %s", c.err_cmd, c.err_reason);

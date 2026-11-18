@@ -1,6 +1,9 @@
 #pragma once
 
-// Слово «Джарвис» на самой плате: ESP-SR 2.6.1 (AFE + WakeNet9 wn9_jarvis_tts + VADNet), без интернета.
+// Слово «Джарвис» на самой плате, без интернета. Два движка на выбор (команда wake engine mww|esp, действует после перезагрузки):
+//   - mww (по умолчанию с v0.5.0): microWakeWord, своя модель «Джарвис» (mww.h). AFE ESP-SR работает только как VAD (конец фразы);
+//   - esp: как в v0.4.2, ESP-SR 2.6.1 (AFE + WakeNet9 wn9_jarvis_tts + VADNet).
+// Если mww не поднялся (память, модель, TFLite) или плата падала при его запуске, слово работает на движке esp (запасной путь).
 // Решения (когда слушать, когда записывать, когда закончить) принимает чистый автомат wake_logic::Machine; здесь только
 // движок, задачи и проводка к разговору (session.h), микрофону (mic_stream.h) и динамику (писк).
 //
@@ -39,6 +42,8 @@
 #include <stdint.h>
 
 #include "audio_out.h"
+#include "mww.h"
+#include "mww_logic.h"
 #include "wake_logic.h"
 
 namespace jarvis {
@@ -78,10 +83,15 @@ struct Status {
     const char *why = "";               // почему недоступно (статическая строка), "" если доступно
     wake_logic::State state = wake_logic::State::Off;
     const char *blocker = "";           // почему не на взводе
-    char model[48] = {0};
-    float thr = 0.0f;                   // порог сейчас
-    float thr_default = 0.0f;           // стандартный порог модели
+    char model[48] = {0};               // имя модели активного движка
+    float thr = 0.0f;                   // порог сейчас (у активного движка)
+    float thr_default = 0.0f;           // стандартный порог модели (у mww из манифеста)
     bool thr_custom = false;
+    mww_logic::Engine engine = mww_logic::Engine::Esp;          // кто слышит слово сейчас
+    mww_logic::Engine engine_wanted = mww_logic::Engine::Mww;   // что выбрано в настройках (после перезагрузки)
+    bool fell_back = false;             // хотели mww, работает esp
+    const char *fallback_why = "";      // почему (статическая строка)
+    mww::Snapshot mww;                  // состояние microWakeWord (ready = false, если он не активен)
     int beep_level = 4;                 // 0 = выключен, 1..5 громкость (4 = -8 дБ по умолчанию)
     uint32_t follow_ms = 6000;          // окно «договорить без слова», 0 = выключено
     bool follow_open = false;           // окно открыто прямо сейчас
@@ -112,6 +122,9 @@ struct PerfInfo {
     char rec_head[48] = {0};            // «last_rec (5697 ms)»
     char rec_frames[200] = {0};         // последняя запись по слову: кадры
     char rec_cpu[160] = {0};            // и загрузка процессора
+    char period_mww[200] = {0};         // v0.5.0: время признака и модели microWakeWord за последние 30 с (пусто с движком esp)
+    char rec_mww[200] = {0};            // и за последнюю запись по слову
+    char mww_total[200] = {0};          // и за всё время работы
 };
 PerfInfo perf_info();
 
@@ -123,10 +136,20 @@ bool set_beep(bool on);                 // on = уровень по умолча
 // Окно «договорить без слова»: 0 = выключено или 2000..15000 мс
 bool set_follow_ms(uint32_t ms);
 bool set_barge(bool on);
-// Порог слова, пока звучит ответ: 0 = автоматически (обычный + 0,08, не выше 0,95)
+// Порог слова, пока звучит ответ: 0 = автоматически; у esp обычный + 0,08 (не выше 0,95), у mww обычный + 0,03 (не выше 0,99).
+// Относится к активному движку.
 bool set_barge_threshold(float thr);
-// 0 = вернуть стандартный порог модели
+// 0 = вернуть стандартный порог модели. Относится к активному движку: у esp область 0,40..0,9999, у mww 0,50..0,99 (false вне
+// области). У каждого движка свой порог в NVS.
 bool set_threshold(float thr);
+// Область порога движка (для сообщения об ошибке в консоли)
+inline void threshold_range(mww_logic::Engine e, double *lo, double *hi)
+{
+    *lo = (e == mww_logic::Engine::Mww) ? mww_logic::kCutoffMin : static_cast<double>(wake_logic::kThresholdMin);
+    *hi = (e == mww_logic::Engine::Mww) ? mww_logic::kCutoffMax : static_cast<double>(wake_logic::kThresholdMax);
+}
+// Движок слова после следующей перезагрузки (сохраняется в NVS). false: не записалось.
+bool set_engine(mww_logic::Engine e);
 bool set_silence_ms(uint32_t ms);
 // Усиление звука, который идёт только в движок слова (на сервер звук уходит как был), целые дБ 0..18. Действует сразу.
 bool set_gain_db(int db);
