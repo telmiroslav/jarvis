@@ -225,9 +225,11 @@ class Session:
         log.info("abort: %s", "ход прерван" if was_running else "ничего не шло")
         if audio_active:
             await self._send(protocol.audio_end())
-        if self.music is not None:  # abort = стоп музыки; если плата ждала сообщения после хода, music_stop идёт до state idle
-            await self.music.aborted()
         await self._send_state("idle")
+        if self.music is not None:
+            # посреди хода abort значит «замолчи»: через ~1 с без listen_start музыка продолжится; без хода (короткое BOOT посреди
+            # музыки) музыка на колонке останавливается (skills/music/box.py, PROTOCOL §10)
+            await self.music.aborted()
 
     async def _music_turn_end(self) -> None:
         """Ход кончился (ответ, молчание, пустая запись, ошибка): плата ждёт от сервера одно сообщение про музыку (PROTOCOL §10)."""

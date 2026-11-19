@@ -70,6 +70,37 @@ class FakeSource:
         return self.error
 
 
+class SpecFakeSource(FakeSource):
+    """Поток по поиску (yt-dlp ytsearch1: | ffmpeg): знает, какой ролик взял yt-dlp."""
+
+    def __init__(self, data: bytes, video_id: str | None, **kw):
+        super().__init__(data, **kw)
+        self.video_id = video_id
+
+    async def wait_video_id(self, timeout: float) -> str | None:
+        return self.video_id
+
+
+class FakeSearchFactory:
+    """search_factory службы: записывает запросы, отдаёт заданный поток (или бросает ошибку)."""
+
+    def __init__(self, video_id: str | None = "LHiSYbn2pUU", seconds: float = 10.0, error: str | None = None, boom: bool = False):
+        self.video_id, self.seconds, self.error, self.boom = video_id, seconds, error, boom
+        self.queries: list[str] = []
+        self.sources: list[SpecFakeSource] = []
+
+    async def __call__(self, query: str) -> SpecFakeSource:
+        self.queries.append(query)
+        if self.boom:
+            raise MusicError("no_ytdlp", "нет yt-dlp")
+        if self.error is not None:
+            src = SpecFakeSource(b"", self.video_id, clean=False, error=self.error)
+        else:
+            src = SpecFakeSource(ramp(self.seconds), self.video_id)
+        self.sources.append(src)
+        return src
+
+
 @dataclass
 class TrackSpec:
     seconds: float = 10.0

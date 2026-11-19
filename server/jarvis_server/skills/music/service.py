@@ -45,13 +45,15 @@ def _enum(value: Any, name: str, allowed: tuple[str, ...], default: str) -> str:
 
 class MusicService:
     def __init__(self, settings: Any, tb: Toolbox, runner: Runner, box: BoxPlayer, laptop: LaptopPlayer, local: LocalFinder, *,
-                 clock: Callable[[], float] = time.monotonic):
+                 search_factory: Callable[[str], Awaitable[Any]] | None = None, clock: Callable[[], float] = time.monotonic):
         self.s, self.tb, self.runner = settings, tb, runner
+        self.search_factory = search_factory  # запуск потока первого результата поиска (sources.open_search_source); None = не запускать
         self.box, self.laptop, self.local = box, laptop, local
         self.clock = clock
         self._token: object | None = None  # сессия платы, к которой привязана колонка
         self.caps: frozenset[str] = frozenset()
         self._duck_task: asyncio.Future | None = None
+        self._unduck_task: asyncio.Future | None = None  # после abort посреди хода громкость ноутбука возвращаем не сразу
 
     # ------------------------------------------------------------------ плата
     async def attach_board(self, token: object, caps: frozenset[str], send_text: Callable[[str], Awaitable[None]],
@@ -68,6 +70,7 @@ class MusicService:
         if token is not self._token:
             return
         self._token, self.caps = None, frozenset()
+        self._cancel_unduck()
         await self.box.link_lost()
         await self.laptop.duck(False)
 
@@ -84,6 +87,7 @@ class MusicService:
         """listen_start: кадры музыки на плату перестают идти, ноутбук приглушается. Приглушение включается на весь ход, даже если
         mpv сейчас не играет: музыка, которую включит функция этого хода, начнётся тихо и вернётся к обычной громкости после ответа."""
         self.box.begin_turn()
+        self._cancel_unduck()  # слово после abort (перебивание): ноутбук остаётся приглушённым
         if not self.laptop.ducked:
             self.laptop.ducked = True  # флаг сразу, а громкость в mpv (IPC) следом, не задерживая приём listen_start
             self._duck_task = asyncio.ensure_future(self.laptop.refresh_volume())
@@ -96,17 +100,34 @@ class MusicService:
 
     async def turn_finished(self) -> None:
         """Ход кончился любым способом: плата получает одно сообщение про музыку, ноутбук возвращает громкость."""
+        self._cancel_unduck()
         try:
             await self.box.end_turn()
         finally:
             await self.laptop.duck(False)
 
-    async def aborted(self) -> bool:
-        """abort платы: музыка на колонке останавливается. True, если ей ушёл music_stop (после хода она ждала сообщения)."""
+    async def aborted(self) -> str:
+        """abort платы. Посреди хода это «замолчи», а не «выключи музыку» (перебивание словом шлёт abort и сразу listen_start): музыка
+        на колонке и громкость ноутбука возвращаются через abort_grace_s, если за это время не пришёл listen_start. Без хода
+        (короткое BOOT посреди музыки) музыка на колонке останавливается, место запоминается. Результат: grace | stopped | none."""
+        result = await self.box.abort()
+        if self.laptop.ducked:
+            self._cancel_unduck()
+            self._unduck_task = asyncio.ensure_future(self._unduck_after_grace())
+        return result
+
+    async def _unduck_after_grace(self) -> None:
         try:
-            return await self.box.abort()
-        finally:
-            await self.laptop.duck(False)
+            await asyncio.sleep(self.box.abort_grace_s)
+        except asyncio.CancelledError:
+            return
+        self._unduck_task = None
+        await self.laptop.duck(False)
+
+    def _cancel_unduck(self) -> None:
+        t, self._unduck_task = self._unduck_task, None
+        if t is not None and not t.done():
+            t.cancel()
 
     def board_music_done(self) -> None:
         self.box.board_done()
@@ -120,6 +141,7 @@ class MusicService:
         return "-"
 
     async def close(self) -> None:
+        self._cancel_unduck()
         await self.box.close()
         await self.laptop.close()
 
@@ -168,43 +190,51 @@ class MusicService:
             raise MusicError("no_mpv", (note + " " if note else "") +
                              "На ноутбуке нет mpv, музыку на компьютере не включить. Установщик ставит его: ./server/install.sh")
 
-        found = await self._find(q, source, kind, deadline)
-        t_search = self.clock() - t0
-        log.info("музыка: «%s» (%s, %s, %s): найдено %d за %.1f с, лучшее «%s»", q, source, kind, target, len(found), t_search,
-                 found[0].title)
+        # YouTube на колонку: поток первого результата поиска стартует ПАРАЛЛЕЛЬНО с обычным поиском (разбор страницы идёт 3-4 секунды,
+        # и вместе с поиском это было бы подряд). Если выбор лучшего трека совпал с тем, что взял yt-dlp, второй раз разбирать не нужно.
+        spec = await self._start_speculative(q, source, target)
+        try:
+            found = await self._find(q, source, kind, deadline)
+            t_search = self.clock() - t0
+            log.info("музыка: «%s» (%s, %s, %s): найдено %d за %.1f с, лучшее «%s»", q, source, kind, target, len(found), t_search,
+                     found[0].title)
+            spec = await self._match_speculative(spec, found[0], deadline)
 
-        if kind == "artist":
-            attempts = [(found, i) for i in range(min(ATTEMPTS, len(found)))]
-        else:
-            attempts = [([t], 0) for t in found[:ATTEMPTS]]
-        t1 = self.clock()
-        last: MusicError | None = None
-        track: Track | None = None
-        queue: list[Track] = []
-        for qu, idx in attempts:
-            remaining = deadline - self.clock()
-            if remaining < 1.5 and last is not None:
-                break
-            try:
-                if target == "box":
-                    p = await self.box.prepare(qu, idx, timeout=remaining)
-                    try:
-                        await self._stop_laptop()
-                        await self.box.start(p)
-                    except BaseException:
-                        await self.box.discard(p)  # звук раскодируется впустую: закрыть, а не оставить процессы висеть
+            if kind == "artist":
+                attempts = [(found, i) for i in range(min(ATTEMPTS, len(found)))]
+            else:
+                attempts = [([t], 0) for t in found[:ATTEMPTS]]
+            t1 = self.clock()
+            last: MusicError | None = None
+            track: Track | None = None
+            queue: list[Track] = []
+            for n, (qu, idx) in enumerate(attempts):
+                remaining = deadline - self.clock()
+                if remaining < 1.5 and last is not None:
+                    break
+                try:
+                    if target == "box":
+                        src, spec = (spec, None) if n == 0 else (None, spec)  # готовый поток годится только для первого кандидата
+                        p = await self._prepare_box(qu, idx, remaining, src)
+                        try:
+                            await self._stop_laptop()
+                            await self.box.start(p)
+                        except BaseException:
+                            await self.box.discard(p)  # звук раскодируется впустую: закрыть, а не оставить процессы висеть
+                            raise
+                        track = p.track
+                    else:
+                        await self._stop_box()
+                        track = await self.laptop.play(qu, idx, timeout=remaining)
+                    queue = qu
+                    break
+                except MusicError as e:
+                    last = e
+                    log.warning("музыка: «%s» не запустился: %s (%s)", qu[idx].title, e.message, e.code)
+                    if e.code not in SKIPPABLE:
                         raise
-                    track = p.track
-                else:
-                    await self._stop_box()
-                    track = await self.laptop.play(qu, idx, timeout=remaining)
-                queue = qu
-                break
-            except MusicError as e:
-                last = e
-                log.warning("музыка: «%s» не запустился: %s (%s)", qu[idx].title, e.message, e.code)
-                if e.code not in SKIPPABLE:
-                    raise
+        finally:
+            await self._drop(spec)  # поток, который так и не пригодился (другой ролик, ошибка, отмена), не должен висеть в фоне
         if track is None:
             raise last or MusicError("failed", "Не удалось включить музыку")
         log.info("музыка: «%s» пошла за %.1f с (поиск %.1f с, запуск звука %.1f с)", track.title, self.clock() - t0, t_search,
@@ -221,6 +251,54 @@ class MusicService:
         else:
             out["message"] = "Музыка играет на ноутбуке"
         return out
+
+    async def _start_speculative(self, q: str, source: str, target: str) -> Any:
+        """Запустить поток по поиску (yt-dlp ytsearch1: | ffmpeg), не дожидаясь обычного поиска. Только YouTube на колонку при системном ffmpeg."""
+        if (self.search_factory is None or not getattr(self.s, "music_speculative", True) or target != "box" or source != "youtube"
+                or not self.tb.ytdlp or not self.tb.ffmpeg):
+            return None
+        try:
+            return await self.search_factory(q)
+        except Exception as e:  # необязательное ускорение: не вышло, идём обычным путём
+            log.info("музыка: поток по поиску не запустился (%s), иду обычным путём", e)
+            return None
+
+    async def _match_speculative(self, spec: Any, best: Track, deadline: float) -> Any:
+        """Поток по поиску пригоден, только если yt-dlp взял тот же ролик, что выбрал наш выбор. Иначе закрываем (вернёт None)."""
+        if spec is None:
+            return None
+        try:
+            vid = await spec.wait_video_id(max(0.5, min(4.0, deadline - self.clock() - 6.0)))
+        except Exception:
+            vid = None
+        if vid and best.source == "youtube" and vid in best.url:
+            log.info("музыка: поток по поиску взял тот же ролик (%s), второй раз не разбираю", vid)
+            return spec
+        log.info("музыка: поток по поиску взял %s, а выбран «%s»: закрываю, запускаю выбранный", vid or "неизвестный ролик", best.title)
+        await self._drop(spec)
+        return None
+
+    async def _prepare_box(self, queue: list[Track], index: int, remaining: float, source: Any) -> Any:
+        """box.prepare; с готовым потоком по поиску. Если он не дал звука, тот же трек пробуем обычным путём (ошибка потока по поиску не
+        повод считать трек недоступным: yt-dlp ytsearch1: мог упереться в своё)."""
+        if source is None:
+            return await self.box.prepare(queue, index, timeout=remaining)
+        t0 = self.clock()
+        try:
+            return await self.box.prepare(queue, index, timeout=remaining, source=source)
+        except MusicError as e:
+            if e.code not in ("failed", "unavailable", "timeout"):
+                raise
+            log.info("музыка: готовый поток не дал звука (%s), пробую тот же трек обычным путём", e.code)
+            return await self.box.prepare(queue, index, timeout=max(1.5, remaining - (self.clock() - t0)))
+
+    @staticmethod
+    async def _drop(src: Any) -> None:
+        if src is not None:
+            try:
+                await src.aclose()
+            except Exception:
+                pass
 
     async def _stop_laptop(self) -> None:
         if self.laptop.state != "idle":

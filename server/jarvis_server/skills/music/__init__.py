@@ -18,7 +18,7 @@ from .env import Toolbox
 from .laptop import LaptopPlayer
 from .local import LocalFinder
 from .service import MusicService
-from .sources import SourceFactory, open_source
+from .sources import SourceFactory, open_search_source, open_source
 from .tools import MusicTools
 
 log = logging.getLogger("jarvis.music")
@@ -27,7 +27,8 @@ __all__ = ["MusicService", "MusicTools", "Toolbox", "check_music", "register_mus
 
 
 def register_music_tools(reg: ToolRegistry, settings: Any, *, tb: Toolbox | None = None, runner: Runner | None = None,
-                         factory: SourceFactory | None = None, local: LocalFinder | None = None, box: BoxPlayer | None = None,
+                         factory: SourceFactory | None = None, search_factory: Any = None, local: LocalFinder | None = None,
+                         box: BoxPlayer | None = None,
                          laptop: LaptopPlayer | None = None, clock: Any = None) -> MusicService | None:
     """Регистрирует play_music и music_control, блок инструкции и службу reg.services["music"]. None, если выключено (music=False)."""
     if not getattr(settings, "music", True):
@@ -42,7 +43,10 @@ def register_music_tools(reg: ToolRegistry, settings: Any, *, tb: Toolbox | None
     box = box or BoxPlayer(factory, volume=getattr(settings, "music_volume", 40), frame_ms=getattr(settings, "frame_ms", 40), **ckw)
     laptop = laptop or LaptopPlayer(tb, **ckw)
     local = local or LocalFinder(tuple(getattr(settings, "music_dirs", ()) or ()))
-    svc = MusicService(settings, tb, runner, box, laptop, local, **ckw)
+    if search_factory is None:
+        async def search_factory(query, _tb=tb):  # type: ignore[misc]
+            return await open_search_source(_tb, query)
+    svc = MusicService(settings, tb, runner, box, laptop, local, search_factory=search_factory, **ckw)
     MusicTools(svc, tb.anything_to_play, **ckw).register(reg)
     reg.services["music"] = svc
     reg.add_closer(svc.close)

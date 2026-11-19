@@ -11,7 +11,11 @@
   Что именно, решают функции хода: они только записывают намерение (intent), а сообщение уходит после конца ответа. По умолчанию resume
   (если до хода музыка была на паузе по просьбе человека, то pause).
 - music_start нового трека уходит ПОСЛЕ audio_end и state idle ответа: «Включаю, сэр» не перебивается музыкой.
-- abort = стоп (место запоминается: «продолжи» включит с него). Обрыв связи = стоп, после нового hello музыка сама не включается.
+- abort посреди хода (перебивание словом, короткое BOOT во время ответа) значит «замолчи», а не «выключи музыку»: ход кончен, плата ждёт
+  нашего сообщения. Ждём abort_grace_s (1 с): пришёл listen_start (слово после abort) — про музыку ничего не шлём, новый ход закончится
+  своим сообщением; не пришёл — музыка продолжается (то, что решили функции хода, тоже: новый трек, пауза, стоп).
+- abort без хода (короткое BOOT посреди музыки или на её паузе: плата уже сама почистила буфер) = стоп, место запоминается:
+  «продолжи» включит с него. Обрыв связи = стоп, после нового hello музыка сама не включается.
 """
 from __future__ import annotations
 
@@ -36,6 +40,7 @@ RESTART_AFTER_S = 60.0  # дольше стоял (пауза, разговор)
 READ_TIMEOUT_S = 20.0  # поток молчит дольше: считаем оборванным
 MAX_RETRIES = 2  # сколько раз подряд перезапускать оборвавшийся поток с позиции
 RESUME_KEEP_S = 1800.0  # «продолжи» после стопа помнит место полчаса
+ABORT_GRACE_S = 1.0  # abort посреди хода: столько ждём listen_start (перебивание), прежде чем продолжить музыку
 SKIPPABLE = ("unavailable", "failed")  # трек не запустился по своей вине: пробуем соседний (сеть, нет программ: соседний не поможет)
 
 
@@ -90,9 +95,11 @@ class _Dead:
 
 
 class BoxPlayer:
-    def __init__(self, open_source: SourceFactory, *, volume: int = 40, frame_ms: int = 40,
+    def __init__(self, open_source: SourceFactory, *, volume: int = 40, frame_ms: int = 40, abort_grace_s: float = ABORT_GRACE_S,
                  clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep):
         self.open_source = open_source
+        self.abort_grace_s = abort_grace_s
+        self._grace: asyncio.Task | None = None  # ждём listen_start после abort посреди хода
         self.volume = max(0, min(100, volume))
         self.frame_bytes = RATE * max(20, min(100, frame_ms)) // 1000 * 2  # PROTOCOL §10: кадры 20-100 мс
         self.clock, self.sleep = clock, sleep
@@ -151,10 +158,12 @@ class BoxPlayer:
             raise explain_failure(cur.src, cur.track)
         cur.buf = data
 
-    async def prepare(self, queue: list[Track], index: int, offset_s: float = 0.0, timeout: float = 10.0) -> Prepared:
-        """Запускает раскодирование queue[index] и ждёт первых отсчётов. Плате ничего не шлёт. MusicError, если звука нет."""
+    async def prepare(self, queue: list[Track], index: int, offset_s: float = 0.0, timeout: float = 10.0,
+                      source: PcmSource | None = None) -> Prepared:
+        """Запускает раскодирование queue[index] и ждёт первых отсчётов. Плате ничего не шлёт. MusicError, если звука нет.
+        source: уже запущенный поток этого же трека (запуск по поиску параллельно с самим поиском, service.py)."""
         track = queue[index]
-        src = await self.open_source(track, offset_s)
+        src = source if source is not None else await self.open_source(track, offset_s)
         cur = _Cur(track, src, start_s=offset_s)
         t0 = time.perf_counter()
         try:
@@ -259,6 +268,7 @@ class BoxPlayer:
     # ------------------------------------------------------------------ ход разговора (из Session)
     def begin_turn(self) -> None:
         """listen_start: плата сама поставила музыку на паузу. Мгновенно (без await): кадры больше не уходят."""
+        self._cancel_grace()  # слово после abort: перебивание, музыку не продолжаем
         self.in_turn = True
         if self.board_on:
             self.held = True
@@ -271,28 +281,51 @@ class BoxPlayer:
         self.held = False
         await self._flush(after_turn=True)
 
-    async def abort(self) -> bool:
-        """abort платы: музыка останавливается (место запоминается). True, если ради этого плате ушёл music_stop: он нужен,
-        только если плата ждала сообщения после хода; короткое нажатие BOOT посреди музыки плата обрабатывает сама."""
+    @property
+    def turn_open(self) -> bool:
+        """Ход идёт или после abort ещё ждём listen_start: плата (если музыка была) ждёт от нас сообщения."""
+        return self.in_turn or self._grace is not None
+
+    def _cancel_grace(self) -> None:
+        g, self._grace = self._grace, None
+        if g is not None and not g.done() and g is not asyncio.current_task():
+            g.cancel()
+
+    async def abort(self) -> str:
+        """abort платы. Возвращает, что сделано:
+        "grace": abort посреди хода («замолчи», перебивание): музыку не трогаем, ход считаем оконченным и ждём abort_grace_s, не придёт ли
+          listen_start; нет — продолжаем музыку (end_turn), да — ничего не шлём (его ход закончится сам);
+        "stopped": abort без хода (короткое BOOT посреди музыки или на паузе: плата сама почистила буфер): стоп, место запоминается;
+        "none": музыки не было."""
         async with self._lock:
-            waiting = self.in_turn and self.board_on
+            if self.turn_open:
+                self._cancel_grace()
+                self.in_turn = False  # held остаётся: плата ждёт сообщения
+                self._grace = asyncio.create_task(self._end_turn_after_grace(), name="music-abort-grace")
+                return "grace"
             if self.board_on or self.pending is not None or self.state != "idle":
                 self._remember()
                 await self._teardown()
-            self.intent = None
-            self.in_turn = self.held = False
-            sent = False
-            if waiting:
-                try:
-                    await self._text(protocol.music_stop())
-                    sent = True
-                except Exception:
-                    pass
-            self.board_on = False
-            return sent
+                self.intent = None
+                self.board_on = False
+                self.in_turn = self.held = False
+                return "stopped"
+            return "none"
+
+    async def _end_turn_after_grace(self) -> None:
+        try:
+            await asyncio.sleep(self.abort_grace_s)
+        except asyncio.CancelledError:
+            return
+        self._grace = None
+        try:
+            await self.end_turn()
+        except Exception as e:
+            log.info("музыка: после abort не удалось продолжить (%s: %s)", type(e).__name__, e)
 
     async def link_lost(self) -> None:
         """Связь с платой оборвалась: поток останавливаем, место помним. После нового hello музыка сама не включается."""
+        self._cancel_grace()
         async with self._lock:
             self._remember()
             await self._teardown()
@@ -429,6 +462,7 @@ class BoxPlayer:
         self._update_runnable()
 
     async def close(self) -> None:
+        self._cancel_grace()
         async with self._lock:
             await self._teardown()
 

@@ -14,6 +14,7 @@ import asyncio
 import logging
 import os
 import queue
+import re
 import signal
 import subprocess
 import tempfile
@@ -57,8 +58,10 @@ def ffmpeg_argv(ffmpeg: str, *, src: str, offset_s: float = 0.0, rate: int = RAT
 
 
 def ytdlp_stream_argv(tb: Toolbox, url: str) -> list[str]:
+    """url: страница ролика или поисковый «ytsearch1:запрос» (первый результат поиска; тогда --no-playlist не нужен)."""
     assert tb.ytdlp
-    return [tb.ytdlp, *tb.ytdlp_args(), "--no-playlist", "--no-progress", "-f", "bestaudio/best", "-o", "-", "--", url]
+    playlist = [] if url.startswith("ytsearch1:") else ["--no-playlist"]
+    return [tb.ytdlp, *tb.ytdlp_args(), *playlist, "--no-progress", "-f", "bestaudio/best", "-o", "-", "--", url]
 
 
 def _kill_group(proc: asyncio.subprocess.Process | subprocess.Popen) -> None:
@@ -74,10 +77,16 @@ def _kill_group(proc: asyncio.subprocess.Process | subprocess.Popen) -> None:
                 pass
 
 
+# yt-dlp пишет в stderr, какой ролик разбирает: «[youtube] Extracting URL: https://www.youtube.com/watch?v=ID» (для поиска ytsearch1: это
+# уже результат поиска, через ~1,8 с после старта), дальше «[youtube] ID: Downloading webpage»
+_VIDEO_ID = re.compile(r"\[youtube\] ([A-Za-z0-9_-]{11}): |Extracting URL: https?://(?:www\.|m\.)?youtube\.com/watch\?v=([A-Za-z0-9_-]{11})")
+
+
 class ProcSource:
     """Один или два процесса (yt-dlp | ffmpeg или просто ffmpeg), PCM читается с stdout последнего."""
 
     def __init__(self, procs: list[asyncio.subprocess.Process], names: list[str]):
+        self.video_id: str | None = None  # id ролика YouTube, как только yt-dlp про него написал
         self._procs, self._names = procs, names
         self._out = procs[-1].stdout
         self._err: dict[str, bytearray] = {n: bytearray() for n in names}
@@ -93,6 +102,10 @@ class ProcSource:
                 if not chunk:
                     return
                 buf += chunk
+                if self.video_id is None and name == "yt-dlp":
+                    m = _VIDEO_ID.search(bytes(buf).decode("utf-8", "replace"))
+                    if m:
+                        self.video_id = m.group(1) or m.group(2)
                 if len(buf) > STDERR_KEEP:
                     del buf[: len(buf) - STDERR_KEEP]
         except Exception:
@@ -130,6 +143,18 @@ class ProcSource:
     @property
     def error_text(self) -> str:
         return "\n".join(bytes(b).decode("utf-8", "replace").strip() for b in self._err.values() if b)
+
+    async def wait_video_id(self, timeout: float) -> str | None:
+        """Дождаться, пока yt-dlp скажет, какой ролик он взял (нужно для запуска по поиску). None: не сказал за timeout или упал."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while self.video_id is None:
+            if self._procs[0].returncode is not None:
+                await asyncio.sleep(0)  # чтец stderr мог ещё не дочитать
+                break
+            if asyncio.get_running_loop().time() > deadline:
+                break
+            await asyncio.sleep(0.03)
+        return self.video_id
 
     async def aclose(self) -> None:
         if self._closed:
@@ -259,7 +284,19 @@ async def open_source(tb: Toolbox, track: Track, offset_s: float = 0.0, rate: in
         raise MusicError("no_ffmpeg", "На ноутбуке нет ffmpeg, раскодировать звук нечем: sudo pacman -S ffmpeg")
     if not tb.ytdlp:
         raise MusicError("no_ytdlp", "На ноутбуке нет yt-dlp, музыку из интернета не включить. Установщик ставит его: ./server/install.sh")
-    ytdlp_argv = ytdlp_stream_argv(tb, track.url)
+    return await _open_stream(tb, env, ffmpeg, ytdlp_stream_argv(tb, track.url), offset_s, rate)
+
+
+async def open_search_source(tb: Toolbox, query: str, offset_s: float = 0.0, rate: int = RATE) -> ProcSource:
+    """Поток первого результата YouTube-поиска: `yt-dlp ytsearch1:запрос | ffmpeg`. Запускается ПАРАЛЛЕЛЬНО с обычным поиском (он
+    даёт список и выбирает лучший трек): если yt-dlp взял тот же ролик (wait_video_id), его поток уже идёт и ждать второй раз не нужно;
+    если другой, поток закрывают. Только с системным ffmpeg (запасной PyAV сюда не годится)."""
+    if not tb.ytdlp or not tb.ffmpeg:
+        raise MusicError("no_ytdlp", "Нет yt-dlp или ffmpeg")
+    return await _open_stream(tb, tb.env(), tb.ffmpeg, ytdlp_stream_argv(tb, f"ytsearch1:{query}"), offset_s, rate)
+
+
+async def _open_stream(tb: Toolbox, env: dict[str, str], ffmpeg: str | None, ytdlp_argv: list[str], offset_s: float, rate: int) -> PcmSource:
     if not ffmpeg:
         if not tb.have_pyav():
             raise MusicError("no_ffmpeg", "На ноутбуке нет ffmpeg, раскодировать звук нечем: sudo pacman -S ffmpeg")

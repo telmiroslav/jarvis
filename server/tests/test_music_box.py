@@ -11,11 +11,14 @@ from music_fakes import (FRAME_MS, MUSIC_FRAME, FakeBoard, FakeClock, FakeFactor
                          ramp, settle)
 
 
+GRACE = 0.03  # окно ожидания listen_start после abort в тестах (настоящие секунды; в работе 1 с)
+
+
 def rig(specs=None, volume=40):
     clock = FakeClock()
     board = FakeBoard(clock)
     fac = FakeFactory(specs)
-    box = BoxPlayer(fac, volume=volume, frame_ms=FRAME_MS, clock=clock, sleep=clock.sleep)
+    box = BoxPlayer(fac, volume=volume, frame_ms=FRAME_MS, abort_grace_s=GRACE, clock=clock, sleep=clock.sleep)
     box.bind(board.send_text, board.send_bytes)
     return box, board, clock, fac
 
@@ -224,17 +227,80 @@ async def test_stop_when_nothing_playing_and_resume_without_point():
 
 # ------------------------------------------------------------------------------------------------ abort и обрыв
 
-async def test_abort_while_board_waits_after_turn_sends_music_stop():
+async def real_wait(cond, timeout=3.0):
+    """Реальное ожидание (окно после abort считается настоящими секундами, а не часами теста)."""
+    t = 0.0
+    while t < timeout:
+        if cond():
+            return True
+        await asyncio.sleep(0.01)
+        t += 0.01
+    return cond()
+
+
+async def test_abort_mid_turn_means_hush_not_stop_music_resumes_after_the_grace_window():
+    box, board, clock, fac = rig()
+    await play(box, make_queue(1, 30.0))
+    assert await settle(lambda: board.frames > 3)
+    box.begin_turn()  # слово «Джарвис» посреди музыки, потом короткое BOOT посреди ответа: abort
+    n = len(board.events)
+    assert await box.abort() == "grace"
+    assert len(board.events) == n and box.state == "playing" and box.board_on  # сразу ничего: ждём, не придёт ли listen_start
+    assert box.held and box.resume_point is None
+    assert await real_wait(lambda: board.jsons()[-1:] == [{"type": "music_resume"}])
+    assert "music_stop" not in board.types() and box.state == "playing"
+    frames = board.frames
+    assert await settle(lambda: board.frames > frames + 5)  # и музыка пошла дальше с того же места
+    assert board.pcm() == ramp(len(board.pcm()) / 2 / RATE)
+    await box.close()
+
+
+async def test_barge_in_abort_then_listen_start_sends_nothing_and_the_new_turn_ends_with_one_message():
+    box, board, clock, fac = rig()
+    await play(box, make_queue(1, 30.0))
+    assert await settle(lambda: board.frames > 3)
+    box.begin_turn()
+    n = len(board.events)
+    await box.abort()
+    box.begin_turn()  # сразу listen_start (слово посреди ответа): перебивание
+    await asyncio.sleep(GRACE * 4)
+    assert len(board.events) == n and box.held and box.in_turn  # окно прошло, а про музыку ни слова
+    await box.end_turn()
+    assert board.jsons()[-1] == {"type": "music_resume"} and len(board.events) == n + 1
+    await box.close()
+
+
+async def test_abort_mid_turn_keeps_what_the_turn_functions_decided():
+    # пауза, стоп и новый трек, сказанные в ходе, который прервали, всё равно выполняются
+    for intent, expect in (("pause", "music_pause"), ("stop", "music_stop")):
+        box, board, clock, _ = rig()
+        await play(box, make_queue(1, 30.0))
+        assert await settle(lambda: board.frames > 3)
+        box.begin_turn()
+        await (box.pause() if intent == "pause" else box.stop())
+        await box.abort()
+        assert await real_wait(lambda: board.jsons()[-1:] == [{"type": expect}]), (intent, board.types())
+        await box.close()
+    box, board, clock, fac = rig()
+    box.begin_turn()
+    await play(box, make_queue(1, 5.0, "z"))  # «включи X», потом BOOT посреди «Включаю, сэр»
+    assert await box.abort() == "grace"
+    assert board.types() == []
+    assert await real_wait(lambda: board.types()[:1] == ["music_start"])
+    assert await settle(lambda: board.frames > 3)
+    await box.close()
+
+
+async def test_abort_mid_turn_on_paused_music_keeps_it_paused():
     box, board, clock, _ = rig()
     await play(box, make_queue(1, 30.0))
     assert await settle(lambda: board.frames > 3)
-    box.begin_turn()  # слово «Джарвис» посреди музыки, потом BOOT: abort
-    sent = await box.abort()
-    assert sent is True and board.jsons()[-1] == {"type": "music_stop"}
-    assert box.state == "idle" and not box.board_on and box.resume_point is not None
-    # после abort ход кончается, но плата ничего больше не ждёт
-    await box.end_turn()
-    assert board.jsons()[-1] == {"type": "music_stop"} and board.types().count("music_resume") == 0
+    await box.pause()
+    box.begin_turn()
+    await box.abort()
+    assert await real_wait(lambda: board.jsons()[-2:] == [{"type": "music_pause"}, {"type": "music_pause"}])  # ход прошёл, пауза осталась
+    assert box.state == "paused"
+    await box.close()
 
 
 async def test_abort_during_pure_music_is_silent_stop_boot_already_handled_by_board():
@@ -242,20 +308,42 @@ async def test_abort_during_pure_music_is_silent_stop_boot_already_handled_by_bo
     await play(box, make_queue(1, 30.0))
     assert await settle(lambda: board.frames > 3)
     n = len(board.events)
-    sent = await box.abort()  # короткое нажатие BOOT посреди музыки: плата сама почистила буфер, серверу достаточно перестать
-    assert sent is False and box.state == "idle"
+    res = await box.abort()  # короткое нажатие BOOT посреди музыки: плата сама почистила буфер, серверу достаточно перестать
+    assert res == "stopped" and box.state == "idle" and not box.board_on
     await settle(lambda: False, 200)
     assert len(board.events) <= n + 1  # не больше одного кадра «в пути»; никаких music_*
     assert [t for t in board.types() if t.startswith("music_") and t != "music_start"] == []
     assert box.resume_point is not None
+    await asyncio.sleep(GRACE * 3)
+    assert [t for t in board.types() if t.startswith("music_")] == ["music_start"]  # и позже сами не заиграли
 
 
-async def test_abort_discards_pending_new_track_and_nothing_to_stop():
-    box, board, _, _ = rig()
+async def test_abort_during_pure_music_pause_also_stops():
+    box, board, clock, _ = rig()
+    await play(box, make_queue(1, 30.0))
+    assert await settle(lambda: board.frames > 3)
+    await box.pause()
+    assert await box.abort() == "stopped" and box.state == "idle" and box.resume_point is not None
+    assert board.jsons()[-1] == {"type": "music_pause"}  # новых сообщений плата не получила
+
+
+async def test_abort_with_nothing_playing_and_grace_cancelled_by_close_or_link_loss():
+    box, board, clock, _ = rig()
+    assert await box.abort() == "none" and board.events == []
     box.begin_turn()
-    await play(box, make_queue(1, 5.0))  # в ходе включили, музыка ждёт конца ответа
-    assert await box.abort() is False  # плата до этого не была в режиме музыки: сообщение не нужно
-    assert board.types() == [] and box.state == "idle" and box.pending is None
+    assert await box.abort() == "grace"  # ход без музыки: через окно end_turn ничего не пошлёт
+    await asyncio.sleep(GRACE * 3)
+    assert board.events == []
+    for how in ("close", "link_lost"):
+        box, board, clock, _ = rig()
+        await play(box, make_queue(1, 30.0))
+        assert await settle(lambda: board.frames > 3)
+        box.begin_turn()
+        await box.abort()
+        await (box.close() if how == "close" else box.link_lost())
+        n = len(board.events)
+        await asyncio.sleep(GRACE * 4)
+        assert len(board.events) == n and "music_resume" not in board.types()  # таймер отменён, ничего не воскресло
 
 
 async def test_link_lost_stops_stream_remembers_place_and_nothing_restarts_by_itself():

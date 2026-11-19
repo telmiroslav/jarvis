@@ -18,4 +18,6 @@ else
 fi
 command -v deno >/dev/null 2>&1 || warn "deno не найден: без него YouTube не откроется (sudo pacman -S deno)"
 command -v ffmpeg >/dev/null 2>&1 || warn "ffmpeg не найден: колонка не заиграет (sudo pacman -S ffmpeg)"
-say "Проверка программ для музыки: ./server/run.sh check-music"
+# то же, что install.sh печатает в итоге (проверка только ищет программы: без сети и без звука)
+printf '    %s\n' "${C_B}Музыка голосом:${C_0}"
+run_server_py jarvis_server check-music 2>&1 | sed 's/^/      /' || true

@@ -43,7 +43,7 @@ URL2 = "https://www.youtube.com/watch?v=DShMg5Z6C3E"
 class MusicRig:
     def __init__(self, tmp_path: Path | None = None, *, specs: dict[str, TrackSpec] | None = None, mpv: bool = True, ytdlp: bool = True,
                  ffmpeg: bool = True, search: str | None = CUPSIZE, settings: dict | None = None, polls_to_start: int = 1,
-                 mpv_kw: dict | None = None):
+                 mpv_kw: dict | None = None, search_factory=None):
         self.tmp = tmp_path or Path(tempfile.mkdtemp(prefix="jvr"))
         self._sock_dir = tempfile.mkdtemp(prefix="jvs")
         self.clock = FakeClock()
@@ -56,14 +56,15 @@ class MusicRig:
         if search is not None:
             self.runner.on(["--flat-playlist"], stdout=search)
         self.spawner = MpvSpawner(polls_to_start=polls_to_start, **(mpv_kw or {}))
-        self.box = BoxPlayer(self.fac, volume=40, frame_ms=FRAME_MS, clock=self.clock, sleep=self.clock.sleep)
+        self.box = BoxPlayer(self.fac, volume=40, frame_ms=FRAME_MS, abort_grace_s=0.1, clock=self.clock, sleep=self.clock.sleep)
         self.laptop = LaptopPlayer(self.tb, socket_path=os.path.join(self._sock_dir, "mpv.sock"), spawn=self.spawner, clock=self.clock,
                                    sleep=self.clock.sleep)
         self.local = LocalFinder(environ={}, home=self.tmp / "home")
-        self.settings = make_settings(music=True, **(settings or {}))
+        # запуск потока по поиску параллельно с поиском в тестах выключен, пока тест сам не включит его (settings + search_factory)
+        self.settings = make_settings(music=True, **{"music_speculative": False, **(settings or {})})
         self.registry = build_default_registry()
         self.svc = register_music_tools(self.registry, self.settings, tb=self.tb, runner=self.runner, box=self.box, laptop=self.laptop,
-                                        local=self.local, clock=self.clock)
+                                        local=self.local, search_factory=search_factory, clock=self.clock)
 
     async def call(self, tool: str, /, **args):
         return await self.registry.call(tool, args)

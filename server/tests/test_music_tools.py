@@ -11,7 +11,7 @@ from jarvis_server.skills.music import check_music, register_music_tools
 from jarvis_server.skills.music.prompt import MUSIC_PROMPT
 
 from conftest import make_settings
-from music_fakes import FakeBoard, TrackSpec, settle
+from music_fakes import FakeBoard, FakeSearchFactory, TrackSpec, settle
 from music_rig import CUPSIZE, URL1, URL2, MusicRig, yt_results
 
 TOOLS = ["play_music", "music_control"]
@@ -40,6 +40,7 @@ def test_settings_switch_defaults_and_proxy():
     assert s.music is False and s.music_proxy == "socks5://127.0.0.1:1080" and s.music_volume == 100
     assert s.music_dirs == ("/a", "/b/c") and s.music_start_timeout_s == 5.0  # слишком малое время поднимается
     assert load_settings({"JARVIS_MUSIC_VOLUME": "-5"}).music_volume == 0
+    assert load_settings({}).music_speculative is True and load_settings({"JARVIS_MUSIC_SPECULATIVE": "0"}).music_speculative is False
     assert "музыка=выкл" in load_settings({"JARVIS_MUSIC": "0"}).describe() and "музыка=вкл" in load_settings({}).describe()
 
 
@@ -320,6 +321,129 @@ async def test_local_not_found_and_ambiguous(tmp_path):
         res = await r.call("play_music", query="танцы", source="local")
         assert res["ok"] is False and res["error"] == "ambiguous" and len(res["candidates"]) == 2
         assert "Спроси" in res["message"] and r.box.pending is None and r.fac.calls == []
+    finally:
+        r.close()
+
+
+# ------------------------------------------------------------------------------------------------ поток по поиску параллельно с поиском
+
+def spec_rig(tmp_path, spec_factory, **kw):
+    return MusicRig(tmp_path, settings={"music_speculative": True}, search_factory=spec_factory, **kw)
+
+
+async def test_stream_started_in_parallel_with_search_is_used_when_it_took_the_same_video(tmp_path):
+    spec = FakeSearchFactory(video_id="LHiSYbn2pUU")  # yt-dlp ytsearch1: взял тот же первый ролик, что выберет наш выбор
+    r = spec_rig(tmp_path, spec)
+    try:
+        board = await with_board(r)
+        r.svc.turn_started()  # функцию вызывает ИИ посреди хода: музыка ждёт конца ответа (pending)
+        res = await r.call("play_music", query="Capsize Ты любишь танцевать")
+        assert res["ok"] is True and res["playing"] == "CUPSIZE — ты любишь танцевать"
+        assert spec.queries == ["Capsize Ты любишь танцевать"]  # стартовал по тому же запросу, что и поиск
+        assert r.runner.calls and r.fac.calls == []  # второй раз ролик не разбирали: звук идёт из потока по поиску
+        assert r.box.pending is not None and r.box.pending.cur.src is spec.sources[0] and not spec.sources[0].closed
+        await r.svc.turn_finished()
+        assert await settle(lambda: board.frames > 3)
+        await r.box.close()
+    finally:
+        r.close()
+
+
+async def test_stream_by_search_for_another_video_is_closed_and_the_chosen_one_is_opened_normally(tmp_path):
+    spec = FakeSearchFactory(video_id="zzzzzzzzzzz")
+    r = spec_rig(tmp_path, spec)
+    try:
+        await with_board(r)
+        res = await r.call("play_music", query="Capsize Ты любишь танцевать")
+        assert res["ok"] is True and spec.sources[0].closed
+        assert r.fac.calls == [(URL1, 0.0)]
+    finally:
+        r.close()
+    spec = FakeSearchFactory(video_id=None)  # yt-dlp так и не сказал, какой ролик (завис, упал): тоже обычный путь
+    r = spec_rig(tmp_path, spec)
+    try:
+        await with_board(r)
+        res = await r.call("play_music", query="Capsize Ты любишь танцевать")
+        assert res["ok"] is True and spec.sources[0].closed and r.fac.calls == [(URL1, 0.0)]
+    finally:
+        r.close()
+
+
+async def test_matched_stream_without_sound_does_not_make_the_track_unavailable(tmp_path):
+    spec = FakeSearchFactory(video_id="LHiSYbn2pUU", error="ERROR: some ytsearch1 quirk")
+    r = spec_rig(tmp_path, spec)
+    try:
+        await with_board(r)
+        res = await r.call("play_music", query="Capsize Ты любишь танцевать")
+        assert res["ok"] is True and res["playing"] == "CUPSIZE — ты любишь танцевать"  # тот же трек обычным путём
+        assert spec.sources[0].closed and r.fac.calls == [(URL1, 0.0)]
+    finally:
+        r.close()
+
+
+async def test_stream_by_search_is_only_for_youtube_on_the_speaker(tmp_path):
+    spec = FakeSearchFactory()
+    r = spec_rig(tmp_path, spec)
+    try:
+        await with_board(r)
+        await r.call("play_music", query="Capsize", where="laptop")
+        await r.call("play_music", query="Capsize", source="soundcloud")
+        assert spec.queries == []
+    finally:
+        r.close()
+    r = MusicRig(tmp_path, settings={"music_speculative": False}, search_factory=spec)  # выключатель JARVIS_MUSIC_SPECULATIVE=0
+    try:
+        await with_board(r)
+        res = await r.call("play_music", query="Capsize")
+        assert res["ok"] is True and spec.queries == []
+    finally:
+        r.close()
+    r = spec_rig(tmp_path, FakeSearchFactory(boom=True))  # запуск не получился: обычный путь, ошибки наружу нет
+    try:
+        await with_board(r)
+        res = await r.call("play_music", query="Capsize")
+        assert res["ok"] is True and r.fac.calls == [(URL1, 0.0)]
+    finally:
+        r.close()
+    r = spec_rig(tmp_path, FakeSearchFactory(), ffmpeg=False)  # без системного ffmpeg поток по поиску не годится (нужен конвейер ffmpeg)
+    try:
+        r.tb.have_pyav = lambda: True
+        await with_board(r)
+        assert await r.svc._start_speculative("x", "youtube", "box") is None
+    finally:
+        r.close()
+
+
+async def test_stream_by_search_is_closed_when_search_fails_or_the_call_is_cancelled(tmp_path):
+    spec = FakeSearchFactory()
+    r = spec_rig(tmp_path, spec, search="")
+    try:
+        await with_board(r)
+        res = await r.call("play_music", query="ничего такого")
+        assert res["ok"] is False and res["error"] == "not_found" and spec.sources[0].closed  # поиск пуст: параллельный поток закрыт
+    finally:
+        r.close()
+    stall = asyncio.Event()
+    spec = FakeSearchFactory(video_id="LHiSYbn2pUU")
+    r = spec_rig(tmp_path, spec, specs={URL1: TrackSpec(stall=stall)})
+    try:
+        await with_board(r)
+        r.fac.specs[URL1] = TrackSpec(stall=stall)
+        spec.sources.clear()
+
+        async def hanging(query):
+            src = await FakeSearchFactory(video_id="LHiSYbn2pUU").__call__(query)
+            src.stall = stall  # звука нет (реклама, сеть): функция ждёт
+            spec.sources.append(src)
+            return src
+
+        r.svc.search_factory = hanging
+        task = asyncio.ensure_future(r.call("play_music", query="Capsize Ты любишь танцевать"))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert spec.sources and all(src.closed for src in spec.sources) and r.box.pending is None
     finally:
         r.close()
 

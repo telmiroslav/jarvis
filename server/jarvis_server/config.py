@@ -154,6 +154,7 @@ class Settings:
     music_proxy: str = ""  # JARVIS_MUSIC_PROXY: прокси для yt-dlp и потока (http://host:port, socks5://host:port); пусто = как у процесса сервера
     music_volume: int = 40  # JARVIS_MUSIC_VOLUME: громкость музыки на колонке по умолчанию, 0..100 (громче слово слышно хуже)
     music_dirs: tuple[str, ...] = ()  # JARVIS_MUSIC_DIRS: свои каталоги для поиска файлов на ноутбуке (через «:»), ищутся первыми
+    music_speculative: bool = True  # JARVIS_MUSIC_SPECULATIVE: YouTube: поток первого результата запускается параллельно с поиском (быстрее на 2-3 с)
     music_start_timeout_s: float = 20.0  # JARVIS_MUSIC_START_TIMEOUT: сколько ждать, пока музыка реально пойдёт (поиск ~2 с, разбор YouTube ~4 с, у роликов с рекламой ещё её 5-20 с)
 
     def describe(self) -> str:
@@ -246,5 +247,6 @@ def load_settings(env_override: dict[str, str] | None = None, *, files: list[Pat
         music_proxy=(env.get("JARVIS_MUSIC_PROXY") or base.music_proxy).strip(),
         music_volume=min(100, max(0, _int(env, "JARVIS_MUSIC_VOLUME", base.music_volume))),
         music_dirs=tuple(x.strip() for x in (env.get("JARVIS_MUSIC_DIRS") or "").split(":") if x.strip()),
+        music_speculative=_bool(env, "JARVIS_MUSIC_SPECULATIVE", base.music_speculative),
         music_start_timeout_s=max(5.0, _float(env, "JARVIS_MUSIC_START_TIMEOUT", base.music_start_timeout_s)),
     )

@@ -344,7 +344,7 @@ async def test_volume_command_goes_to_board_at_once_music_continues_after_turn()
 
 # ------------------------------------------------------------------------------------------------ abort, обрыв, перебивание
 
-async def test_abort_during_answer_with_music_stops_it_and_resume_continues_from_place():
+async def test_abort_during_answer_with_music_is_hush_music_resumes_after_a_second():
     rig = MusicRig(specs=LONG)
     link = MusicLink()
     eng = make_engines(llm=ScriptedLLM(["Длинный ответ, сэр. " * 3]), tts=MockTTS(seconds_per_char=0.2, min_s=1.0))
@@ -354,19 +354,18 @@ async def test_abort_during_answer_with_music_stops_it_and_resume_continues_from
     link.valve.set()
     link.valve_after = None
     await say(sess)
-    assert await wait_for(lambda: link.audio_bytes() > 0 and any(o == 1920 for _, k, o in link.items if k == "bin"))
-    await sess.on_text('{"type":"abort"}')
+    assert await wait_for(lambda: any(o == 1920 for _, k, o in link.items if k == "bin"))
+    await sess.on_text('{"type":"abort"}')  # короткое BOOT посреди ответа: «замолчи», а не «выключи музыку»
     k = link.kinds()
-    assert k[-3:] == ["audio_end", "music_stop", "state:idle"], k  # music_stop до state idle
-    assert rig.box.state == "idle" and rig.box.resume_point is not None
-    n = len(link.items)
-    await asyncio.sleep(0.2)
-    assert len(link.items) == n  # ни музыки, ни голоса
+    assert k[-2:] == ["audio_end", "state:idle"], k  # сразу про музыку ни слова
     assert sess.state == "idle" and sess._turn is None
-    # «продолжи» включает с того места
-    res = await rig.call("music_control", action="resume")
-    assert res["ok"] is True and "с того места" in res["message"]
-    assert link.jsons()[-1]["type"] == "music_start" and rig.fac.calls[-1][1] > 0
+    assert rig.box.state == "playing" and rig.box.resume_point is None
+    assert await wait_for(lambda: "music_resume" in link.kinds())  # окно без listen_start прошло: музыка продолжается
+    k = link.kinds()
+    assert k[k.index("music_resume") - 1] == "state:idle" and "music_stop" not in k and k.count("music_resume") == 1
+    n = link.music_frames
+    assert await wait_for(lambda: link.music_frames > n + 20)
+    no_music_inside_voice(link)
     await rig.box.close()
     rig.close()
 
@@ -384,15 +383,21 @@ async def test_abort_during_pure_music_only_state_idle_board_stops_itself():
     await sess.on_text('{"type":"abort"}')  # короткое нажатие BOOT посреди музыки: плата сама почистила буфер
     assert link.types()[n_json:] == ["state:idle"] or link.types()[-1] == "state:idle"
     assert "music_stop" not in link.types() and rig.box.state == "idle"
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.2)
+    assert "music_resume" not in link.types()  # и без хода окно ожидания не воскрешает музыку
     frames = link.music_frames
     await asyncio.sleep(0.1)
     assert link.music_frames == frames  # кадров больше нет
+    # «продолжи» включает с того места
+    rig.clock.t += 10
+    res = await rig.call("music_control", action="resume")
+    assert res["ok"] is True and "с того места" in res["message"]
+    assert link.jsons()[-1]["type"] == "music_start" and rig.fac.calls[-1][1] > 0
     await rig.box.close()
     rig.close()
 
 
-async def test_barge_in_over_answer_abort_then_listen_start_does_not_leave_board_paused():
+async def test_barge_in_abort_then_listen_start_sends_nothing_about_music_until_the_new_turn_ends():
     rig = MusicRig(specs=LONG)
     link = MusicLink()
     eng = make_engines(llm=ScriptedLLM(["Длинный ответ, сэр. " * 3]), tts=MockTTS(seconds_per_char=0.2, min_s=1.0))
@@ -406,9 +411,17 @@ async def test_barge_in_over_answer_abort_then_listen_start_does_not_leave_board
     await sess.on_text('{"type":"abort"}')
     await say(sess, mode="wake")  # abort, сразу listen_start(wake): слово посреди ответа
     assert await wait_for(lambda: link.kinds().count("state:thinking") == 2)  # вторая запись дошла до ответа
-    await sess.on_text('{"type":"abort"}')  # чтобы не ждать конца длинного ответа
+    await asyncio.sleep(0.4)  # окно ожидания (0,1 с в тестах) давно прошло: перебивание его отменило
     k = link.kinds()
-    assert k.count("music_stop") == 1 and "music_resume" not in k  # музыка остановлена один раз, плата не ждёт сообщения
+    assert "music_resume" not in k and "music_stop" not in k, k
+    music_before = link.music_frames
+    await asyncio.sleep(0.1)
+    assert link.music_frames == music_before  # плата всё ещё на паузе, кадров нет
+    await sess.on_text('{"type":"abort"}')  # второй ответ тоже прервали (чтобы не ждать): после окна музыка продолжится ОДИН раз
+    assert await wait_for(lambda: "music_resume" in link.kinds())
+    await asyncio.sleep(0.3)
+    k = link.kinds()
+    assert k.count("music_resume") == 1 and "music_stop" not in k
     await rig.box.close()
     rig.close()
 
@@ -516,7 +529,7 @@ async def test_laptop_music_started_in_turn_begins_quiet_then_swells():
     rig.close()
 
 
-async def test_abort_does_not_stop_laptop_music_but_restores_its_volume():
+async def test_abort_does_not_stop_laptop_music_and_restores_its_volume_after_the_grace_window():
     rig = MusicRig(specs=LONG)
     link = MusicLink()
     eng = make_engines(llm=ScriptedLLM(["Длинный ответ, сэр. " * 3]), tts=MockTTS(seconds_per_char=0.2, min_s=1.0))
@@ -524,11 +537,36 @@ async def test_abort_does_not_stop_laptop_music_but_restores_its_volume():
     sess = Session(link, eng, make_settings(), ConversationMemory(10, 600))
     await hello(sess)
     await rig.svc.play("Capsize", where="laptop")
+    proc = rig.spawner.procs[0]
+    await say(sess)
+    assert await wait_for(lambda: any(o == 1920 for _, k, o in link.items if k == "bin"))
+    assert proc.props["volume"] == 30
+    await sess.on_text('{"type":"abort"}')
+    assert proc.props["volume"] == 30  # сразу не возвращаем: вдруг следом перебивание словом
+    assert await wait_for(lambda: proc.props["volume"] == 100)
+    assert rig.laptop.state == "playing" and "music_stop" not in link.types()
+    await rig.laptop.close()
+    rig.close()
+
+
+async def test_laptop_stays_ducked_when_abort_is_followed_by_listen_start():
+    rig = MusicRig(specs=LONG)
+    link = MusicLink()
+    eng = make_engines(llm=ScriptedLLM(["Длинный ответ, сэр. " * 3]), tts=MockTTS(seconds_per_char=0.2, min_s=1.0))
+    eng.tools = rig.registry
+    sess = Session(link, eng, make_settings(), ConversationMemory(10, 600))
+    await hello(sess)
+    await rig.svc.play("Capsize", where="laptop")
+    proc = rig.spawner.procs[0]
     await say(sess)
     assert await wait_for(lambda: any(o == 1920 for _, k, o in link.items if k == "bin"))
     await sess.on_text('{"type":"abort"}')
-    assert await wait_for(lambda: rig.spawner.procs[0].props["volume"] == 100)
-    assert rig.laptop.state == "playing" and "music_stop" not in link.types()
+    await say(sess, mode="wake")  # перебивание: громкость остаётся приглушённой, пока говорит человек и отвечает ИИ
+    assert await wait_for(lambda: link.kinds().count("state:thinking") == 2)
+    await asyncio.sleep(0.4)
+    assert proc.props["volume"] == 30 and proc.sets("volume") == [30]  # ни разу не поднимали
+    await sess.on_text('{"type":"abort"}')
+    assert await wait_for(lambda: proc.props["volume"] == 100)
     await rig.laptop.close()
     rig.close()
 

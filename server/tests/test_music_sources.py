@@ -14,7 +14,8 @@ import pytest
 
 from jarvis_server.skills.music.env import Toolbox
 from jarvis_server.skills.music.model import RATE, MusicError, Track
-from jarvis_server.skills.music.sources import AvSource, explain_failure, ffmpeg_argv, open_source, ytdlp_stream_argv
+from jarvis_server.skills.music.sources import (AvSource, explain_failure, ffmpeg_argv, open_search_source, open_source,
+                                                ytdlp_stream_argv)
 
 HAVE_FFMPEG = shutil.which("ffmpeg") is not None
 needs_ffmpeg = pytest.mark.skipif(not HAVE_FFMPEG, reason="нет ffmpeg")
@@ -37,10 +38,15 @@ def fake_ytdlp(bindir, wav, *, mode="ok", pidfile=None):
     f.write_text(f"""#!{sys.executable}
 import os, subprocess, sys, time
 mode = {mode!r}
-sys.stderr.write("[youtube] Extracting URL: " + sys.argv[-1] + "\\n")
+if sys.argv[-1].startswith("ytsearch1:"):  # поиск: сначала результат поиска, потом разбор ролика (как настоящий yt-dlp)
+    sys.stderr.write("[youtube:search] Extracting URL: " + sys.argv[-1] + "\\n[download] Downloading item 1 of 1\\n")
+    sys.stderr.write("[youtube] Extracting URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ\\n[youtube] dQw4w9WgXcQ: Downloading webpage\\n")
+else:
+    sys.stderr.write("[youtube] Extracting URL: " + sys.argv[-1] + "\\n")
 data = open({str(wav)!r}, "rb").read()
 if {str(pidfile)!r} != "None":
     open({str(pidfile)!r}, "w").write(str(os.getpid()))
+    open({str(pidfile)!r} + ".argv", "w").write(chr(10).join(sys.argv))
 if mode == "ok":
     sys.stdout.buffer.write(data)
 elif mode == "die":
@@ -318,3 +324,33 @@ async def test_box_player_restarts_real_stream_from_position_after_midway_failur
     assert abs(got - 3.0) < 0.25, got  # с перемоткой на позицию обрыва ровно трек; без неё было бы около 4,5 с
     assert (tmp_path / "pid.once").exists()
     await box.close()
+
+
+@needs_ffmpeg
+async def test_stream_by_search_runs_ytsearch1_and_reports_which_video_yt_dlp_took(tmp_path):
+    wav = make_wav(tmp_path / "s.wav", 2.0)
+    fake_ytdlp(tmp_path / "bin", wav, pidfile=tmp_path / "pid")
+    tb = tb_for(tmp_path / "bin")
+    src = await open_search_source(tb, "Capsize Ты любишь танцевать")
+    assert await src.wait_video_id(5.0) == "dQw4w9WgXcQ"  # id из сообщений yt-dlp, ещё до звука
+    data = await read_all(src)
+    assert abs(len(data) / 2 / RATE - 2.0) < 0.1 and src.clean_end is True
+    argv = (tmp_path / "pid.argv").read_text().split("\n")
+    assert argv[-1] == "ytsearch1:Capsize Ты любишь танцевать" and argv[argv.index("-o") + 1] == "-" and "--no-playlist" not in argv
+    await src.aclose()
+
+
+@needs_ffmpeg
+async def test_wait_video_id_gives_up_when_yt_dlp_dies_or_is_silent(tmp_path):
+    wav = make_wav(tmp_path / "s.wav", 1.0)
+    fake_ytdlp(tmp_path / "bin", wav, mode="error")
+    src = await open_source(tb_for(tmp_path / "bin"), Track("п", "https://soundcloud.com/a/b", "soundcloud"))
+    t0 = time.monotonic()
+    assert await src.wait_video_id(5.0) is None and time.monotonic() - t0 < 3  # упал: не ждём весь таймаут
+    await src.aclose()
+
+
+async def test_stream_by_search_needs_system_ffmpeg_and_ytdlp(tmp_path):
+    tb = tb_for(tmp_path / "bin", ffmpeg=False)
+    with pytest.raises(MusicError):
+        await open_search_source(tb, "x")
