@@ -16,6 +16,7 @@ SERVER_TOKEN = "JARVIS_SERVER"
 
 MIC_RATE = 16000  # плата -> сервер
 TTS_RATE = 24000  # сервер -> плата
+MUSIC_RATE = 24000  # музыка на колонку (§10): тот же формат, что голос
 
 STATES = ("thinking", "speaking", "idle", "error")
 
@@ -117,6 +118,45 @@ def audio_end() -> str:
 
 def pong() -> str:
     return dumps({"type": "pong"})
+
+
+# --- музыка на колонке (PROTOCOL §10, плата v0.6.0) ---
+MUSIC_CAP = "music"  # hello.caps: плата умеет играть музыку
+
+
+def parse_caps(raw: Any) -> frozenset[str]:
+    """hello.caps -> множество возможностей платы. Нет поля или оно кривое = ничего (прошивки до v0.6.0 музыку не умеют)."""
+    if not isinstance(raw, (list, tuple)):
+        return frozenset()
+    return frozenset(c.strip().lower() for c in raw if isinstance(c, str) and c.strip())
+
+
+def music_start(volume: int, title: str, rate: int = MUSIC_RATE) -> str:
+    return dumps({"type": "music_start", "rate": rate, "volume": int(volume), "title": title})
+
+
+def music_title(title: str) -> str:
+    return dumps({"type": "music_title", "title": title})
+
+
+def music_pause() -> str:
+    return dumps({"type": "music_pause"})
+
+
+def music_resume() -> str:
+    return dumps({"type": "music_resume"})
+
+
+def music_volume(volume: int) -> str:
+    return dumps({"type": "music_volume", "volume": int(volume)})
+
+
+def music_stop() -> str:
+    return dumps({"type": "music_stop"})
+
+
+def music_end() -> str:
+    return dumps({"type": "music_end"})
 
 
 def parse_listen_mode(raw: Any) -> tuple[str, bool]:

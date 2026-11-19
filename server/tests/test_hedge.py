@@ -373,9 +373,9 @@ async def test_session_primary_wins_hedge_primary_in_turn_line(link, caplog):
 
 
 def test_turn_line_llm_hedge_key_position():
-    # 0.3.2: llm_conn добавлен между llm_hedge и mode; mode по-прежнему последний ключ
-    assert TurnTiming().line().endswith(" llm_hedge=- llm_conn=- mode=ptt")
-    assert TurnTiming(llm_hedge="primary", mode="wake").line().endswith(" llm_hedge=primary llm_conn=- mode=wake")
+    # 0.3.2: llm_conn добавлен между llm_hedge и mode; 0.5.0: music между llm_conn и mode; mode по-прежнему последний ключ
+    assert TurnTiming().line().endswith(" llm_hedge=- llm_conn=- music=- mode=ptt")
+    assert TurnTiming(llm_hedge="primary", mode="wake").line().endswith(" llm_hedge=primary llm_conn=- music=- mode=wake")
     assert "llm_hedge=fallback" in TurnTiming(llm_hedge="fallback").line()
 
 

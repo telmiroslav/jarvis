@@ -15,3 +15,6 @@ scipy==1.17.1
 soundfile==0.14.0
 num2words==0.5.14
 huggingface-hub==1.33.0
+# Музыка: yt-dlp[default] (вместе с yt-dlp-ejs) здесь и в requirements.lock НАМЕРЕННО не указан. YouTube ломает старые версии каждые несколько
+# недель, поэтому его ставит и обновляет отдельно ./server/install.sh (при каждом запуске) и ./server/update_ytdlp.sh, а остальные библиотеки
+# стоят на проверенных версиях. Системные программы для музыки: sudo pacman -S ffmpeg deno mpv mpv-mpris (установщик предложит сам).

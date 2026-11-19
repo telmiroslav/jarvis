@@ -8,6 +8,7 @@
   fake_board.py q.wav --mode wake                  # как плата v0.4 после слова «Джарвис»: listen_start с mode=wake
   fake_board.py q.wav --mode follow                # продолжение разговора без слова: listen_start с mode=follow
   fake_board.py a.wav b.wav --abort-after-audio 2 --pause 0   # приблизительно barge-in: abort посреди ответа и сразу новая запись
+  fake_board.py include_music.wav --caps music --music-seconds 20   # плата v0.6.0: «включи музыку», потом 20 с принимать музыку (§10)
 
 Звук на этой машине не проигрывается: ответ только сохраняется в WAV (папка --out-dir).
 Код возврата: 0 ход завершён штатно, 3 сервер прислал state error, 2 нарушение протокола или тайм-аут.
@@ -88,6 +89,16 @@ class Recorder:
         self.error_msg: str | None = None
         self.user_text: str | None = None
         self.frames_after_end = 0
+        self.voice_open = False  # между audio_start и audio_end бинарные кадры это голос (PROTOCOL §10), иначе музыка, если режим включён
+        self.music_state = "off"  # off | on | paused
+        self.music_audio = bytearray()
+        self.music_frames = 0
+        self.music_first_t: float | None = None
+        self.music_paused_s = 0.0
+        self.music_pause_t: float | None = None
+        self.music_max_ahead = 0.0
+        self.music_titles: list[str] = []
+        self.music_done_due = False
 
     def t(self) -> float:
         return time.perf_counter() - self.t0
@@ -97,7 +108,46 @@ class Recorder:
         self.events.append(ev)
         print(f"{ev['t']:8.3f}s {direction} {json.dumps(obj, ensure_ascii=False)}", flush=True)
 
+    def on_music_frame(self, data: bytes) -> None:
+        now = self.t()
+        if self.music_first_t is None:
+            self.music_first_t = now
+        self.music_audio += data
+        self.music_frames += 1
+        got_s = len(self.music_audio) / 2 / 24000
+        paused = self.music_paused_s + (now - self.music_pause_t if self.music_pause_t is not None else 0.0)
+        self.music_max_ahead = max(self.music_max_ahead, got_s - (now - self.music_first_t - paused))
+
+    def on_music_json(self, obj: dict) -> None:
+        t, now = obj.get("type"), self.t()
+        if t == "music_start":
+            self.music_state, self.music_audio, self.music_frames = "on", bytearray(), 0
+            self.music_first_t, self.music_paused_s, self.music_pause_t = None, 0.0, None
+            self.music_titles.append(str(obj.get("title")))
+            if obj.get("rate") != 24000:
+                self.violations.append(f"music_start.rate = {obj.get('rate')}, плата принимает только 24000")
+        elif t == "music_title":
+            self.music_titles.append(str(obj.get("title")))
+        elif t == "music_pause":
+            self.music_state, self.music_pause_t = "paused", self.music_pause_t if self.music_pause_t is not None else now
+        elif t == "music_resume":
+            if self.music_pause_t is not None:
+                self.music_paused_s += now - self.music_pause_t
+            self.music_state, self.music_pause_t = "on", None
+        elif t == "music_stop":
+            self.music_state, self.music_pause_t = "off", None
+        elif t == "music_end":
+            self.music_done_due = True
+
+    def on_listen_start(self) -> None:
+        """Плата сама ставит музыку на паузу (буфер держит) и ждёт от сервера music_resume/pause/stop/start."""
+        if self.music_state == "on":
+            self.music_state, self.music_pause_t = "paused", self.t()
+
     def on_binary(self, data: bytes) -> None:
+        if not self.voice_open and self.music_state != "off":
+            self.on_music_frame(data)
+            return
         now = self.t()
         if self.audio_end_t is not None:
             self.frames_after_end += 1
@@ -114,6 +164,8 @@ class Recorder:
     def on_json(self, obj: dict) -> None:
         self.log("<-", obj)
         t = obj.get("type")
+        if isinstance(t, str) and t.startswith("music_"):
+            self.on_music_json(obj)
         if t == "state":
             self.states.append(obj.get("state"))
             if obj.get("state") == "error":
@@ -126,10 +178,12 @@ class Recorder:
         elif t == "audio_start":
             self.rate = int(obj.get("rate", 24000))
             self.audio_started = True
+            self.voice_open = True
             if self.rate != 24000:
                 self.violations.append(f"audio_start.rate = {self.rate}, плата принимает только 24000")
         elif t == "audio_end":
             self.audio_end_t = self.t()
+            self.voice_open = False
 
     def save_audio(self, path: Path) -> float:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -141,10 +195,38 @@ class Recorder:
         return len(self.audio) / 2 / self.rate
 
 
+async def answer_music_end(ws, rec: Recorder) -> None:
+    """music_end: плата доигрывает буфер музыки и шлёт music_done."""
+    if rec.music_done_due:
+        rec.music_done_due = False
+        rec.music_state = "off"
+        rec.log("->", {"type": "music_done"})
+        await ws.send(json.dumps({"type": "music_done"}))
+
+
+async def listen_music(ws, rec: Recorder, seconds: float) -> None:
+    """После последнего хода ещё seconds секунд принимать то, что шлёт сервер (музыка после ответа)."""
+    end = time.perf_counter() + seconds
+    while True:
+        left = end - time.perf_counter()
+        if left <= 0:
+            return
+        try:
+            msg = await asyncio.wait_for(ws.recv(), timeout=left)
+        except asyncio.TimeoutError:
+            return
+        if isinstance(msg, (bytes, bytearray)):
+            rec.on_binary(bytes(msg))
+            continue
+        rec.on_json(json.loads(msg))
+        await answer_music_end(ws, rec)
+
+
 async def run_turn(ws, rec: Recorder, pcm: np.ndarray, args, idx: int) -> int:
     chunk = int(MIC_RATE * args.chunk_ms / 1000)
     start = {"type": "listen_start", "mode": args.mode}
     rec.log("->", start)
+    rec.on_listen_start()
     await ws.send(json.dumps(start))
     t_send = time.perf_counter()
     n = 0
@@ -197,6 +279,7 @@ async def run_turn(ws, rec: Recorder, pcm: np.ndarray, args, idx: int) -> int:
             continue
         obj = json.loads(msg)
         rec.on_json(obj)
+        await answer_music_end(ws, rec)
         if obj.get("type") == "state" and obj.get("state") in ("idle", "error"):
             if obj["state"] == "error":
                 result = 3
@@ -219,6 +302,8 @@ async def main_async(args) -> int:
     async with websockets.connect(url, max_size=None, ping_interval=None) as ws:
         hello = {"type": "hello", "proto": 1, "fw": "fake-board", "mac": "00:00:00:00:00:01",
                  "mic_rate": MIC_RATE, "spk_rate": 24000}
+        if args.caps:
+            hello["caps"] = [c.strip() for c in args.caps.split(",") if c.strip()]
         rec.log("->", hello)
         await ws.send(json.dumps(hello))
         w = json.loads(await asyncio.wait_for(ws.recv(), 5))
@@ -235,6 +320,9 @@ async def main_async(args) -> int:
             print(f"\n=== ход {i + 1}: {wav} ({len(pcm) / MIC_RATE:.1f} с) ===", flush=True)
             c = await run_turn(ws, rec, pcm, args, i)
             code = max(code, c)
+            if i == len(args.wav) - 1 and args.music_seconds > 0:
+                print(f"\n[музыка] слушаю ещё {args.music_seconds:g} с", flush=True)
+                await listen_music(ws, rec, args.music_seconds)
             out = Path(args.out_dir) / f"{args.name}_{i + 1}.wav"
             dur = rec.save_audio(out)
             report(rec, out, dur, args)
@@ -277,6 +365,20 @@ def report(rec: Recorder, out: Path, dur: float, args) -> None:
     if rec.texts and rec.texts[-1]["final"] is not True and rec.audio_end_t is not None and args.abort_after is None \
             and args.abort_after_audio is None:
         rec.violations.append("последний jarvis_text без final:true")
+    if rec.music_titles:
+        got = len(rec.music_audio) / 2 / 24000
+        print(f"музыка: {' | '.join(rec.music_titles)}; последний запуск: {got:.2f} с в {rec.music_frames} кадрах, состояние платы {rec.music_state}; "
+              f"максимальное опережение над часами {rec.music_max_ahead:.2f} с (по протоколу не больше 2)")
+        if rec.music_max_ahead > 2.0 + 0.15:
+            rec.violations.append(f"музыка: опережение {rec.music_max_ahead:.2f} с больше 2 с")
+        if rec.music_audio:
+            mpath = out.with_name(out.stem + "_music.wav")
+            with wave.open(str(mpath), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(24000)
+                w.writeframes(bytes(rec.music_audio))
+            print(f"музыка сохранена: {mpath}")
     if rec.error_msg:
         print(f"ОШИБКА от сервера: {rec.error_msg}")
     for v in rec.violations:
@@ -295,6 +397,8 @@ def main() -> int:
     ap.add_argument("--out-dir", default="fake_board_out", help="куда сохранять звук ответа")
     ap.add_argument("--name", default="reply", help="префикс имени файла ответа")
     ap.add_argument("--mode", default="ptt", help="значение listen_start.mode: ptt (кнопка), wake (слово «Джарвис») или follow (продолжение без слова)")
+    ap.add_argument("--caps", default="", help="возможности платы в hello.caps через запятую (music = плата v0.6.0 умеет музыку, PROTOCOL §10)")
+    ap.add_argument("--music-seconds", type=float, default=0.0, help="после последнего хода ещё столько секунд принимать музыку (сохраняется в WAV)")
     ap.add_argument("--chunk-ms", type=int, default=40)
     ap.add_argument("--fast", action="store_true", help="слать звук не по часам, а сразу")
     ap.add_argument("--tail-silence", type=float, default=0.3, help="секунд тишины перед listen_stop")

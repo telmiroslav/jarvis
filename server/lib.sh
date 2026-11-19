@@ -56,3 +56,16 @@ is_interactive() { [ "${ASSUME_YES:-0}" != "1" ] && [ -t 0 ]; }
 
 # Сервис запущен?
 service_active() { systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; }
+
+# Свежий yt-dlp для музыки. Намеренно вне requirements.lock: его ценность в свежести (YouTube ломает старые версии каждые несколько недель).
+# [default] ставит и yt-dlp-ejs (решатель JavaScript-задач YouTube, нужен вместе с deno). Обновляются только yt-dlp и yt-dlp-ejs: остальные
+# библиотеки (websockets и др.) остаются на проверенных версиях из requirements.lock. Сервер запускает yt-dlp заново на каждую просьбу
+# (и mpv тоже), поэтому перезапускать службу после обновления не нужно.
+update_ytdlp() {
+    local out
+    [ -x "$PY" ] || return 1
+    out="$(uv pip install --python "$PY" --upgrade-package yt-dlp --upgrade-package yt-dlp-ejs "yt-dlp[default]" 2>&1)" \
+        || { printf '%s\n' "$out" | tail -4 | sed 's/^/    /'; return 1; }
+}
+
+ytdlp_version() { "$VENV_DIR/bin/yt-dlp" --version 2>/dev/null || echo "версия неизвестна"; }
