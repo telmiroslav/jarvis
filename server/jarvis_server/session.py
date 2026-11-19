@@ -326,6 +326,7 @@ class Session:
     # ------------------------------------------------------------ конвейер ----
     async def _answer(self, user_text: str, tm: TurnTiming, ctx: _TurnCtx) -> None:
         ctx.user_text = user_text
+        self.eng.tools.begin_turn(user_text)  # управление ПК: подтверждение питания смотрит на слова этой реплики
         history = self.memory.history()
         stats = LLMStats()
         sent_q: asyncio.Queue[_Sentence | None] = asyncio.Queue()
