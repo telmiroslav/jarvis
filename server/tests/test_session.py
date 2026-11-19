@@ -65,7 +65,7 @@ async def test_hello_ping_unknown_and_bad_json(link):
     await sess.on_text("не json")
     await sess.on_text("[]")
     assert link.jsons() == [{"type": "welcome", "proto": 1, "server": __version__, "tts_rate": 24000}, {"type": "pong"}]
-    assert __version__ == "0.3.1"
+    assert __version__ == "0.3.2"
     assert sess.state == "idle"
 
 
@@ -557,6 +557,11 @@ def _turn_lines(caplog):
     return [r.getMessage() for r in caplog.records if r.getMessage().startswith("TURN ")]
 
 
+def asked_text(q: str) -> str:
+    """Что сказал человек: в follow (0.3.2) запрос к ИИ идёт со служебной подводкой, сама фраза стоит в конце: «Реплика: «...»»."""
+    return q.rsplit("Реплика: «", 1)[-1].removesuffix("»") if q.startswith("СЛУЖЕБНАЯ ПОДСКАЗКА") else q
+
+
 async def test_follow_mode_is_known_and_strips_address(link, caplog):
     import logging
 
@@ -614,7 +619,7 @@ async def test_follow_real_words_pass_even_single_ones(link, heard):
     sess, _ = new_session(link, llm=llm, stt=FakeSTT(heard, avg_logprob=-0.45, no_speech_prob=0.05))
     await say(sess, mode="follow")
     await finish(sess, link)
-    assert llm.asked == [heard] and link.audio_bytes() > 0
+    assert [asked_text(q) for q in llm.asked] == [heard] and link.audio_bytes() > 0
 
 
 async def test_follow_wake_only_is_silent_and_guard_only_applies_to_follow(link, caplog):
@@ -643,7 +648,7 @@ async def test_follow_guard_can_be_switched_off(link):
     sess, _ = new_session(link, llm=llm, stt=FakeSTT("угу", avg_logprob=-1.6, no_speech_prob=0.9), follow_guard=False)
     await say(sess, mode="follow")
     await finish(sess, link)
-    assert llm.asked == ["угу"]
+    assert [asked_text(q) for q in llm.asked] == ["угу"]
 
 
 async def test_follow_preroll_is_longer_than_ptt(link):

@@ -8,6 +8,12 @@ def _ms(v: float | None) -> str:
     return "-" if v is None else str(int(round(v)))
 
 
+def _slug(s: str) -> str:
+    """Причина молчания одним словом для строки TURN: буквы, цифры, «_»; не длиннее 40 символов."""
+    t = "".join(c if c.isalnum() else "_" for c in s.strip())
+    return "_".join(p for p in t.split("_") if p)[:40] or "-"
+
+
 @dataclass
 class TurnTiming:
     t_stop: float = 0.0  # когда пришёл listen_stop (perf_counter)
@@ -29,6 +35,8 @@ class TurnTiming:
     outcome: str = "ok"
     first_split: int = 0  # длина первого куска, если первое предложение разрезали (0 = не резали)
     llm_hedge: str = "-"  # запасной запрос к ИИ: "-" не запускали (или никто не ответил), "primary" запускали, но первой ответила основная модель, "fallback" первой ответила запасная
+    llm_conn: str = "-"  # соединение с Google у первого запроса хода: "new" (рукопожатие на пути хода) | "reused" | "-" неизвестно
+    why: str = ""  # причина молчания (outcome silent(...)): слова, которыми ИИ объяснил пометку [SILENT]
     mode: str = "ptt"  # listen_start.mode (ptt | wake | follow); в строке TURN всегда последний ключ
 
     def line(self) -> str:
@@ -40,5 +48,6 @@ class TurnTiming:
             f"audio_s={self.audio_s:.1f} | sentences={self.sentences} tts_ms={_ms(self.tts_ms_total)} tts_rtf={rtf} "
             f"underruns={self.underruns} max_gap_s={self.max_gap_s:.2f} chars={self.chars} "
             f"first_split={self.first_split or '-'} model={self.model or '-'} "
-            f"tools={','.join(self.tools) or '-'} llm_hedge={self.llm_hedge or '-'} mode={self.mode}"
+            f"tools={','.join(self.tools) or '-'} llm_hedge={self.llm_hedge or '-'}"
+            f"{' why=' + _slug(self.why) if self.why else ''} llm_conn={self.llm_conn or '-'} mode={self.mode}"
         )

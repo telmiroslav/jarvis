@@ -12,11 +12,12 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from . import __version__, protocol
+from .addressing import SilenceGate, follow_prompt, gate_stream, named_jarvis
 from .audio import float_to_pcm16
 from .config import Settings
 from .engines import Engines, is_fatal_gpu_error
 from .followguard import follow_reject_reason
-from .llm import FLUSH, LLMError, LLMStats, classify_exception
+from .llm import FLUSH, MSG_SAFETY, LLMError, LLMStats, classify_exception
 from .memory import ConversationMemory
 from .pacing import AudioPacer
 from .sentences import Chunk, SentenceSplitter, split_long
@@ -68,6 +69,8 @@ class _TurnCtx:
         self.error: LLMError | None = None
         self.user_text = ""  # распознанная фраза (для памяти разговора)
         self.cancelled = False  # ход отменяют (abort / новый listen_start / обрыв): плате больше ничего не отправлять
+        self.user_text_sent = True  # user_text (субтитр «Вы: ...») ушёл на плату; в follow с вопросом к ИИ он ждёт решения «отвечать/молчать»
+        self.silent: tuple[str, str] | None = None  # (вид, причина): follow, ИИ решил молчать; плате уйдёт только state idle
 
 
 class Session:
@@ -161,6 +164,17 @@ class Session:
         self._mode = mode
         self.state = "listening"
         log.debug("слушаю (mode=%s)", mode)
+        self._prewarm()
+
+    def _prewarm(self) -> None:
+        """Человек начал говорить: пока идёт запись и распознавание (секунды), соединение с Google прогревается, если живого нет."""
+        pw = getattr(self.eng.llm, "prewarm", None)
+        if pw is None or not self.s.llm_prewarm:
+            return
+        try:
+            pw()
+        except Exception as e:  # прогрев необязателен
+            log.debug("прогрев соединения с ИИ не запустился: %s", e)
 
     async def _listen_stop(self) -> None:
         if self.state != "listening":
@@ -254,8 +268,24 @@ class Session:
                 await self._send_state("idle")
                 return
             log.info("Вы (%s): %s", mode, text)
-            await self._send(protocol.user_text(text))
-            await self._answer(text, tm, ctx)
+            # follow: ИИ сам решает, к нему ли фраза (addressing.py), и пока решения нет, плате не уходит ничего, в том числе
+            # user_text. Если в фразе названо имя «Джарвис», обращение было: спрашивать нечего, ход как в 0.3.1
+            gated = mode == "follow" and self.s.follow_silence and not named_jarvis(res.text, text)
+            if not gated:
+                await self._send(protocol.user_text(text))
+            await self._answer(text, tm, ctx, gated=gated)
+            if gated and ctx.silent is None and ctx.error is not None and ctx.error.user_msg == MSG_SAFETY \
+                    and not ctx.user_text_sent:
+                ctx.silent, ctx.error = ("blocked", "ИИ отказался отвечать на запись без обращения"), None  # чужая болтовня, не ошибка
+            if ctx.silent is not None:
+                kind, why = ctx.silent
+                tm.outcome, tm.why = f"silent({kind})", why
+                log.info("follow: промолчал (%s): «%s»; причина: %s", kind, text, why or "-")
+                await self._send_state("idle")  # без user_text, jarvis_text и звука; окно follow на плате после этого не открывается
+                return
+            if gated and not ctx.user_text_sent:  # ИИ ничего не дал (ошибка, пустой ответ): «Вы: ...» всё равно покажем
+                ctx.user_text_sent = True
+                await self._send(protocol.user_text(text))
             if ctx.error is not None:
                 raise ctx.error
             await self._send_state("idle")
@@ -324,14 +354,17 @@ class Session:
             log.warning("не удалось сохранить запись: %s", e)
 
     # ------------------------------------------------------------ конвейер ----
-    async def _answer(self, user_text: str, tm: TurnTiming, ctx: _TurnCtx) -> None:
-        ctx.user_text = user_text
+    async def _answer(self, user_text: str, tm: TurnTiming, ctx: _TurnCtx, gated: bool = False) -> None:
+        ctx.user_text = user_text  # в память идёт сама фраза, без подводки follow
+        ctx.user_text_sent = not gated
         history = self.memory.history()
         stats = LLMStats()
+        gate = SilenceGate() if gated else None
+        llm_input = follow_prompt(user_text, history[-1].assistant if history else "") if gated else user_text
         sent_q: asyncio.Queue[_Sentence | None] = asyncio.Queue()
         audio_q: asyncio.Queue[_AudioItem | None] = asyncio.Queue(maxsize=1)
         first_word = asyncio.Event()  # первое слово ИИ пришло (или ИИ закончил): заглушка больше не нужна
-        filler = self.eng.filler if self.s.llm_filler_ms > 0 else None
+        filler = self.eng.filler if self.s.llm_filler_ms > 0 and not gated else None  # заглушка заговорила бы до решения «молчать»
 
         async def llm_stage() -> None:
             splitter = SentenceSplitter(self.s.first_chunk_max_chars, self.s.chunk_max_chars,
@@ -347,7 +380,13 @@ class Session:
 
             try:
                 async with asyncio.timeout(self.s.llm_total_timeout_s):
-                    async for item in self.eng.llm.stream(history, user_text, self.eng.tools, stats):
+                    src = self.eng.llm.stream(history, llm_input, self.eng.tools, stats)
+                    if gate is not None:
+                        src = gate_stream(src, gate)
+                    async for item in src:
+                        if not ctx.user_text_sent:  # решение «отвечать» принято: субтитр «Вы: ...» и дальше как обычно
+                            ctx.user_text_sent = True
+                            await self._send(protocol.user_text(user_text))
                         if item is FLUSH:
                             for c in splitter.flush_chunks():
                                 emit(c)
@@ -357,20 +396,28 @@ class Session:
                             first_word.set()
                         for c in splitter.feed_chunks(item):
                             emit(c)
+                if gate is not None and gate.silent:  # пометка [SILENT]: ничего не озвучиваем и не отправляем
+                    ctx.silent = ("not_addressed", gate.reason)
+                    if tm.llm_first_token_ms is None and gate.t_first is not None:
+                        tm.llm_first_token_ms = (gate.t_first - t0) * 1000
+                    return
                 tail = splitter.flush_chunks()
                 for i, c in enumerate(tail):
                     emit(c, last=(i == len(tail) - 1))
                 if tm.first_sentence_ms is None:
                     ctx.error = LLMError(MSG_NO_ANSWER, "ИИ вернул пустой текст")
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, LinkClosed):
                 raise
             except Exception as e:  # ошибка ИИ: озвучиваем то, что уже получено, потом покажем ошибку
                 ctx.error = classify_exception(e)
-                log.error("ИИ: %s", ctx.error.detail or ctx.error.user_msg)
+                # follow без обращения: отказ по безопасности на чужой болтовне не авария (дальше он станет молчанием)
+                log.log(logging.INFO if gated and ctx.error.user_msg == MSG_SAFETY else logging.ERROR, "ИИ: %s",
+                        ctx.error.detail or ctx.error.user_msg)
             finally:
                 tm.model = stats.model
                 tm.tools = list(stats.tool_calls)
                 tm.llm_hedge = stats.hedge
+                tm.llm_conn = stats.conn
                 first_word.set()
                 sent_q.put_nowait(None)
 

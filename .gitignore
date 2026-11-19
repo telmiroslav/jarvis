@@ -27,3 +27,4 @@ voice_lab/clone/out/
 .pytest_cache/
 fake_board_out/
 jarvis_voice*.zip
+.claude/

@@ -131,6 +131,12 @@ class Settings:
     follow_guard: bool = True
     follow_min_logprob: float = -1.1  # средняя уверенность Whisper (avg_logprob) ниже этого: скорее шум, принятый за слова
     follow_max_no_speech: float = 0.6  # вероятность «это не речь» (no_speech_prob) выше этого: тоже
+    # --- 0.3.2 (addressing.py, llmconn.py) ---
+    follow_silence: bool = True  # follow: ИИ сам решает, к нему ли фраза; не к нему = молча idle (0 = отвечать на всё, как в 0.3.1)
+    llm_keepalive_s: float = 120.0  # сколько держать простаивающее соединение с Google (httpx: 5 с); 0 = штатный клиент SDK, как в 0.3.1
+    llm_prewarm: bool = True  # на listen_start открыть соединение заранее, если живого нет (HEAD без ключа, квоту не тратит)
+    llm_http2: bool = False  # HTTP/2 к Google (нужен пакет h2, в requirements.lock его нет)
+    # --- конец 0.3.2 ---
     # подача звука
     frame_ms: int = 40
     pacing_burst_s: float = 0.5
@@ -146,7 +152,9 @@ class Settings:
         key = "задан" if self.api_key else "НЕ задан"
         hedge = f"{self.llm_hedge_ms}мс" if self.llm_hedge_ms else "выкл"
         return (
-            f"llm={self.llm}/{self.llm_backend}/{self.llm_model} хедж={hedge} ключ={key} stt={self.stt_model}/{self.stt_device}/"
+            f"llm={self.llm}/{self.llm_backend}/{self.llm_model} хедж={hedge} соединение={self.llm_keepalive_s:g}с"
+            f"{'+прогрев' if self.llm_prewarm else ''} молчание_follow={'вкл' if self.follow_silence else 'выкл'} ключ={key} "
+            f"stt={self.stt_model}/{self.stt_device}/"
             f"{self.stt_compute} подсказка_stt={self.stt_hotwords or '-'} tts={self.tts}/{self.tts_device}/{self.tts_dtype}/steps={self.tts_steps} "
             f"порты udp={self.discovery_port} ws={self.ws_port}"
         )
@@ -210,6 +218,12 @@ def load_settings(env_override: dict[str, str] | None = None, *, files: list[Pat
         follow_guard=_bool(env, "JARVIS_FOLLOW_GUARD", base.follow_guard),
         follow_min_logprob=_float(env, "JARVIS_FOLLOW_MIN_LOGPROB", base.follow_min_logprob),
         follow_max_no_speech=_float(env, "JARVIS_FOLLOW_MAX_NO_SPEECH", base.follow_max_no_speech),
+        # --- 0.3.2 ---
+        follow_silence=_bool(env, "JARVIS_FOLLOW_SILENCE", base.follow_silence),
+        llm_keepalive_s=max(0.0, _float(env, "JARVIS_LLM_KEEPALIVE_S", base.llm_keepalive_s)),
+        llm_prewarm=_bool(env, "JARVIS_LLM_PREWARM", base.llm_prewarm),
+        llm_http2=_bool(env, "JARVIS_LLM_HTTP2", base.llm_http2),
+        # --- конец 0.3.2 ---
         frame_ms=_int(env, "JARVIS_FRAME_MS", base.frame_ms),
         pacing_burst_s=_float(env, "JARVIS_PACING_BURST_S", base.pacing_burst_s),
         pacing_max_lead_s=_float(env, "JARVIS_PACING_MAX_LEAD_S", base.pacing_max_lead_s),

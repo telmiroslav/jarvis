@@ -13,6 +13,49 @@ from jarvis_server.stt import SttResult
 from jarvis_server.tts import MockTTS
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _no_internet():
+    """Страховка: тесты не выходят в интернет (настоящий Gemini не вызывать: квота чужая). Любое соединение и разрешение имени
+    с публичным адресом падает с понятной ошибкой; localhost и частные сети (поддельные серверы, UDP-ответчик) разрешены."""
+    import ipaddress
+    import socket
+
+    mp = pytest.MonkeyPatch()
+    real_connect, real_connect_ex, real_gai = socket.socket.connect, socket.socket.connect_ex, socket.getaddrinfo
+
+    def check(host):
+        if isinstance(host, bytes):
+            host = host.decode("ascii", "ignore")
+        if host in (None, "", "localhost"):
+            return
+        try:
+            ip = ipaddress.ip_address(str(host).split("%")[0])
+        except ValueError:
+            raise RuntimeError(f"тест пытается разрешить внешнее имя {host!r}: в тестах интернета нет") from None
+        if ip.is_global:
+            raise RuntimeError(f"тест пытается выйти в интернет ({host}): в тестах интернета нет")
+
+    def connect(self, address):
+        if self.family in (socket.AF_INET, socket.AF_INET6):
+            check(address[0])
+        return real_connect(self, address)
+
+    def connect_ex(self, address):
+        if self.family in (socket.AF_INET, socket.AF_INET6):
+            check(address[0])
+        return real_connect_ex(self, address)
+
+    def gai(host, *a, **kw):
+        check(host)
+        return real_gai(host, *a, **kw)
+
+    mp.setattr(socket.socket, "connect", connect)
+    mp.setattr(socket.socket, "connect_ex", connect_ex)
+    mp.setattr(socket, "getaddrinfo", gai)
+    yield
+    mp.undo()
+
+
 class FakeLink:
     """Плата с точки зрения сессии: записывает всё, что ей отправили (с временем)."""
 

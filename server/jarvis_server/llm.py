@@ -16,7 +16,9 @@ from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Protocol
 
+from .addressing import unwrap_follow
 from .config import Settings
+from .llmconn import CONN_SINK, ORIGINS, ConnTracker, build_async_client
 from .memory import Exchange
 from .persona import SYSTEM_PROMPT
 from .skills import ToolRegistry
@@ -57,6 +59,9 @@ class LLMStats:
     # запасной (хедж) запрос: "-" не запускали (или никто не ответил); "primary" запускали, но первой ответила основная
     # модель; "fallback" первой ответила запасная. model/backend/tool_calls всегда от той цепочки, что реально отвечала.
     hedge: str = "-"
+    # соединение первого запроса хода: "new" (рукопожатие TCP+TLS на пути хода), "reused" (держалось в пуле или прогрето на
+    # listen_start), "-" неизвестно (подделка, mock). Заполняет крючок ответа клиента httpx (llmconn.ConnTracker)
+    conn: str = "-"
 
 
 class LLM(Protocol):
@@ -146,6 +151,11 @@ class GeminiLLM:
         self._resolved: str | None = None  # какой бэкенд ответил (для auto)
         self._no_thinking: set[str] = set()
         self._reapers: set[asyncio.Task] = set()  # фоновая уборка проигравших цепочек хеджа
+        self._conn = ConnTracker()
+        self._http: Any = None  # общий клиент httpx с долгим keep-alive (llmconn.py); None = штатный клиент SDK, как в 0.3.1
+        self._base_url: str | None = None  # только для тестов: поддельный сервер на localhost вместо Google
+        self._prewarm_task: asyncio.Task | None = None
+        self._prewarm_failed = float("-inf")  # time.monotonic() последней неудачи прогрева
 
     # --- клиент и настройки запроса
     def _backend_order(self) -> list[str]:
@@ -163,12 +173,25 @@ class GeminiLLM:
             from google import genai
             from google.genai import types
 
-            opts = types.HttpOptions(timeout=int(self.s.llm_total_timeout_s * 1000))
+            kw: dict[str, Any] = {"timeout": int(self.s.llm_total_timeout_s * 1000)}
+            http = self._http_client()
+            if http is not None:  # свой клиент httpx вместо клиента SDK: соединение живёт llm_keepalive_s, а не 5 с
+                kw["httpx_async_client"] = http
+            if self._base_url:
+                kw["base_url"] = self._base_url
+            opts = types.HttpOptions(**kw)
             if backend == "vertex":
                 self._clients[backend] = genai.Client(vertexai=True, api_key=self.s.api_key, http_options=opts)
             else:
                 self._clients[backend] = genai.Client(api_key=self.s.api_key, http_options=opts)
         return self._clients[backend]
+
+    def _http_client(self) -> Any:
+        if self.s.llm_keepalive_s <= 0:
+            return None
+        if self._http is None:
+            self._http = build_async_client(self.s.llm_keepalive_s, self._conn, http2=self.s.llm_http2)
+        return self._http
 
     def _config(self, model: str, tools: ToolRegistry):
         from google.genai import types
@@ -389,6 +412,7 @@ class GeminiLLM:
         from google.genai import types
 
         stats.backend, stats.model = backend, model
+        CONN_SINK.set(stats)  # крючок ответа клиента httpx запишет сюда new/reused (только первый запрос хода)
         client = self._client(backend)
         contents = self._contents(history, user_text)
         t_req = time.perf_counter()
@@ -476,12 +500,63 @@ class GeminiLLM:
             t.cancel()
         if reapers:
             await asyncio.gather(*reapers, return_exceptions=True)
+        if self._prewarm_task is not None:
+            self._prewarm_task.cancel()
+            await asyncio.gather(self._prewarm_task, return_exceptions=True)
         for c in self._clients.values():
             try:
                 await c.aio.aclose()
             except Exception:
                 pass
         self._clients.clear()
+        if self._http is not None:  # SDK чужой клиент сам не закрывает
+            try:
+                await self._http.aclose()
+            except Exception:
+                pass
+            self._http = None
+
+    # --- прогрев соединения (listen_start): человек ещё говорит, а рукопожатие с Google уже идёт
+    def _pool_has_live_connection(self) -> bool | None:
+        """Есть ли в пуле простаивающее живое соединение (None: пул не разглядеть, внутренности httpx2 могли измениться)."""
+        try:
+            # при прокси из окружения (HTTPS_PROXY) запросы идут через mounts, а не через основной транспорт
+            transports = [self._http._transport, *self._http._mounts.values()]
+            return any(c.is_idle() and not c.has_expired() for t in transports if t is not None for c in t._pool.connections)
+        except Exception:
+            return None
+
+    def prewarm(self) -> None:
+        """Не ждёт и не бросает. Если живого соединения нет, открывает его запросом HEAD на корень хоста Google без ключа и тела:
+        квоту генерации это не тратит. Раньше первого обращения к ИИ (клиент ещё не создан) и без keep-alive ничего не делает."""
+        if self._http is None or not self.s.llm_prewarm or not self.s.api_key:
+            return
+        if self._prewarm_task is not None and not self._prewarm_task.done():
+            return
+        if time.monotonic() - self._prewarm_failed < 10.0:
+            return  # недавно не вышло (нет VPN): не долбим на каждом listen_start
+        live = self._pool_has_live_connection()
+        if live is None:  # не разглядеть: считаем живым, если ответ был недавно
+            live = time.monotonic() - self._conn.last_ok < 20.0
+        if live:
+            return
+        self._prewarm_task = asyncio.ensure_future(self._prewarm())
+
+    async def _prewarm(self) -> None:
+        CONN_SINK.set(None)
+        t0 = time.perf_counter()
+        url = self._base_url or ORIGINS.get(self._backend_order()[0], ORIGINS["gemini"])
+        try:
+            r = await self._http.head(url, timeout=8.0, follow_redirects=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._prewarm_failed = time.monotonic()
+            log.debug("ИИ: прогрев соединения не удался: %s", _short(f"{type(e).__name__}: {e}"))
+            return
+        lvl = logging.INFO if self._conn.last_conn == "new" else logging.DEBUG
+        log.log(lvl, "ИИ: соединение %s за %d мс (прогрев на listen_start, HTTP %d)",
+                "открыто" if self._conn.last_conn == "new" else "уже было", (time.perf_counter() - t0) * 1000, r.status_code)
 
     async def warmup(self) -> None:
         """Импорт SDK (тяжёлый, держит GIL) и первое соединение с Google делаем при старте, а не на первой фразе."""
@@ -566,6 +641,7 @@ def _adopt(dst: LLMStats, src: LLMStats) -> None:
     dst.first_token_s = src.first_token_s
     dst.tool_calls = list(src.tool_calls)
     dst.rounds = src.rounds
+    dst.conn = src.conn
 
 
 async def _reap(lane: _Lane) -> None:
@@ -593,6 +669,7 @@ class MockLLM:
     async def stream(self, history: list[Exchange], user_text: str, tools: ToolRegistry,
                      stats: LLMStats) -> AsyncIterator[Any]:
         stats.backend, stats.model, stats.rounds, stats.attempts = "mock", "mock", 1, 1
+        user_text = unwrap_follow(user_text)  # режим follow: подводка не для чтения вслух
         low = user_text.lower()
         t0 = time.perf_counter()
         await asyncio.sleep(self.first_delay)
