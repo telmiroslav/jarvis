@@ -46,7 +46,7 @@ async def serve_forever(settings) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="jarvis_server", description="Мозг Jarvis: сервер для платы ESP32-S3")
-    ap.add_argument("command", nargs="?", default="serve", choices=["serve", "selftest", "check-llm", "config"])
+    ap.add_argument("command", nargs="?", default="serve", choices=["serve", "selftest", "check-llm", "check-pc", "config"])
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
     # без полос загрузки в журнале (tqdm пишет в лог мусор из возвратов каретки)
@@ -68,6 +68,12 @@ def main(argv: list[str] | None = None) -> int:
         from .selftest import check_llm
 
         return asyncio.run(check_llm(settings))
+    if args.command == "check-pc":  # управление ноутбуком: сеанс Hyprland, программы, индекс приложений (без действий)
+        from .skills.pc import check_pc
+
+        logging.getLogger("jarvis").setLevel(logging.WARNING)  # в отчёте только итог, без строк журнала
+        print("\n".join(asyncio.run(check_pc(settings))))
+        return 0
     log.info("Jarvis server %s. %s", __version__, settings.describe())
     if settings.llm == "gemini" and not settings.api_key:
         log.warning("Ключ Gemini не задан (GEMINI_API_KEY): отвечать будет нечем. Задай его: ./server/set_key.sh")

@@ -357,6 +357,7 @@ class Session:
     async def _answer(self, user_text: str, tm: TurnTiming, ctx: _TurnCtx, gated: bool = False) -> None:
         ctx.user_text = user_text  # в память идёт сама фраза, без подводки follow
         ctx.user_text_sent = not gated
+        self.eng.tools.begin_turn(user_text)  # управление ПК: подтверждение питания смотрит на слова этой реплики
         history = self.memory.history()
         stats = LLMStats()
         gate = SilenceGate() if gated else None

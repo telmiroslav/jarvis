@@ -49,12 +49,54 @@ def schema_from_signature(func: Callable[..., Any]) -> dict[str, Any]:
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        # Наборы функций, которые бывают недоступны (управление ПК: нет сеанса Hyprland). Проверка дешёвая и без блокировок.
+        self._available: dict[str, Callable[[], bool]] = {}
+        self._instructions: list[tuple[str, Callable[[], bool] | None]] = []  # блоки для системной инструкции ИИ
+        self._turn_hooks: list[Callable[[str], None]] = []
 
-    def register(self, tool: Tool) -> Tool:
+    def register(self, tool: Tool, *, available: Callable[[], bool] | None = None) -> Tool:
+        """available: функция без аргументов; пока она возвращает False, функцию ИИ не показывают и вызвать нельзя."""
         if tool.name in self._tools:
             raise ValueError(f"умение {tool.name} уже зарегистрировано")
         self._tools[tool.name] = tool
+        if available is not None:
+            self._available[tool.name] = available
         return tool
+
+    def is_available(self, name: str) -> bool:
+        check = self._available.get(name)
+        if check is None:
+            return name in self._tools
+        try:
+            return name in self._tools and bool(check())
+        except Exception:  # сбой проверки = функции нет, но разговор не роняем
+            log.exception("проверка доступности функции %s упала", name)
+            return False
+
+    def add_instructions(self, text: str, available: Callable[[], bool] | None = None) -> None:
+        """Блок для системной инструкции ИИ (persona.system_prompt): включается, пока available() истинно."""
+        self._instructions.append((text, available))
+
+    def instructions(self) -> str:
+        out = []
+        for text, check in self._instructions:
+            try:
+                if check is None or check():
+                    out.append(text)
+            except Exception:
+                log.exception("проверка блока инструкции упала")
+        return "\n\n".join(out)
+
+    def on_turn(self, hook: Callable[[str], None]) -> None:
+        """hook(текст фразы пользователя) вызывается в начале каждого хода, до запроса к ИИ (подтверждения: умения pc)."""
+        self._turn_hooks.append(hook)
+
+    def begin_turn(self, user_text: str) -> None:
+        for hook in self._turn_hooks:
+            try:
+                hook(user_text)
+            except Exception:
+                log.exception("обработчик начала хода упал")
 
     def tool(self, name: str | None = None, description: str | None = None,
              parameters: dict[str, Any] | None = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -73,10 +115,11 @@ class ToolRegistry:
         return deco
 
     def names(self) -> list[str]:
-        return list(self._tools)
+        """Имена функций, которые сейчас видит ИИ (недоступные не входят)."""
+        return [n for n in self._tools if self.is_available(n)]
 
     def __len__(self) -> int:
-        return len(self._tools)
+        return len(self.names())
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
@@ -84,13 +127,16 @@ class ToolRegistry:
     def declarations(self) -> list[dict[str, Any]]:
         """Описания функций в нейтральном виде: [{name, description, parameters}]."""
         return [{"name": t.name, "description": t.description, "parameters": t.parameters}
-                for t in self._tools.values()]
+                for t in self._tools.values() if self.is_available(t.name)]
 
     async def call(self, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         tool = self._tools.get(name)
         if tool is None:
             log.warning("ИИ вызвал неизвестную функцию %s", name)
             return {"error": f"неизвестная функция {name}"}
+        if not self.is_available(name):
+            log.warning("ИИ вызвал функцию %s, которая сейчас недоступна", name)
+            return {"ok": False, "error": "unavailable", "message": "эта возможность сейчас недоступна"}
         args = dict(args or {})
         try:
             if inspect.iscoroutinefunction(tool.func):

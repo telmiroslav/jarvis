@@ -211,7 +211,12 @@ command -v uv >/dev/null 2>&1 || NEED_PKGS+=(uv)
 command -v git >/dev/null 2>&1 || NEED_PKGS+=(git)
 [ "${NEED_PY:-0}" = "1" ] && NEED_PKGS+=(python)
 HAVE_UFW=0; command -v ufw >/dev/null 2>&1 && HAVE_UFW=1
-if [ ${#NEED_PKGS[@]} -gt 0 ] || { [ "$NO_FIREWALL" != "1" ] && [ "$HAVE_UFW" = "1" ]; }; then
+# Управление ноутбуком голосом (Hyprland, шаг 6 плана). Всё необязательно: без этих программ сервер работает, просто чего-то не умеет.
+# hyprctl идёт с Hyprland, wpctl с wireplumber (громкость), playerctl нужен для музыки, brightnessctl для яркости экрана.
+have() { command -v "$1" >/dev/null 2>&1; }
+OPT_PKGS=()
+if have hyprctl && ! have playerctl; then OPT_PKGS+=(playerctl); fi
+if [ ${#NEED_PKGS[@]} -gt 0 ] || [ ${#OPT_PKGS[@]} -gt 0 ] || { [ "$NO_FIREWALL" != "1" ] && [ "$HAVE_UFW" = "1" ]; }; then
     say "Сейчас sudo попросит пароль от ноутбука. Его вводишь только ты, скрипт пароля не видит."
     $SUDO -v || die "Без sudo не получится поставить программы и открыть порты."
 fi
@@ -221,6 +226,21 @@ if [ ${#NEED_PKGS[@]} -gt 0 ]; then
     ok "Поставлено: ${NEED_PKGS[*]}"
 else
     ok "uv и git уже есть"
+fi
+if [ ${#OPT_PKGS[@]} -gt 0 ]; then
+    say "Для управления музыкой с ноутбука нужен playerctl (необязательно): sudo pacman -S --needed ${OPT_PKGS[*]}"
+    say "pacman спросит подтверждение; можно отказаться, остальное будет работать."
+    if $SUDO pacman -S --needed "${OPT_PKGS[@]}"; then
+        ok "Поставлено: ${OPT_PKGS[*]}"
+    else
+        warn "${OPT_PKGS[*]} не поставлен: музыкой голосом управлять не получится (поставить позже: sudo pacman -S --needed ${OPT_PKGS[*]})"
+    fi
+fi
+if have hyprctl; then
+    ok "Hyprland найден (hyprctl): Джарвис сможет управлять ноутбуком. wpctl (громкость): $(have wpctl && echo есть || echo НЕТ, пакет wireplumber)," \
+       "playerctl (музыка): $(have playerctl && echo есть || echo НЕТ), brightnessctl (яркость, необязательно): $(have brightnessctl && echo есть || echo нет)"
+else
+    say "hyprctl не найден: голосовое управление ноутбуком (Hyprland) работать не будет, всё остальное работает как обычно"
 fi
 if [ "$NO_FIREWALL" = "1" ]; then
     say "Брандмауэр: пропущен (--no-firewall)"
@@ -385,5 +405,15 @@ cat <<MSG
     Настройки (по желанию):                $ENV_FILE  и docs/SERVER.md
 
 MSG
+# Управление ноутбуком (Hyprland): проверка только читает каталог сеансов, версию hyprctl и список программ, ничего не выполняет.
+# Если установщик запущен не из сеанса Hyprland (например по ssh), здесь будет «сеанс не найден»: на работу службы это не влияет.
+PC_OUT="$(run_server_py jarvis_server check-pc 2>&1 || true)"
+if [ -n "$PC_OUT" ]; then
+    printf '    %s\n' "${C_B}Управление ноутбуком голосом (Hyprland):${C_0}"
+    printf '%s\n' "$PC_OUT" | sed 's/^/      /'
+    say "Выключить: JARVIS_PC_CONTROL=0 в $ENV_FILE и systemctl --user restart jarvis-server. Подробности: docs/SERVER.md"
+    have brightnessctl || say "Яркость экрана голосом (необязательно): sudo pacman -S brightnessctl"
+    echo
+fi
 if [ -z "$(env_get GEMINI_API_KEY)" ]; then warn "Ключ Gemini не задан: без него Джарвис не ответит. Выполни ./server/set_key.sh"; fi
 if ! have_voice; then warn "Образца голоса нет: ./server/install.sh --voice ~/Downloads/jarvis_voice.zip"; fi

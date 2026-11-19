@@ -1,4 +1,4 @@
-"""Встроенные умения. Сейчас одно: get_time. Новые (управление ПК, музыка, свет) добавляются сюда или в
+"""Встроенные умения: get_time. Управление ПК живёт в skills/pc/. Новые (музыка, свет) добавляются сюда или в
 отдельные модули и подключаются в build_default_registry()."""
 from __future__ import annotations
 
@@ -29,7 +29,9 @@ def get_time(timezone: str = "") -> dict:
     }
 
 
-def build_default_registry() -> ToolRegistry:
+def build_default_registry(settings=None) -> ToolRegistry:
+    """settings=None: только встроенные функции (так работают тесты и инструменты, чтобы не трогать рабочий стол).
+    С настройками подключается набор «pc» (управление ноутбуком), если он включён и есть Hyprland."""
     reg = ToolRegistry()
     reg.tool(
         name="get_time",
@@ -38,4 +40,8 @@ def build_default_registry() -> ToolRegistry:
         parameters={"type": "object", "properties": {"timezone": {
             "type": "string", "description": "необязательно: часовой пояс IANA, например Europe/Moscow или Asia/Tokyo"}}},
     )(get_time)
+    if settings is not None:
+        from .pc import register_pc_tools  # управление ПК: skills/pc/
+
+        register_pc_tools(reg, settings)
     return reg

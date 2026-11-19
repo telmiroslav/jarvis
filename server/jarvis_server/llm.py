@@ -20,7 +20,7 @@ from .addressing import unwrap_follow
 from .config import Settings
 from .llmconn import CONN_SINK, ORIGINS, ConnTracker, build_async_client
 from .memory import Exchange
-from .persona import SYSTEM_PROMPT
+from .persona import system_prompt
 from .skills import ToolRegistry
 
 log = logging.getLogger("jarvis.llm")
@@ -212,7 +212,7 @@ class GeminiLLM:
                 name=d["name"], description=d["description"],
                 **({"parameters_json_schema": d["parameters"]} if props else {})))
         return types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=system_prompt(tools),
             temperature=self.s.llm_temperature,
             max_output_tokens=self.s.llm_max_tokens,
             thinking_config=tc,

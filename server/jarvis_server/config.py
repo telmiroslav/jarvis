@@ -146,6 +146,9 @@ class Settings:
     save_utterances: bool = False
     log_level: str = "INFO"
     hf_offline: bool = True
+    # управление ноутбуком (skills/pc)
+    pc_control: bool = True  # JARVIS_PC_CONTROL: 0 = функции управления ПК не подключаются
+    pc_hypr_dialect: str = "auto"  # JARVIS_PC_HYPR_DIALECT: auto | lua | legacy (грамматика hyprctl dispatch)
 
     def describe(self) -> str:
         """Одна строка для лога, без секретов."""
@@ -231,4 +234,6 @@ def load_settings(env_override: dict[str, str] | None = None, *, files: list[Pat
         save_utterances=_bool(env, "JARVIS_SAVE_UTTERANCES", base.save_utterances),
         log_level=(env.get("JARVIS_LOG_LEVEL") or base.log_level).strip().upper(),
         hf_offline=_bool(env, "JARVIS_HF_OFFLINE", base.hf_offline),
+        pc_control=_bool(env, "JARVIS_PC_CONTROL", base.pc_control),
+        pc_hypr_dialect=(env.get("JARVIS_PC_HYPR_DIALECT") or base.pc_hypr_dialect).strip().lower(),
     )

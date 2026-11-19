@@ -118,7 +118,7 @@ def build_engines(settings: Settings, load: bool = True) -> Engines:
         stt = _MockSTT()
     else:
         stt = WhisperSTT(settings)
-    eng = Engines(stt=stt, tts=build_tts(settings), llm=build_llm(settings), tools=build_default_registry())
+    eng = Engines(stt=stt, tts=build_tts(settings), llm=build_llm(settings), tools=build_default_registry(settings))
     if load:
         t0 = time.perf_counter()
         eng.stt.load()

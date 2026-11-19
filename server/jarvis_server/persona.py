@@ -38,3 +38,10 @@ SYSTEM_PROMPT = """\
 
 Время и дату не угадывай: для них вызывай функцию get_time.
 """
+
+
+# --- наборы функций (skills/pc): их блок инструкции добавляется, только пока набор доступен ---
+def system_prompt(tools=None) -> str:
+    """SYSTEM_PROMPT плюс блоки инструкций подключённых наборов функций (registry.instructions())."""
+    extra = tools.instructions() if tools is not None and hasattr(tools, "instructions") else ""
+    return f"{SYSTEM_PROMPT}\n{extra}" if extra else SYSTEM_PROMPT
