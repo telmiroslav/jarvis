@@ -1,15 +1,18 @@
 """ИИ: Gemini (официальный SDK google-genai, потоковый ответ + вызов функций) и заглушка mock.
 
-stream() отдаёт кусочки текста (str) по мере генерации и маркер Flush перед вызовом функции (чтобы фразу
-«Сейчас посмотрю» можно было озвучить, пока функция выполняется). Цикл вызова функций ручной: так его можно
-в любой момент отменить, а подписи «мыслей» Gemini 3 (thought_signature) возвращаются обратно как есть.
+stream() отдаёт кусочки текста (str) по мере генерации, маркер FLUSH перед вызовом функции (чтобы фразу
+«Сейчас посмотрю» можно было озвучить, пока функция выполняется) и маркер RESET, когда ответ оборвался и запрашивается заново
+(markers.py). Цикл вызова функций ручной: так его можно в любой момент отменить, а подписи «мыслей» Gemini 3
+(thought_signature) возвращаются обратно как есть.
 
 Хедж (JARVIS_LLM_HEDGE_MS): если основная модель не дала первого куска за это время, тот же запрос параллельно уходит
 на следующую запасную; говорит та, что дала кусок первой, вторая отменяется. Подробности: GeminiLLM._hedged.
 
 История разговора (memory.py) хранит и вызовы функций прошлых ходов; в запрос они уходят настоящими function_call/function_response
 (GeminiLLM._contents), а не одним текстом: иначе модель видит свои «Открываю» без вызовов и сама перестаёт вызывать. Продолжение хода
-после выполненных функций переживает ошибку: функции повторно не вызываются (_Resume, GeminiLLM._chain).
+после выполненных функций переживает ошибку: функции повторно не вызываются (_Resume, GeminiLLM._chain). Ошибка посреди потока тоже
+переживается, пока плате ещё ничего не ушло: сессия сообщает, что она уже отправила (LLMStats.commit), а недосказанное
+выбрасывается маркером RESET.
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ from .addressing import unwrap_follow
 from .claims import call_ok
 from .config import Settings
 from .llmconn import CONN_SINK, ORIGINS, ConnTracker, build_async_client, http2_in_use
+from .markers import FLUSH, RESET  # noqa: F401  (FLUSH и RESET отдаёт stream; их же импортирует session)
 from .memory import Exchange, ToolCall
 from .persona import system_prompt
 from .skills import ToolRegistry
@@ -41,14 +45,6 @@ MAX_TOOL_ROUNDS = 4
 INJECTED_SIGNATURE = b"skip_thought_signature_validator"
 
 
-class _Flush:
-    def __repr__(self) -> str:
-        return "FLUSH"
-
-
-FLUSH = _Flush()
-
-
 class LLMError(Exception):
     """Ошибка ИИ с готовым коротким русским текстом для экрана платы."""
 
@@ -59,6 +55,22 @@ class LLMError(Exception):
         self.retryable = retryable  # можно пробовать другую модель, пока ничего не отдали
         self.kind = kind  # auth | quota | overload | network | model | other
         self.started = False  # уже что-то отдали или выполнили функцию: повторять нельзя
+
+
+@dataclass
+class Commit:
+    """Сколько предложений ответа сессия уже отдала плате (поставила в очередь озвучки): назад их не вернуть. Сессия зовёт mark() на
+    каждое такое предложение, а цепочка запросов (GeminiLLM._chain) по счётчику решает, можно ли после ошибки перезапросить ответ:
+    пока с последнего FLUSH плате ничего не ушло, недосказанный текст лежит только в буфере предложений сессии, и его выбрасывает
+    маркер RESET. Один объект на ход: он общий для всех цепочек хеджа (у каждой свой LLMStats, а объект тот же).
+
+    Генераторы тянут по одному элементу: когда цепочка читает счётчик, сессия уже обработала всё, что цепочка успела отдать
+    (в том числе через gate_stream), поэтому значение точное. Заглушку «Секунду, сэр.» сессия говорит сама, она сюда не попадает."""
+
+    n: int = 0
+
+    def mark(self) -> None:
+        self.n += 1
 
 
 @dataclass
@@ -78,6 +90,9 @@ class LLMStats:
     # соединение первого запроса хода: "new" (рукопожатие TCP+TLS на пути хода), "reused" (держалось в пуле или прогрето на
     # listen_start), "-" неизвестно (подделка, mock). Заполняет крючок ответа клиента httpx (llmconn.ConnTracker)
     conn: str = "-"
+    # что сессия уже отдала плате (см. Commit). None: потребитель этого не сообщает (проверки, подделки), тогда весь отданный
+    # текст считается ушедшим, как до 0.5.1. Общий объект: _adopt его не копирует
+    commit: Commit | None = None
 
 
 class LLM(Protocol):
@@ -281,9 +296,12 @@ class GeminiLLM:
         """Последовательные попытки: модели plan.models[start:], бэкенды, один быстрый повтор, запасные модели при ошибках
         до начала ответа. quiet: цепочка запасного (хедж) запроса, её ошибки не повод для тревоги (пишем в debug).
 
-        Ошибка после выполненных функций, пока текста после них не было (_Resume.resumable): функции повторно НЕ вызываются, продолжение
-        (те же contents с их результатами) повторяется той же моделью один раз, затем запасными моделями по plan; если упало всё,
-        озвучивается короткая честная фраза по результатам функций (fallback_phrase) вместо ошибки: человек не остаётся без ответа."""
+        Ошибка после выполненных функций, пока с последнего FLUSH плате ничего не ушло (_Resume.redoable): функции повторно НЕ вызываются,
+        продолжение (те же contents с их результатами) повторяется той же моделью один раз, затем запасными моделями по plan; если
+        упало всё, озвучивается короткая честная фраза по результатам функций (fallback_phrase) вместо ошибки: человек не остаётся
+        без ответа. Что «ушло плате», сообщает сессия (stats.commit): текст, который ИИ успел отдать, но сессия не довела до
+        предложения, никуда не ушёл, и перед повтором цепочка отдаёт RESET, чтобы сессия его выбросила. То же до всяких функций:
+        обрыв посреди потока, когда плате ещё ничего не ушло, это тот же перезапрос, что ошибка до первого слова."""
         models = plan.models
         lvl_warn = logging.DEBUG if quiet else logging.WARNING
         lvl_info = logging.DEBUG if quiet else logging.INFO
@@ -315,14 +333,22 @@ class GeminiLLM:
                     err.started = started or err.started
                     log.log(lvl_warn, "ИИ: ошибка (%s, %s, %s): %s", backend, model, err.kind,
                             _short(err.detail or err.user_msg))
-                    if err.started and not resume.resumable():
+                    if err.started and not resume.redoable(stats):
                         raise err from e
+                    if resume.text_after_flush:
+                        # поток оборвался на полуслове, но плате с последнего FLUSH ничего не ушло: недосказанное лежит только в буфере
+                        # сессии, пусть выбросит его, повтор начнёт с чистого листа
+                        resume.text_after_flush = False
+                        resume.spoke = stats.commit is not None and stats.commit.n > 0
+                        log.log(lvl_info, "ИИ: ответ оборвался на полуслове, плате ничего не ушло: выбрасываю недосказанное и повторяю")
+                        yield RESET
                     if err.kind == "auth" and bi + 1 < len(backends):
                         continue  # ключ может быть от другого бэкенда
                     break
             assert err is not None
             last = err
-            cont = resume.resumable()  # функции уже выполнены, текста после них не было: можно продолжать, а не начинать заново
+            # функции выполнены и плате после них ничего не ушло: продолжаем с их результатами, а не начинаем заново
+            cont = resume.contents is not None and resume.redoable(stats)
             if not err.retryable:
                 if cont:
                     break  # продолжать нечем: ниже честная фраза вместо ошибки
@@ -343,7 +369,7 @@ class GeminiLLM:
             if idx < len(models) and (plan.limit is None or idx < plan.limit):
                 log.log(lvl_info, "ИИ: пробую запасную модель %s%s", models[idx],
                         " (продолжение после выполненных функций)" if cont else "")
-        if resume.resumable():
+        if resume.contents is not None and resume.redoable(stats):
             phrase = fallback_phrase(stats.tool_records)
             log.log(lvl_warn, "ИИ: после выполненных функций ответ не получен (%s): озвучиваю короткую фразу по их результатам «%s»",
                     _short(last.detail or last.user_msg) if last is not None else "-", phrase)
@@ -367,12 +393,15 @@ class GeminiLLM:
         а FLUSH и выполнение функции — это уже следующий шаг генератора, который проигравшей никто не даст сделать.
         Цепочка, упавшая до первого куска, просто выбывает (её ошибка уходит в debug), пока жива другая. Когда
         упали обе, поднимается ошибка той, что упала последней. Победитель, упавший после первого куска, ведёт себя
-        как раньше: ошибка наружу (повторять поздно, плате уже что-то ушло). Исключение: победитель, взявший слово вызовом
-        функции и упавший после неё до всякого текста, продолжает сам (см. _chain), в том числе на запасных моделях: хедж к этому
-        времени закончен, ограничение plan.limit снимается."""
+        как раньше: ошибка наружу (повторять поздно, плате уже что-то ушло). Исключение: победитель, у которого плате ещё ничего
+        не ушло (после вызова функции до первого предложения; без функций до первого предложения; сессия сообщает это через
+        stats.commit), продолжает сам (см. _chain): отдаёт RESET и повторяет, в том числе на запасных моделях. Хедж к этому
+        времени закончен (проигравшая отменена, и ничего, кроме победителя, больше не читается), ограничение plan.limit снимается.
+        Функции при этом не выполняются дважды: пока цепочку не объявили победителем, из неё тянется один элемент, а FLUSH перед
+        функцией её собственный: с него, и только с него, ход «с первого запроса» уже не перезапустить (_Resume.fired)."""
         t0 = time.perf_counter()
         loop = asyncio.get_running_loop()
-        a = _Lane("primary", LLMStats(), t0)
+        a = _Lane("primary", LLMStats(commit=stats.commit), t0)
         a.gen = self._chain(plan, 0, history, user_text, tools, a.stats)
         lanes = [a]
         b: _Lane | None = None
@@ -394,7 +423,7 @@ class GeminiLLM:
                 can_hedge = False  # запасных за текущей моделью нет: хеджировать нечем
                 return False
             plan.limit = h
-            sb = LLMStats()
+            sb = LLMStats(commit=stats.commit)
             b = _Lane("fallback", sb, time.perf_counter())
             b.gen = self._chain(_Plan(plan.models), h, history, user_text, tools, sb, quiet=True)
             lanes.append(b)
@@ -595,7 +624,9 @@ class GeminiLLM:
                 return
             # ИИ просит выполнить функции: отдать накопленный текст озвучке, выполнить, вернуть результат
             resume.text_after_flush = False  # текст до вызова не в счёт: после результатов ИИ скажет итог, и его можно перезапросить
+            resume.fired = True
             yield FLUSH
+            resume.base = stats.commit.n if stats.commit is not None else 0  # сессия обработала FLUSH: всё сказанное до него ушло плате
             contents.append(types.Content(role="model", parts=parts_acc))
             resume.signer = (backend, model)
             results = await asyncio.gather(*(tools.call(fc.name, dict(fc.args or {})) for fc in calls))
@@ -767,12 +798,21 @@ class _Resume:
     contents: list[Any] | None = None  # contents с выполненными функциями и их результатами; None: функции в этом ходе ещё не вызывали
     next_round: int = 0  # с какого раунда цикла вызова функций продолжать
     signer: tuple[str, str] | None = None  # (бэкенд, модель), чьи подписи «мыслей» лежат в contents
-    spoke: bool = False  # хоть какой-то текст за ход уже отдан
-    text_after_flush: bool = False  # после последнего вызова функций уже пошёл текст: перезапрашивать поздно, он мог уйти на плату
+    spoke: bool = False  # хоть какой-то текст за ход уже отдан и не выброшен
+    text_after_flush: bool = False  # после последнего FLUSH (или с начала хода) отдан текст, а RESET его ещё не выбросил
+    fired: bool = False  # перед функциями был FLUSH: они уже могли выполниться, ход заново с первого запроса начинать нельзя
+    base: int = 0  # сколько предложений сессия отдала плате к последнему FLUSH (Commit.n)
 
-    def resumable(self) -> bool:
-        """Функции выполнены, а текста после них ещё не было: ошибку можно пережить, не вызывая функции повторно."""
-        return self.contents is not None and not self.text_after_flush
+    def redoable(self, stats: "LLMStats") -> bool:
+        """Ошибку можно пережить перезапросом, не повторяя необратимого. С потребителем, который сообщает, что ушло плате (stats.commit,
+        то есть сессия): пока с последнего FLUSH не ушло ни одного предложения, а функции не выполнялись (начинаем с первого запроса)
+        или выполнены, и их результаты у нас (продолжаем с ними). Без него весь отданный текст считается ушедшим: можно только
+        продолжение после выполненных функций, пока текста после них не было."""
+        if self.contents is None and self.fired:
+            return False  # функции запущены, а результатов нет: повторять нельзя
+        if stats.commit is None:
+            return self.contents is not None and not self.text_after_flush
+        return stats.commit.n <= self.base
 
 
 def _by_round(calls: list[ToolCall]) -> list[list[ToolCall]]:
@@ -824,9 +864,32 @@ def _resign(contents: list[Any]) -> list[Any]:
     return out
 
 
+# Фразы по коду ошибки функции (поле error в её ответе), когда ИИ не смог её озвучить. Коды: музыка (skills/music/model.py MusicError,
+# search.py classify_ytdlp_error), общие (skills/registry.py, skills/pc/tools.py). Остальные коды: «Не вышло, сэр.»
+ERROR_PHRASES: dict[str, str] = {
+    "blocked": "YouTube не пустил, сэр.",
+    "forbidden": "Сервис не отдал звук, сэр.",
+    "no_js_runtime": "YouTube сейчас не отдаёт звук, сэр.",
+    "rate_limited": "Слишком часто, сэр. Подождите немного.",
+    "network": "Нет связи с сервисом, сэр.",
+    "unavailable": "Недоступно, сэр.",
+    "not_found": "Ничего не нашёл, сэр.",
+    "timeout": "Не успело запуститься, сэр.",
+    "no_board": "Колонка не подключена, сэр.",
+    "nothing_playing": "Сейчас ничего не играет, сэр.",
+    "no_previous": "Это первый трек, сэр.",
+    "no_next": "Это последний трек, сэр.",
+    "no_mpv": "Нечем играть на ноутбуке, сэр.",
+    "no_ytdlp": "Нечем искать музыку, сэр.",
+    "no_ffmpeg": "Нечем раскодировать звук, сэр.",
+    "tool_missing": "На ноутбуке нет нужной программы, сэр.",
+}
+FALLBACK_FAILED = "Не вышло, сэр."
+
+
 def fallback_phrase(records: list[ToolCall]) -> str:
     """Короткая честная фраза по результатам функций, когда ИИ не смог их озвучить (ошибка после выполненных функций).
-    Смотрим на последний вызов: раньше ИИ мог исправляться повторами."""
+    Смотрим на последний вызов: раньше ИИ мог исправляться повторами. Неудача называется по коду ошибки (ERROR_PHRASES)."""
     res = records[-1].response if records else {}
     if not isinstance(res, dict):
         res = {}
@@ -836,7 +899,8 @@ def fallback_phrase(records: list[ToolCall]) -> str:
     if res.get("error") == "ambiguous" and isinstance(cand, list) and cand:
         return f"Подходит несколько вариантов: {', '.join(str(x) for x in cand[:3])}. Какой нужен, сэр?"
     if not call_ok(res):
-        return "Не вышло, сэр."
+        code = res.get("error")
+        return ERROR_PHRASES.get(code, FALLBACK_FAILED) if isinstance(code, str) else FALLBACK_FAILED
     if res.get("ok") is True:
         return "Готово, сэр."
     return "Не успел ответить, сэр. Спросите ещё раз."  # у функции нет поля ok (get_time): итог в двух словах не передать

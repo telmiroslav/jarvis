@@ -26,6 +26,7 @@ import re
 import time
 from typing import Any, AsyncIterator
 
+from .markers import RESET
 from .textnorm import mute_own_name
 
 MARKER = "[SILENT]"
@@ -136,6 +137,11 @@ class SilenceGate:
             return ""
         return self.release()
 
+    def reset(self) -> None:
+        """Ответ ИИ оборвался и запрашивается заново: начало прежнего ответа забыто, новый ответ разбирается с нуля."""
+        self._buf = self._raw_reason = ""
+        self.decided = self.silent = False
+
     def release(self) -> str:
         """ИИ делает что-то кроме текста (зовёт функцию) или поток кончился: это ответ, отдать буфер."""
         self.decided = True
@@ -173,6 +179,14 @@ async def gate_stream(src: AsyncIterator[Any], gate: SilenceGate, drain_s: float
                 if gate.silent:
                     break  # решение уже принято, причина необязательна
                 raise
+            if item is RESET:  # ответ оборвался, плате ничего не ушло: ИИ ответит заново, и решение «отвечать или молчать» тоже
+                if gate.silent:
+                    break  # решение «молчать» уже принято: повтор ради причины не нужен
+                held = not gate.decided  # начало ответа ещё у нас: сессии выбрасывать нечего
+                gate.reset()
+                if not held:
+                    yield item
+                continue
             if not isinstance(item, str):
                 out = gate.release()  # вызов функции: значит, ИИ отвечает
                 if out:
