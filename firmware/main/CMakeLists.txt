@@ -1,5 +1,7 @@
 idf_component_register(
     SRCS "main.cc"
+         "aec.cc"
+         "aec_logic.cc"
          "audio_in.cc"
          "audio_out.cc"
          "cmd_parse.cc"
@@ -14,6 +16,8 @@ idf_component_register(
          "link.cc"
          "link_logic.cc"
          "mic_stream.cc"
+         "music.cc"
+         "music_logic.cc"
          "mww.cc"
          "mww_core.cc"
          "mww_logic.cc"

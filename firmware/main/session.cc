@@ -9,6 +9,8 @@
 
 #include "audio_out.h"
 #include "mic_stream.h"
+#include "music.h"
+#include "music_logic.h"
 #include "playback.h"
 #include "subtitle.h"
 #include "text_util.h"
@@ -28,6 +30,8 @@ struct State {
     dialog::Dialog dlg;
     subtitle::Answer answer;
     uint32_t last_aborts = 0;
+    // v0.6.0: куда идут бинарные кадры (голос или музыка): по последнему управляющему сообщению сервера (music_logic.h)
+    music_logic::FrameRouter router;
 };
 
 State S;
@@ -49,11 +53,19 @@ void apply(const dialog::Out &o)
     if (o.stop_playback) {
         playback::abort();
     }
+    if (o.music_stop) {
+        // Короткое нажатие BOOT посреди музыки: стоп. Буфер выброшен сразу, режим выключен; abort серверу уйдёт ниже вместе с остальным
+        ESP_LOGI(TAG, "MUSIC: BOOT short press = stop (abort goes to the server)");
+        music::exit_mode("BOOT short press");
+    }
     if (o.clear_texts) {
         S.answer.reset();
         ui::clear_texts();
     }
     if (o.listen_start) {
+        // Слово «Джарвис» или зажатая BOOT посреди музыки: музыка сразу на паузу (буфер держим), abort не нужен (отменять нечего). Дальше плата
+        // музыку сама не продолжает: ждёт music_resume / music_pause / music_stop / music_start от сервера
+        music::pause_for_talk();
         // Запись микрофона готовим до сообщений серверу (звук пойдёт, как только link получит listen_start)
         if (o.listen_wake) {
             mic_stream::begin_capture_injected();   // звук подаёт wake.cc с точностью до отсчёта (без писка, с предзаписью)
@@ -69,7 +81,7 @@ void apply(const dialog::Out &o)
         link::send(msgs[i]);
         switch (msgs[i]) {
         case proto::OutMsg::Abort:
-            ESP_LOGI(TAG, "%s: abort", o.barge ? "BARGE-IN" : "PTT");
+            ESP_LOGI(TAG, "%s: abort", o.barge ? "BARGE-IN" : o.music_stop ? "MUSIC STOP" : "PTT");
             break;
         case proto::OutMsg::ListenStartFollow:
             ESP_LOGI(TAG, "FOLLOW: listening (voice without the word)");
@@ -125,6 +137,9 @@ void on_message(const proto::ServerMsg &m)
         break;
     case proto::Kind::AudioStart:
         ESP_LOGI(TAG, "server: audio_start rate=%d", m.rate);
+        // Дальше и до audio_end бинарные кадры это голос (даже если разговор его не примет: голос старого ответа не должен попасть в музыку)
+        S.router.on_audio_start();
+        music::pause_for_voice();   // голос важнее: музыка (если играла) на паузу; сервер так делать не должен, это страховка
         if (m.rate != 0 && m.rate != static_cast<int>(AudioOut::kSampleRate)) {
             ESP_LOGE(TAG, "the server sends audio at %d Hz, the board plays %u Hz only: ignoring the answer", m.rate,
                      static_cast<unsigned>(AudioOut::kSampleRate));
@@ -135,7 +150,44 @@ void on_message(const proto::ServerMsg &m)
         break;
     case proto::Kind::AudioEnd:
         ESP_LOGI(TAG, "server: audio_end");
+        S.router.on_audio_end();
         apply(S.dlg.on_audio_end(now));
+        break;
+    // ---- музыка (v0.6.0, docs/PROTOCOL.md, раздел 10)
+    case proto::Kind::MusicStart:
+        ESP_LOGI(TAG, "server: music_start rate=%d volume=%d", m.rate, m.volume);
+        if (m.rate != 0 && m.rate != static_cast<int>(AudioOut::kSampleRate)) {
+            ESP_LOGE(TAG, "the server sends music at %d Hz, the board plays %u Hz only: ignoring music_start (music frames will be dropped)", m.rate,
+                     static_cast<unsigned>(AudioOut::kSampleRate));
+        } else {
+            S.router.on_music_start();
+            music::on_start(m.volume, m.title);
+            if (S.dlg.phase() == dialog::Phase::Listening) {
+                music::pause_for_talk();   // человек сейчас говорит: музыка ждёт (звук в запись попал бы эхом)
+            }
+        }
+        break;
+    case proto::Kind::MusicTitle:
+        music::on_title(m.title);
+        break;
+    case proto::Kind::MusicPause:
+        music::on_pause();
+        break;
+    case proto::Kind::MusicResume:
+        ESP_LOGI(TAG, "server: music_resume");
+        music::on_resume();
+        if (S.dlg.phase() == dialog::Phase::Listening) {
+            music::pause_for_talk();   // продолжение пришло, пока человек говорит (сообщение разминулось с listen_start): ждём конца хода
+        }
+        break;
+    case proto::Kind::MusicVolume:
+        music::on_volume(m.volume < 0 ? music_logic::kVolumeDefault : m.volume);
+        break;
+    case proto::Kind::MusicStop:
+        music::on_stop();
+        break;
+    case proto::Kind::MusicEnd:
+        music::on_end();
         break;
     default:
         break;
@@ -147,13 +199,29 @@ void on_message(const proto::ServerMsg &m)
 
 void on_audio(const uint8_t *data, size_t len)
 {
-    bool accept;
+    // Куда кадр: по последнему управляющему сообщению сервера. Внутри audio_start...audio_end это голос (его принимает или выбрасывает разговор);
+    // иначе музыка, если режим включён; иначе кадр выбрасывается
+    music_logic::Route route;
+    bool accept = false;
     {
         std::lock_guard<std::mutex> lock(S.mu);
-        accept = S.dlg.on_audio_data(now_ms());
+        route = S.router.route(music::active());
+        if (route == music_logic::Route::Voice) {
+            accept = S.dlg.on_audio_data(now_ms());
+        }
     }
-    if (accept) {
-        playback::push_bytes(data, len);   // без замка разговора: запись в кольцо идёт под замком очереди
+    switch (route) {
+    case music_logic::Route::Voice:
+        if (accept) {
+            playback::push_bytes(data, len);   // без замка разговора: запись в кольцо идёт под замком очереди
+        }
+        break;
+    case music_logic::Route::Music:
+        music::on_frames(data, len);
+        break;
+    case music_logic::Route::Drop:
+        music::note_dropped_frame();
+        break;
     }
 }
 
@@ -161,6 +229,9 @@ void on_ready(bool ready)
 {
     std::lock_guard<std::mutex> lock(S.mu);
     const dialog::Phase before = S.dlg.phase();
+    // Новое соединение или обрыв: режим музыки и «внутри ответа» не переходят через него (после нового hello музыка сама не включается)
+    S.router.reset();
+    music::exit_mode(ready ? "new connection" : "connection lost");
     apply(S.dlg.on_link(ready, now_ms()));
     if (S.dlg.phase() != before) {
         ESP_LOGI(TAG, "dialog: %s -> %s (link %s)", dialog::phase_name(before), dialog::phase_name(S.dlg.phase()),
@@ -180,6 +251,7 @@ void on_button(bool pressed, uint32_t at_ms)
 {
     std::lock_guard<std::mutex> lock(S.mu);
     const dialog::Phase before = S.dlg.phase();
+    S.dlg.set_music(music::active());
     apply(pressed ? S.dlg.on_press(at_ms) : S.dlg.on_release(at_ms));
     if (S.dlg.phase() != before) {
         ESP_LOGI(TAG, "dialog: %s -> %s", dialog::phase_name(before), dialog::phase_name(S.dlg.phase()));
@@ -230,6 +302,11 @@ bool wake_end(uint32_t at_ms, bool no_speech)
 void tick()
 {
     const bool drained = playback::drained();
+    // Музыка (v0.6.0): запуск потока в динамик, тестовый сигнал, конец списка. После music_end и доигранного буфера режим закрыт: серверу music_done
+    if (music::tick(now_ms())) {
+        link::send(proto::OutMsg::MusicDone);
+        ESP_LOGI(TAG, "MUSIC: music_done sent to the server");
+    }
     {
         std::lock_guard<std::mutex> lock(S.mu);
         // Часы читаем здесь, уже под замком, как и обработчики сообщений сервера (on_message, on_audio, on_ready): тогда метка
@@ -237,6 +314,7 @@ void tick()
         // циклом в начале прохода, под нагрузкой отставало и обрывало ответ (v0.4.0: «звук не приходил 49 суток»).
         const uint32_t at_ms = now_ms();
         const dialog::Phase before = S.dlg.phase();
+        S.dlg.set_music(music::active());   // короткое нажатие BOOT посреди музыки значит «стоп» (dialog::Dialog::on_release)
         apply(S.dlg.on_tick(at_ms, drained));
         if (S.dlg.phase() != before) {
             ESP_LOGI(TAG, "dialog: %s -> %s", dialog::phase_name(before), dialog::phase_name(S.dlg.phase()));

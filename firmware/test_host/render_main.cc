@@ -630,6 +630,27 @@ int main(int argc, char **argv)
         CHECK(d_hint.any() && d_hint.x0 >= 4 && d_hint.x1 <= 236 && d_hint.y1 <= 238);
         CHECK(ui::testing::main_text_height() <= ui::testing::main_view_height());
 
+        // 22. Музыка (v0.6.0): «♪ название», глаза спокойные; 23. на паузе «⏸ название». Знаки из шрифта (с «?» на их месте строка выглядит иначе)
+        ui::set_hint("\xE2\x99\xAA Capsize \xE2\x80\x94 \xD0\xA2\xD1\x8B \xD0\xBB\xD1\x8E\xD0\xB1\xD0\xB8\xD1\x88\xD1\x8C \xD1\x82\xD0\xB0\xD0\xBD\xD1\x86\xD0\xB5\xD0\xB2\xD0\xB0\xD1\x82\xD1\x8C");
+        advance(900);
+        const Image music = shot(++n, "music_playing");
+        const Box4 m_eyes = lit_box(music, 0, 24, 240, 120);
+        CHECK(m_eyes.any() && m_eyes.y1 < 146);
+        const Box4 m_hint = lit_box(music, 0, 150, 240, 90);
+        CHECK(m_hint.any() && m_hint.x0 >= 4 && m_hint.x1 <= 236 && m_hint.y1 <= 238);
+        CHECK(ui::testing::main_text_height() <= ui::testing::main_view_height());
+        ui::set_hint("? Capsize \xE2\x80\x94 \xD0\xA2\xD1\x8B \xD0\xBB\xD1\x8E\xD0\xB1\xD0\xB8\xD1\x88\xD1\x8C \xD1\x82\xD0\xB0\xD0\xBD\xD1\x86\xD0\xB5\xD0\xB2\xD0\xB0\xD1\x82\xD1\x8C");
+        advance(900);
+        const Image music_q = frame_to_image();
+        CHECK(lit_pixels(music, 0, 150, 240, 90) != lit_pixels(music_q, 0, 150, 240, 90));   // «♪» нарисована настоящим глифом
+        ui::set_hint("\xE2\x8F\xB8 Capsize \xE2\x80\x94 \xD0\xA2\xD1\x8B \xD0\xBB\xD1\x8E\xD0\xB1\xD0\xB8\xD1\x88\xD1\x8C \xD1\x82\xD0\xB0\xD0\xBD\xD1\x86\xD0\xB5\xD0\xB2\xD0\xB0\xD1\x82\xD1\x8C");
+        advance(900);
+        const Image music_p = shot(++n, "music_paused");
+        const Box4 p_hint = lit_box(music_p, 0, 150, 240, 90);
+        CHECK(p_hint.any() && p_hint.x0 >= 4 && p_hint.x1 <= 236 && p_hint.y1 <= 238);
+        CHECK(ui::testing::main_text_height() <= ui::testing::main_view_height());
+        CHECK(lit_pixels(music_p, 0, 150, 240, 90) != lit_pixels(music_q, 0, 150, 240, 90));   // и «⏸» тоже
+
         ui::set_hint("");
         advance(500);
     }

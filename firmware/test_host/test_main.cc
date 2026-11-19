@@ -1036,7 +1036,7 @@ static void test_proto()
     char hello[200];
     const size_t hn = proto::build_hello(hello, sizeof(hello), "v0.4.0", "10:51:db:aa:bb:cc");
     CHECK(strcmp(hello, "{\"type\":\"hello\",\"proto\":1,\"fw\":\"v0.4.0\",\"mac\":\"10:51:db:aa:bb:cc\",\"mic_rate\":16000,"
-                        "\"spk_rate\":24000}") == 0 && hn == strlen(hello));
+                        "\"spk_rate\":24000,\"caps\":[\"music\"]}") == 0 && hn == strlen(hello));   // с v0.6.0 в hello есть caps
     // версия с кавычкой не ломает JSON
     proto::build_hello(hello, sizeof(hello), "v\"1\\x", "m");
     CHECK(strstr(hello, "\"fw\":\"v\\\"1\\\\x\"") != nullptr);
@@ -6325,6 +6325,9 @@ static void test_wake_bench_logic()
     CHECK(c.kind == cmd::Kind::Error);
 }
 
+// v0.6.0: музыка на колонке и эхоподавление
+#include "test_v060.inc"
+
 int main()
 {
     test_dbfs();
@@ -6388,6 +6391,28 @@ int main()
     test_mww_pause_detector();
     test_mww_pause_flow();
     test_wake_bench_logic();
+    test_proto_music();
+    test_music_volume_curve();
+    test_frame_router();
+    test_music_player();
+    test_music_player_stop_tail();
+    test_music_player_end_and_done();
+    test_music_player_pause_without_audio();
+    test_music_test_signal();
+    test_dialog_music();
+    test_wake_music();
+    test_face_music();
+    test_music_glyphs();
+    test_aec_resampler();
+    test_aec_history();
+    test_aec_window_min_and_hangover();
+    test_aec_aligner_simulation();
+    test_aec_end_to_end_alignment();
+    test_aec_erle_meter();
+    test_aec_xcorr_and_synthetic();
+    test_aec_config_logic();
+    test_commands_v060();
+    test_music_turn_flow();
     printf("%d checks, %d failed\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

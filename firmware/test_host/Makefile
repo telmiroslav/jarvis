@@ -12,7 +12,8 @@ LVGL_CFLAGS := -O2 -std=gnu11 -DLV_CONF_INCLUDE_SIMPLE -DLV_LVGL_H_INCLUDE_SIMPL
 
 WARN := -Wall -Wextra -Wpedantic
 LOGIC_SRCS := test_main.cc $(MAIN)/dsp.cc $(MAIN)/text_util.cc $(MAIN)/ui_logic.cc $(MAIN)/cmd_parse.cc $(MAIN)/net_logic.cc \
-              $(MAIN)/proto.cc $(MAIN)/link_logic.cc $(MAIN)/pcm_queue.cc $(MAIN)/subtitle.cc $(MAIN)/dialog.cc $(MAIN)/face_logic.cc $(MAIN)/wake_logic.cc $(MAIN)/wake_perf.cc $(MAIN)/heap_logic.cc $(MAIN)/mww_logic.cc $(MAIN)/sample_ring.cc
+              $(MAIN)/proto.cc $(MAIN)/link_logic.cc $(MAIN)/pcm_queue.cc $(MAIN)/subtitle.cc $(MAIN)/dialog.cc $(MAIN)/face_logic.cc $(MAIN)/wake_logic.cc $(MAIN)/wake_perf.cc $(MAIN)/heap_logic.cc $(MAIN)/mww_logic.cc $(MAIN)/sample_ring.cc \
+              $(MAIN)/music_logic.cc $(MAIN)/aec_logic.cc
 
 # ---- Движок microWakeWord (mww_core.cc): микрофронтенд (C) и TFLite Micro (C++, эталонные ядра) из управляемых компонентов,
 # они появляются после первой сборки прошивки idf.py build. Нет их, тест движка пропускается (run.sh пишет об этом).
@@ -44,7 +45,7 @@ TFLM_INC := -I$(TFLM_DIR) -I$(TFLM_DIR)/third_party/gemmlowp -I$(TFLM_DIR)/third
 
 all: $(OUT)/test_main $(OUT)/render $(if $(HAVE_MWW),$(OUT)/test_mww_core $(OUT)/mww_check)
 
-$(OUT)/test_main: $(LOGIC_SRCS) $(wildcard $(MAIN)/*.h)
+$(OUT)/test_main: $(LOGIC_SRCS) test_v060.inc $(wildcard $(MAIN)/*.h)
 	@mkdir -p $(OUT)
 	g++ -std=c++17 -O1 -g $(WARN) -fsanitize=address,undefined -I$(MAIN) $(LOGIC_SRCS) -o $@ -lm
 

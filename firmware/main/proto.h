@@ -23,6 +23,7 @@ constexpr int kSpkRate = 24000;
 constexpr size_t kMaxText = 1200;       // байт UTF-8 в одном user_text / jarvis_text
 constexpr size_t kMaxErrMsg = 240;      // байт в msg ошибки
 constexpr size_t kMaxServerVer = 23;
+constexpr size_t kMaxTitle = 200;       // байт UTF-8 в названии трека (music_start, music_title); длиннее обрезается по границе символа
 
 enum class Kind : uint8_t {
     Invalid = 0,   // не JSON-объект или нет поля type
@@ -34,6 +35,14 @@ enum class Kind : uint8_t {
     AudioStart,
     AudioEnd,
     Pong,
+    // v0.6.0, музыка на колонке (docs/PROTOCOL.md, раздел 10)
+    MusicStart,    // rate, volume, title
+    MusicTitle,    // title
+    MusicPause,
+    MusicResume,
+    MusicVolume,   // volume
+    MusicStop,
+    MusicEnd,
 };
 
 enum class ServerState : uint8_t { None = 0, Thinking, Speaking, Idle, Error };
@@ -52,8 +61,13 @@ struct ServerMsg {
     char text[kMaxText + 1] = {0};
     bool final_flag = false;
     bool text_truncated = false;
-    // audio_start
+    // audio_start, music_start
     int rate = 0;
+    // music_start, music_volume: громкость музыки 0..100 (-1: в сообщении её нет или она не число)
+    int volume = -1;
+    // music_start, music_title
+    char title[kMaxTitle + 1] = {0};
+    bool title_truncated = false;
 };
 
 // json не обязан кончаться нулём (len байт). false: это не JSON-объект или в нём нет строки type.
@@ -61,12 +75,13 @@ bool parse_server_message(const char *json, size_t len, ServerMsg *out);
 
 // ---- сообщения платы
 
-enum class OutMsg : uint8_t { ListenStart, ListenStop, Abort, Ping, ListenStartWake, ListenStartFollow };
+enum class OutMsg : uint8_t { ListenStart, ListenStop, Abort, Ping, ListenStartWake, ListenStartFollow, MusicDone };
 
 // Готовая строка для коротких сообщений ({"type":"listen_start","mode":"ptt"}, "wake", "follow", ...)
 const char *out_text(OutMsg m);
 
-// {"type":"hello","proto":1,"fw":"...","mac":"..","mic_rate":16000,"spk_rate":24000}; возвращает длину
+// {"type":"hello","proto":1,"fw":"...","mac":"..","mic_rate":16000,"spk_rate":24000,"caps":["music"]}; возвращает длину.
+// caps (с v0.6.0) говорит серверу, что плата умеет играть музыку (раздел 10 протокола); без него сервер включает музыку на ноутбуке.
 size_t build_hello(char *buf, size_t cap, const char *fw, const char *mac);
 
 // ---- сборка текстового сообщения из кусков

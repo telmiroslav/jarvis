@@ -13,8 +13,10 @@
 #include "freertos/task.h"
 #include "sdkconfig.h"
 
+#include "aec.h"
 #include "cmd_parse.h"
 #include "link.h"
+#include "music.h"
 #include "net.h"
 #include "net_logic.h"
 #include "wake.h"
@@ -65,6 +67,8 @@ const char *kind_name(cmd::Kind k)
     case cmd::Kind::Server:    return "server";
     case cmd::Kind::Echo:      return "echo";
     case cmd::Kind::Wake:      return "wake";
+    case cmd::Kind::Aec:       return "aec";
+    case cmd::Kind::Music:     return "music";
     case cmd::Kind::Status:    return "status";
     case cmd::Kind::Reboot:    return "reboot";
     case cmd::Kind::Help:      return "help";
@@ -343,6 +347,183 @@ void run_wake(const cmd::Command &c)
     }
 }
 
+// Команда aec (v0.6.0): «AEC OK ...» при успехе, «ERR aec ...» при ошибке, а без аргументов состояние несколькими строками (каждая короче 200 символов)
+void run_aec(const cmd::Command &c)
+{
+    using cmd::AecOp;
+    char why[24] = {0};
+    switch (c.aec_op) {
+    case AecOp::Status: {
+        const aec::Status s = aec::status();
+        char state[64];
+        if (!s.available) {
+            snprintf(state, sizeof(state), "unavailable(%s)", s.why);
+        } else if (s.active) {
+            snprintf(state, sizeof(state), "ACTIVE");
+        } else if (s.want) {
+            snprintf(state, sizeof(state), "waiting(alignment)");
+        } else {
+            snprintf(state, sizeof(state), "idle");
+        }
+        reply("AEC %s state=%s mode=%s taps=%d nlp=%d delay_ms=%d voice=%s frame=%d", s.enabled ? "on" : "off", state, aec_logic::mode_name(s.cfg.mode), s.cfg.taps,
+              s.cfg.nlp, s.cfg.delay_ms, s.cfg.voice ? "on" : "off", s.frame);
+        if (s.available) {
+            reply("AEC stats activations=%u frames=%u skipped=%u proc_avg_us=%u proc_max_us=%u cpu=%.1f%%_of_one_core_at_real_time erle_db=%.1f erle_window_db=%.1f",
+                  static_cast<unsigned>(s.activations), static_cast<unsigned>(s.frames), static_cast<unsigned>(s.skipped), static_cast<unsigned>(s.proc_avg_us),
+                  static_cast<unsigned>(s.proc_max_us), static_cast<double>(s.cpu_pct), static_cast<double>(s.erle_db), static_cast<double>(s.erle_win_db));
+            reply("AEC levels mic=%.1fdBFS out=%.1fdBFS ref=%.1fdBFS (frames with a sounding reference: %u) makeup=x%d queue=%u stall_recoveries=%u",
+                  static_cast<double>(s.mic_dbfs), static_cast<double>(s.out_dbfs), static_cast<double>(s.ref_dbfs), static_cast<unsigned>(s.erle_frames), s.makeup,
+                  static_cast<unsigned>(s.pending), static_cast<unsigned>(s.stall_recoveries));
+            reply("AEC align ready=%s anchor_diff_ms=%.2f jumps=%u streams=%u | memory internal=%uKB psram=%uKB task_stack_free=%uB | lib=%s",
+                  s.aligned ? "yes" : "no", static_cast<double>(s.anchor_diff_us) / 1000.0, static_cast<unsigned>(s.align_jumps), static_cast<unsigned>(s.streams),
+                  static_cast<unsigned>(s.internal_used_bytes / 1024), static_cast<unsigned>(s.psram_used_bytes / 1024), static_cast<unsigned>(s.stack_free_bytes), s.lib);
+        }
+        if (aec::bench_state() == 1) {
+            reply("AEC bench: running (about 5 s after the command), ask again with: aec");
+        } else {
+            char bl[240];
+            for (int i = 0; aec::bench_line(i, bl, sizeof(bl)) > 0; i++) {
+                reply("AEC bench %s", bl);
+            }
+        }
+        if (aec::cal_state() == 1) {
+            reply("AEC cal: running (about 4 s after the command), ask again with: aec");
+        } else {
+            char cl[260];
+            for (int i = 0; aec::cal_line(i, cl, sizeof(cl)) > 0; i++) {
+                reply("AEC cal %s", cl);
+            }
+        }
+        break;
+    }
+    case AecOp::On:
+    case AecOp::Off: {
+        const bool on = (c.aec_op == AecOp::On);
+        if (aec::set_enabled(on)) {
+            reply("AEC OK %s%s", on ? "on" : "off", (on && !aec::available()) ? " (the engine is not running: send reboot)" : "");
+        } else {
+            reply("ERR aec save_failed");
+        }
+        break;
+    }
+    case AecOp::VoiceOn:
+    case AecOp::VoiceOff: {
+        const bool on = (c.aec_op == AecOp::VoiceOn);
+        if (aec::set_voice(on)) {
+            reply("AEC OK voice %s", on ? "on (the echo of Jarvis's voice is cancelled too)" : "off (only the music)");
+        } else {
+            reply("ERR aec save_failed");
+        }
+        break;
+    }
+    case AecOp::Delay:
+        if (aec::set_delay_ms(c.aec_value)) {
+            reply("AEC OK delay %d ms", c.aec_value);
+        } else {
+            reply("ERR aec save_failed");
+        }
+        break;
+    case AecOp::Taps:
+        if (aec::set_taps(c.aec_value)) {
+            reply("AEC OK taps %d (the AEC is re-created when the speaker is silent)", c.aec_value);
+        } else {
+            reply("ERR aec save_failed");
+        }
+        break;
+    case AecOp::Mode: {
+        const aec_logic::Mode m = static_cast<aec_logic::Mode>(c.aec_value);
+        if (aec::set_mode(m)) {
+            reply("AEC OK mode %s (the AEC is re-created when the speaker is silent)", aec_logic::mode_name(m));
+        } else {
+            reply("ERR aec save_failed");
+        }
+        break;
+    }
+    case AecOp::Nlp:
+        if (aec::set_nlp(c.aec_value)) {
+            reply("AEC OK nlp %d (only the fd modes use it)", c.aec_value);
+        } else {
+            reply("ERR aec save_failed");
+        }
+        break;
+    case AecOp::Bench:
+        if (aec::bench_start(why, sizeof(why))) {
+            reply("AEC OK bench started: about 5 s on the AEC task; read the result with: aec (lines AEC bench)");
+        } else {
+            reply("ERR aec bench_%s", why);
+        }
+        break;
+    case AecOp::Cal:
+        if (aec::cal_start(why, sizeof(why))) {
+            reply("AEC OK cal started: the board plays 1.8 s of noise, keep the room quiet; read the result with: aec (lines AEC cal)");
+        } else {
+            reply("ERR aec cal_%s", why);
+        }
+        break;
+    }
+}
+
+// Команда music (v0.6.0)
+void run_music(const cmd::Command &c)
+{
+    using cmd::MusicOp;
+    switch (c.music_op) {
+    case MusicOp::Stat: {
+        const music::Status s = music::status();
+        const char *st = s.state == music_logic::Player::State::Off       ? "off"
+                         : s.state == music_logic::Player::State::Playing ? "playing"
+                         : s.state == music_logic::Player::State::Pausing ? "pausing"
+                                                                          : "paused";
+        reply("MUSIC %s state=%s%s%s%s volume=%d gain_db=%.1f buffer=%u/%ums queue=%s title=\"%s\"", s.ready ? "ready" : "NO_MEMORY", st,
+              s.paused_by_talk ? "(by_the_board_waiting_for_the_server)" : "", s.ending ? "(ending)" : "", s.test ? "(test_signal)" : "", s.volume,
+              static_cast<double>(s.gain_db), static_cast<unsigned>(s.buffered_ms), static_cast<unsigned>(s.capacity_ms),
+              s.queue_state == 2 ? "playing" : s.queue_state == 1 ? "buffering" : s.queue_state == 3 ? "done" : "idle", s.title);
+        reply("MUSIC counters starts=%u underruns=%u silent_chunks=%u/%u overflow_samples=%u frames=%u dropped_frames=%u in=%u out=%u",
+              static_cast<unsigned>(s.starts), static_cast<unsigned>(s.underruns), static_cast<unsigned>(s.silent_chunks), static_cast<unsigned>(s.pulled_chunks),
+              static_cast<unsigned>(s.overflowed), static_cast<unsigned>(s.frames), static_cast<unsigned>(s.dropped_frames), static_cast<unsigned>(s.in_samples),
+              static_cast<unsigned>(s.out_samples));
+        const aec::Status a = aec::status();
+        if (a.available) {
+            reply("MUSIC aec state=%s mode=%s delay_ms=%d frames=%u skipped=%u proc_avg_us=%u (%.1f%% of a core) erle_db=%.1f (window %.1f) aligned=%s (details: aec)",
+                  a.active ? "ACTIVE" : "idle", aec_logic::mode_name(a.cfg.mode), a.cfg.delay_ms, static_cast<unsigned>(a.frames), static_cast<unsigned>(a.skipped),
+                  static_cast<unsigned>(a.proc_avg_us), static_cast<double>(a.cpu_pct), static_cast<double>(a.erle_db), static_cast<double>(a.erle_win_db),
+                  a.aligned ? "yes" : "no");
+        } else {
+            reply("MUSIC aec unavailable(%s): the word over the music relies on the stricter threshold only", a.why);
+        }
+        break;
+    }
+    case MusicOp::Vol:
+        if (music::console_volume(c.music_volume)) {
+            reply("MUSIC OK volume %d", c.music_volume);
+        } else {
+            reply("ERR music not_ready");
+        }
+        break;
+    case MusicOp::Test:
+        if (!link::status().ready) {
+            reply("ERR music no_link (the test needs the server link: the word works only with it)");
+        } else if (music::test_start(c.music_volume)) {
+            reply("MUSIC OK test signal playing (volume %d). Say Jarvis over it; stop: music stop or a short BOOT press", music::status().volume);
+        } else {
+            reply("ERR music test_failed");
+        }
+        break;
+    case MusicOp::Pause:
+        music::on_pause();
+        reply("MUSIC OK pause");
+        break;
+    case MusicOp::Resume:
+        music::on_resume();
+        reply("MUSIC OK resume");
+        break;
+    case MusicOp::Stop:
+        music::on_stop();
+        reply("MUSIC OK stop");
+        break;
+    }
+}
+
 void run_command(const cmd::Command &c)
 {
     switch (c.kind) {
@@ -400,6 +581,12 @@ void run_command(const cmd::Command &c)
     case cmd::Kind::Wake:
         run_wake(c);
         break;
+    case cmd::Kind::Aec:
+        run_aec(c);
+        break;
+    case cmd::Kind::Music:
+        run_music(c);
+        break;
     case cmd::Kind::Echo:
         if (g_hooks.start_echo && g_hooks.start_echo()) {
             reply("ECHO OK recording 4 s, then playing back");
@@ -423,7 +610,9 @@ void run_command(const cmd::Command &c)
     case cmd::Kind::Help:
         reply("HELP wifi_set <ssid><TAB><password> | wifi_clear | tz <POSIX TZ> | lcd <1-6> | server [ws://ip:port/ws|auto] | "
               "wake [on|off|engine mww|esp|beep on|off|0-5|thr <0.50-0.99 mww, 0.40-0.9999 esp|default>|silence <300-3000 ms>|gain <0-18 dB>|"
-              "follow <0|2000-15000 ms>|barge on|off|barge thr <as thr|default>|bench] | echo | status | reboot");
+              "follow <0|2000-15000 ms>|barge on|off|barge thr <as thr|default>|bench] | "
+              "aec [on|off|voice on|off|delay <0-250 ms>|taps <1-8>|mode sr_low|sr_high|fd_low|fd_high|nlp <0-2>|bench|cal] | "
+              "music [stat|vol <0-100>|test [vol]|pause|resume|stop] | echo | status | reboot");
         break;
     case cmd::Kind::Error:
         reply("ERR %s %s", c.err_cmd, c.err_reason);

@@ -1,9 +1,9 @@
-// Inter (c) 2016 The Inter Project Authors, https://github.com/rsms/inter
+// Inter (c) 2016 The Inter Project Authors, https://github.com/rsms/inter; знаки ♪ и ⏸ (c) 2022 The Noto Project Authors, https://github.com/notofonts/symbols
 // Лицензия: SIL Open Font License 1.1 (текст рядом: OFL.txt). Файл сгенерирован gen_fonts.sh, руками не править.
 /*******************************************************************************
  * Size: 14 px
  * Bpp: 4
- * Opts: --bpp 4 --size 14 --format lvgl --no-compress --lv-font-name jv_font_ui_14 --font @fontsource/inter/files/inter-latin-500-normal.woff -r 0x20-0x7E,0xA0,0xAB,0xB0,0xB7,0xBB,0x2013,0x2014,0x2018,0x2019,0x201C,0x201D,0x201E,0x2022,0x2026,0x20AC --font @fontsource/inter/files/inter-cyrillic-500-normal.woff -r 0x401,0x410-0x44F,0x451,0x2116 -o jv_font_ui_14.c.tmp
+ * Opts: --bpp 4 --size 14 --format lvgl --no-compress --lv-font-name jv_font_ui_14 --font @fontsource/inter/files/inter-latin-500-normal.woff -r 0x20-0x7E,0xA0,0xAB,0xB0,0xB7,0xBB,0x2013,0x2014,0x2018,0x2019,0x201C,0x201D,0x201E,0x2022,0x2026,0x20AC --font @fontsource/inter/files/inter-cyrillic-500-normal.woff -r 0x401,0x410-0x44F,0x451,0x2116 --font @fontsource/noto-sans-symbols/files/noto-sans-symbols-symbols-500-normal.woff -r 0x266A --font @fontsource/noto-sans-symbols-2/files/noto-sans-symbols-2-symbols-400-normal.woff -r 0x23F8 -o jv_font_ui_14.c.tmp
  ******************************************************************************/
 
 #ifdef LV_LVGL_H_INCLUDE_SIMPLE
@@ -1313,7 +1313,20 @@ static LV_ATTRIBUTE_LARGE_CONST const uint8_t glyph_bitmap[] = {
     0x10, 0xe8, 0x1, 0xf6, 0xf6, 0x4f, 0xff, 0xf0,
     0xe8, 0x0, 0x7e, 0xf6, 0x0, 0x0, 0x0, 0xe8,
     0x0, 0xd, 0xf6, 0x0, 0x0, 0x0, 0xe8, 0x0,
-    0x4, 0xf6, 0x0, 0x0, 0x0
+    0x4, 0xf6, 0x0, 0x0, 0x0,
+
+    /* U+23F8 "⏸" */
+    0x33, 0x0, 0x33, 0xd, 0xf4, 0xf, 0xf2, 0xdf,
+    0x40, 0xff, 0x2d, 0xf4, 0xf, 0xf2, 0xdf, 0x40,
+    0xff, 0x2d, 0xf4, 0xf, 0xf2, 0xdf, 0x40, 0xff,
+    0x2d, 0xf4, 0xf, 0xf2, 0xdf, 0x40, 0xff, 0x2d,
+    0xf4, 0xf, 0xf2,
+
+    /* U+266A "♪" */
+    0x0, 0xa, 0x0, 0x0, 0xf, 0x30, 0x0, 0xf,
+    0xe1, 0x0, 0xb, 0x97, 0x0, 0xb, 0x1a, 0x0,
+    0xb, 0x18, 0x1, 0x5a, 0x43, 0xe, 0xf8, 0x0,
+    0x1d, 0xb0, 0x0
 };
 
 
@@ -1499,7 +1512,9 @@ static const lv_font_fmt_txt_glyph_dsc_t glyph_dsc[] = {
     {.bitmap_index = 6738, .adv_w = 119, .box_w = 5, .box_h = 5, .ofs_x = 1, .ofs_y = 2},
     {.bitmap_index = 6751, .adv_w = 204, .box_w = 11, .box_h = 3, .ofs_x = 1, .ofs_y = 0},
     {.bitmap_index = 6768, .adv_w = 151, .box_w = 9, .box_h = 11, .ofs_x = 0, .ofs_y = 0},
-    {.bitmap_index = 6818, .adv_w = 245, .box_w = 14, .box_h = 11, .ofs_x = 1, .ofs_y = 0}
+    {.bitmap_index = 6818, .adv_w = 245, .box_w = 14, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
+    {.bitmap_index = 6895, .adv_w = 204, .box_w = 7, .box_h = 10, .ofs_x = 3, .ofs_y = 0},
+    {.bitmap_index = 6930, .adv_w = 101, .box_w = 6, .box_h = 9, .ofs_x = 0, .ofs_y = 0}
 };
 
 /*---------------------
@@ -1512,7 +1527,7 @@ static const uint16_t unicode_list_1[] = {
 
 static const uint16_t unicode_list_3[] = {
     0x0, 0x1bc2, 0x1bc3, 0x1bc7, 0x1bc8, 0x1bcb, 0x1bcc, 0x1bcd,
-    0x1bd1, 0x1bd5, 0x1c5b, 0x1cc5
+    0x1bd1, 0x1bd5, 0x1c5b, 0x1cc5, 0x1fa7, 0x2219
 };
 
 /*Collect the unicode lists and glyph_id offsets*/
@@ -1531,8 +1546,8 @@ static const lv_font_fmt_txt_cmap_t cmaps[] =
         .unicode_list = NULL, .glyph_id_ofs_list = NULL, .list_length = 0, .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY
     },
     {
-        .range_start = 1105, .range_length = 7366, .glyph_id_start = 166,
-        .unicode_list = unicode_list_3, .glyph_id_ofs_list = NULL, .list_length = 12, .type = LV_FONT_FMT_TXT_CMAP_SPARSE_TINY
+        .range_start = 1105, .range_length = 8730, .glyph_id_start = 166,
+        .unicode_list = unicode_list_3, .glyph_id_ofs_list = NULL, .list_length = 14, .type = LV_FONT_FMT_TXT_CMAP_SPARSE_TINY
     }
 };
 

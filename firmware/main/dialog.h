@@ -65,10 +65,12 @@ struct Out {
     bool capture_begin = false;     // кнопка нажата: начать копить звук с микрофона (запись начнётся не сразу, 200 мс)
     bool capture_cancel = false;    // не запись (тап или обрыв): выбросить накопленное
     bool no_link = false;           // кнопку держат, а связи с сервером нет: записать нечего
+    bool music_stop = false;        // v0.6.0: короткое нажатие BOOT посреди музыки (ни записи, ни ответа нет): сразу выбросить буфер музыки и выйти из режима
+                                    // (вместе с abort: серверу тоже «стоп»)
     bool any() const
     {
         return listen_start || listen_stop || abort || stop_playback || begin_playback || finish_playback ||
-               clear_texts || capture_begin || capture_cancel || no_link || barge;
+               clear_texts || capture_begin || capture_cancel || no_link || barge || music_stop;
     }
 };
 
@@ -88,6 +90,11 @@ public:
     // Слово «Джарвис» посреди ответа (THINKING или SPEAKING): замолчать и начать запись. Принимается при связи и отпущенной
     // кнопке; в других фазах пустой Out. Out: abort + stop_playback + clear_texts + listen_start (wake) + barge.
     Out on_barge(uint32_t now);
+    // v0.6.0: режим музыки включён (играет или на паузе). Короткое нажатие BOOT в покое (Idle) тогда значит «стоп»: Out.music_stop + abort.
+    // Зовёт session каждый такт по music::active(). Остальные фазы (запись, ответ, ошибка) ведут себя как всегда.
+    void set_music(bool on) { music_ = on; }
+    bool music() const { return music_; }
+    uint32_t music_stops() const { return music_stops_; }
     // Ответ назвал себя («Джарвис» в тексте предложения): пока этот ответ не кончился, перебивать его голосом нельзя
     // (динамик сам скажет слово, микрофон его услышит). Сбрасывается в начале следующего ответа.
     void note_names_self() { names_self_ = true; }
@@ -147,6 +154,8 @@ private:
     uint32_t answers_done_ = 0;
     uint32_t barges_ = 0;
     bool listen_follow_ = false;    // текущая запись по слову (Listening) начата голосом в окне, а не словом
+    bool music_ = false;            // режим музыки включён (set_music)
+    uint32_t music_stops_ = 0;      // сколько раз короткое нажатие остановило музыку
     bool names_self_ = false;       // ответ уже назвал себя вслух
     char err_msg_[proto::kMaxErrMsg + 1] = {0};
 };
