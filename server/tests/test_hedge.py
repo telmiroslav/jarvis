@@ -248,19 +248,19 @@ async def test_winner_erroring_after_first_word_does_not_fall_back():
     assert models_called(log) == [PRIMARY, FALLBACK]
 
 
-async def test_winner_erroring_after_tool_call_before_text_does_not_fall_back():
-    """Победитель взял слово вызовом функции (FLUSH), функция выполнена, дальше ошибка до всякого текста: как раньше, наружу."""
+async def test_winner_erroring_after_tool_call_before_text_retries_continuation_without_calling_function_again():
+    """Победитель взял слово вызовом функции (FLUSH), функция выполнена, продолжение упало с 503 до всякого текста: то же продолжение
+    (с результатом функции) повторяется на той же модели, функция заново не вызывается. Запасная модель хеджа уже отменена."""
     reg, calls = counting_registry()
     a = HStream([chunk(fc_part())], delay=0.3)
     a2 = api_error(503, "UNAVAILABLE")
+    a3 = HStream([chunk(part("Двенадцать ноль-ноль."))])
     b = HStream([chunk(part("Запасная."))], delay=2.0)
-    llm, log = make_hedge_llm({PRIMARY: [a, a2], FALLBACK: [b]})
-    out = []
-    with pytest.raises(LLMError) as e:
-        async for it in llm.stream([], "который час", reg, LLMStats()):
-            out.append(it)
-    assert out == [FLUSH] and e.value.started and calls == [1]
-    assert models_called(log) == [PRIMARY, FALLBACK, PRIMARY]  # без запросов к запасной после функции
+    llm, log = make_hedge_llm({PRIMARY: [a, a2, a3], FALLBACK: [b]})
+    out, st = await collect(llm, reg, text="который час")
+    assert out == [FLUSH, "Двенадцать ноль-ноль."] and calls == [1]
+    assert models_called(log) == [PRIMARY, FALLBACK, PRIMARY, PRIMARY]  # запасная ушла по таймеру хеджа и проиграла; дальше два раза основная
+    assert st.tool_calls == ["get_time"] and st.hedge == "primary" and st.model == PRIMARY
     assert await closed(b)
 
 

@@ -7,7 +7,9 @@
 полем SDK не выбирает aiohttp, даже если он вдруг установлен) и даёт нам два крючка:
 - ConnTracker считает, новое соединение у запроса или старое (`llm_conn=new|reused` в строке TURN);
 - прогрев: на listen_start (человек ещё говорит, а STT ещё не начался) открываем соединение заранее запросом HEAD на корень
-  хоста без ключа и тела: квота генерации не тратится, ключ в запрос не попадает.
+  хоста без ключа и тела: квота генерации не тратится, ключ в запрос не попадает. Пока включён хедж и HTTP/1.1, греем два соединения
+  (GeminiLLM.prewarm): основная и запасная модели идут параллельно, а у HTTP/1.1 на соединение один запрос за раз; иначе второй
+  запрос хода открывал бы своё соединение на пути хода (+1-2 с через VPN, `llm_conn=new`).
 """
 from __future__ import annotations
 
@@ -29,6 +31,11 @@ ORIGINS = {"gemini": "https://generativelanguage.googleapis.com/", "vertex": "ht
 
 def h2_available() -> bool:
     return importlib.util.find_spec("h2") is not None
+
+
+def http2_in_use(requested: bool) -> bool:
+    """HTTP/2 к Google реально включён: его просили (JARVIS_LLM_HTTP2) и пакет h2 стоит (build_async_client без него молча остаётся на HTTP/1.1)."""
+    return bool(requested) and h2_available()
 
 
 def _httpx_module() -> Any:
@@ -81,6 +88,6 @@ def build_async_client(keepalive_s: float, tracker: ConnTracker, *, http2: bool 
         kw["verify"] = verify
     elif os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
         kw["verify"] = ssl.create_default_context(cafile=os.environ.get("SSL_CERT_FILE"), capath=os.environ.get("SSL_CERT_DIR"))
-    if http2 and h2_available():
+    if http2_in_use(http2):
         kw["http2"] = True
     return mod.AsyncClient(**kw)

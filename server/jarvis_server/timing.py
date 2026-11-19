@@ -34,8 +34,9 @@ class TurnTiming:
     max_gap_s: float = 0.0
     outcome: str = "ok"
     first_split: int = 0  # длина первого куска, если первое предложение разрезали (0 = не резали)
-    llm_hedge: str = "-"  # запасной запрос к ИИ: "-" не запускали (или никто не ответил), "primary" запускали, но первой ответила основная модель, "fallback" первой ответила запасная
+    llm_hedge: str = "-"  # запасной запрос к ИИ: "-" не запускали (или никто не ответил), "primary" запускали, но первой ответила основная модель, "fallback" первой ответила запасная (запустили по таймеру), "fallback_err" то же, но запустили сразу после перегрузки основной, не дожидаясь таймера
     llm_conn: str = "-"  # соединение с Google у первого запроса хода: "new" (рукопожатие на пути хода) | "reused" | "-" неизвестно
+    claim: bool = False  # ИИ сказал о действии первого лица («Открываю»), а функции управления ПК не вызвал или она не удалась (claims.py); только счётчик
     why: str = ""  # причина молчания (outcome silent(...)): слова, которыми ИИ объяснил пометку [SILENT]
     music: str = "-"  # музыка после хода: - | box:playing | box:paused | laptop:playing | laptop:paused
     mode: str = "ptt"  # listen_start.mode (ptt | wake | follow); в строке TURN всегда последний ключ
@@ -49,6 +50,6 @@ class TurnTiming:
             f"audio_s={self.audio_s:.1f} | sentences={self.sentences} tts_ms={_ms(self.tts_ms_total)} tts_rtf={rtf} "
             f"underruns={self.underruns} max_gap_s={self.max_gap_s:.2f} chars={self.chars} "
             f"first_split={self.first_split or '-'} model={self.model or '-'} "
-            f"tools={','.join(self.tools) or '-'} llm_hedge={self.llm_hedge or '-'}"
+            f"tools={','.join(self.tools) or '-'} claim={'1' if self.claim else '-'} llm_hedge={self.llm_hedge or '-'}"
             f"{' why=' + _slug(self.why) if self.why else ''} llm_conn={self.llm_conn or '-'} music={self.music or '-'} mode={self.mode}"
         )

@@ -6,6 +6,10 @@ stream() отдаёт кусочки текста (str) по мере генер
 
 Хедж (JARVIS_LLM_HEDGE_MS): если основная модель не дала первого куска за это время, тот же запрос параллельно уходит
 на следующую запасную; говорит та, что дала кусок первой, вторая отменяется. Подробности: GeminiLLM._hedged.
+
+История разговора (memory.py) хранит и вызовы функций прошлых ходов; в запрос они уходят настоящими function_call/function_response
+(GeminiLLM._contents), а не одним текстом: иначе модель видит свои «Открываю» без вызовов и сама перестаёт вызывать. Продолжение хода
+после выполненных функций переживает ошибку: функции повторно не вызываются (_Resume, GeminiLLM._chain).
 """
 from __future__ import annotations
 
@@ -14,18 +18,27 @@ import logging
 import time
 from contextlib import aclosing
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Protocol
+from types import SimpleNamespace
+from typing import Any, AsyncIterator, Callable, Protocol
 
 from .addressing import unwrap_follow
+from .claims import call_ok
 from .config import Settings
-from .llmconn import CONN_SINK, ORIGINS, ConnTracker, build_async_client
-from .memory import Exchange
+from .llmconn import CONN_SINK, ORIGINS, ConnTracker, build_async_client, http2_in_use
+from .memory import Exchange, ToolCall
 from .persona import system_prompt
 from .skills import ToolRegistry
 
 log = logging.getLogger("jarvis.llm")
 
 MAX_TOOL_ROUNDS = 4
+
+# Служебная подпись «мысли» для function_call, которые модель в этом запросе не порождала (вызовы из памяти разговора, продолжение
+# хода на другой модели). Документация Gemini API (thought signatures): для вызовов, «не созданных через API», в поле подписи кладут
+# "skip_thought_signature_validator" (или "context_engineering_is_the_way_to_go"); произвольное значение даёт 400 «Corrupted thought
+# signature». Поле bytes: SDK кодирует его base64 сам. Сервер такое значение принимает (так сообщает сторонний проект с живым API, у нас
+# это не проверялось), а на случай отказа в _run есть откат на текстовую историю.
+INJECTED_SIGNATURE = b"skip_thought_signature_validator"
 
 
 class _Flush:
@@ -54,10 +67,13 @@ class LLMStats:
     model: str = ""
     first_token_s: float | None = None
     tool_calls: list[str] = field(default_factory=list)
+    # те же вызовы с аргументами и ответами функций, в порядке вызова: идут в память разговора (session.py) и в итоговую фразу
+    tool_records: list[ToolCall] = field(default_factory=list)
     rounds: int = 0
     attempts: int = 0
     # запасной (хедж) запрос: "-" не запускали (или никто не ответил); "primary" запускали, но первой ответила основная
-    # модель; "fallback" первой ответила запасная. model/backend/tool_calls всегда от той цепочки, что реально отвечала.
+    # модель; "fallback" первой ответила запасная (запущена по таймеру); "fallback_err" то же, но запущена сразу после перегрузки
+    # или сбоя сети основной, не дожидаясь таймера. model/backend/tool_calls всегда от той цепочки, что реально отвечала.
     hedge: str = "-"
     # соединение первого запроса хода: "new" (рукопожатие TCP+TLS на пути хода), "reused" (держалось в пуле или прогрето на
     # listen_start), "-" неизвестно (подделка, mock). Заполняет крючок ответа клиента httpx (llmconn.ConnTracker)
@@ -156,6 +172,7 @@ class GeminiLLM:
         self._base_url: str | None = None  # только для тестов: поддельный сервер на localhost вместо Google
         self._prewarm_task: asyncio.Task | None = None
         self._prewarm_failed = float("-inf")  # time.monotonic() последней неудачи прогрева
+        self._calls_in_history = True  # вызовы функций прошлых ходов идут в запрос настоящими function_call; False после отказа API (_run)
 
     # --- клиент и настройки запроса
     def _backend_order(self) -> list[str]:
@@ -221,12 +238,26 @@ class GeminiLLM:
         )
 
     @staticmethod
-    def _contents(history: list[Exchange], user_text: str):
+    def _contents(history: list[Exchange], user_text: str, tools: ToolRegistry | None = None, *, with_calls: bool = True):
+        """Прошлые ходы как у настоящего разговора с функциями: user-текст, model с function_call, user с function_response, model-текст.
+        Подпись «мысли» у function_call служебная (INJECTED_SIGNATURE): настоящих подписей в памяти нет, они привязаны к модели, а для
+        прошлых ходов API их по документации не проверяет («Only current turn is required»). Ход с вызовами функций, которых сейчас у ИИ
+        нет (сеанс Hyprland пропал), идёт обычным текстом, чтобы запрос не отвергли. with_calls=False: только текст, как в 0.4.0."""
         from google.genai import types
 
+        avail = set(tools.names()) if tools is not None else None
         out = []
         for ex in history:
             out.append(types.Content(role="user", parts=[types.Part(text=ex.user)]))
+            rounds = _by_round(ex.calls) if with_calls else []
+            if rounds and (avail is None or all(c.name in avail for r in rounds for c in r)):
+                for rnd in rounds:
+                    out.append(types.Content(role="model", parts=[
+                        types.Part(function_call=types.FunctionCall(name=c.name, args=dict(c.args)),
+                                   thought_signature=INJECTED_SIGNATURE if i == 0 else None)  # подпись только у первого вызова шага
+                        for i, c in enumerate(rnd)]))
+                    out.append(types.Content(role="user", parts=[
+                        types.Part(function_response=types.FunctionResponse(name=c.name, response=dict(c.response))) for c in rnd]))
             out.append(types.Content(role="model", parts=[types.Part(text=ex.assistant)]))
         out.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
         return out
@@ -248,13 +279,19 @@ class GeminiLLM:
     async def _chain(self, plan: "_Plan", start: int, history: list[Exchange], user_text: str, tools: ToolRegistry,
                      stats: LLMStats, *, quiet: bool = False) -> AsyncIterator[Any]:
         """Последовательные попытки: модели plan.models[start:], бэкенды, один быстрый повтор, запасные модели при ошибках
-        до начала ответа. quiet: цепочка запасного (хедж) запроса, её ошибки не повод для тревоги (пишем в debug)."""
+        до начала ответа. quiet: цепочка запасного (хедж) запроса, её ошибки не повод для тревоги (пишем в debug).
+
+        Ошибка после выполненных функций, пока текста после них не было (_Resume.resumable): функции повторно НЕ вызываются, продолжение
+        (те же contents с их результатами) повторяется той же моделью один раз, затем запасными моделями по plan; если упало всё,
+        озвучивается короткая честная фраза по результатам функций (fallback_phrase) вместо ошибки: человек не остаётся без ответа."""
         models = plan.models
         lvl_warn = logging.DEBUG if quiet else logging.WARNING
         lvl_info = logging.DEBUG if quiet else logging.INFO
         started = False
         last: LLMError | None = None
         retried_first = False
+        retried_cont: set[int] = set()  # модели, на которых продолжение после функций уже повторяли
+        resume = _Resume()
         idx = start
         while idx < len(models) and (plan.limit is None or idx < plan.limit):
             plan.cur = idx
@@ -264,7 +301,7 @@ class GeminiLLM:
             for bi, backend in enumerate(backends):
                 stats.attempts += 1
                 try:
-                    async with aclosing(self._run(backend, model, history, user_text, tools, stats)) as run:
+                    async with aclosing(self._run(backend, model, history, user_text, tools, stats, resume)) as run:
                         async for item in run:
                             started = True
                             yield item
@@ -278,22 +315,41 @@ class GeminiLLM:
                     err.started = started or err.started
                     log.log(lvl_warn, "ИИ: ошибка (%s, %s, %s): %s", backend, model, err.kind,
                             _short(err.detail or err.user_msg))
-                    if err.started:
+                    if err.started and not resume.resumable():
                         raise err from e
                     if err.kind == "auth" and bi + 1 < len(backends):
                         continue  # ключ может быть от другого бэкенда
                     break
             assert err is not None
             last = err
+            cont = resume.resumable()  # функции уже выполнены, текста после них не было: можно продолжать, а не начинать заново
             if not err.retryable:
+                if cont:
+                    break  # продолжать нечем: ниже честная фраза вместо ошибки
                 raise err
-            if err.kind in ("overload", "network") and idx == start and not retried_first:
-                retried_first = True  # один быстрый повтор той же моделью
-                await asyncio.sleep(0.4)
-                continue
+            if err.kind in ("overload", "network"):
+                if cont and idx not in retried_cont:
+                    retried_cont.add(idx)  # продолжение после функций: одна быстрая повторная попытка той же моделью
+                    log.log(lvl_info, "ИИ: продолжение после функций не вышло, повторяю на %s (функции заново не вызываю)", model)
+                    await asyncio.sleep(0.4)
+                    continue
+                if not cont and idx == start and not retried_first:
+                    retried_first = True  # один быстрый повтор той же моделью
+                    if plan.on_retry is not None:
+                        plan.on_retry()  # хедж: запасная модель стартует уже сейчас, а не по таймеру; тут пока ждём повтор
+                    await asyncio.sleep(0.4)
+                    continue
             idx += 1
             if idx < len(models) and (plan.limit is None or idx < plan.limit):
-                log.log(lvl_info, "ИИ: пробую запасную модель %s", models[idx])
+                log.log(lvl_info, "ИИ: пробую запасную модель %s%s", models[idx],
+                        " (продолжение после выполненных функций)" if cont else "")
+        if resume.resumable():
+            phrase = fallback_phrase(stats.tool_records)
+            log.log(lvl_warn, "ИИ: после выполненных функций ответ не получен (%s): озвучиваю короткую фразу по их результатам «%s»",
+                    _short(last.detail or last.user_msg) if last is not None else "-", phrase)
+            resume.spoke = resume.text_after_flush = True
+            yield phrase
+            return
         raise last or LLMError(MSG_BAD)
 
     async def _hedged(self, plan: "_Plan", hedge_s: float, history: list[Exchange], user_text: str,
@@ -302,13 +358,20 @@ class GeminiLLM:
         запрос параллельно уходит на следующую модель за той, на которой сейчас основная цепочка (вторая цепочка,
         _chain с quiet). Основная при этом дальше своей текущей модели не идёт: остальные модели принадлежат запасной.
 
+        Запасная стартует и раньше таймера: когда основная получила перегрузку или сбой сети и собирается ждать 0,4 с, чтобы
+        повторить ту же модель (_chain зовёт plan.on_retry), запасной запрос уходит сразу, параллельно с этим повтором. Ошибки
+        «лимит» и «нет модели» хеджа не просят: цепочка и так переходит на следующую модель без паузы.
+
         Кто первой отдал первый кусок (текст, либо FLUSH перед вызовом функции), тот и отвечает; вторая отменяется
         сразу. Функции не выполняются дважды: пока цепочку не объявили победителем, из неё тянется ровно один элемент,
         а FLUSH и выполнение функции — это уже следующий шаг генератора, который проигравшей никто не даст сделать.
         Цепочка, упавшая до первого куска, просто выбывает (её ошибка уходит в debug), пока жива другая. Когда
         упали обе, поднимается ошибка той, что упала последней. Победитель, упавший после первого куска, ведёт себя
-        как раньше: ошибка наружу (повторять поздно, плате уже что-то ушло)."""
+        как раньше: ошибка наружу (повторять поздно, плате уже что-то ушло). Исключение: победитель, взявший слово вызовом
+        функции и упавший после неё до всякого текста, продолжает сам (см. _chain), в том числе на запасных моделях: хедж к этому
+        времени закончен, ограничение plan.limit снимается."""
         t0 = time.perf_counter()
+        loop = asyncio.get_running_loop()
         a = _Lane("primary", LLMStats(), t0)
         a.gen = self._chain(plan, 0, history, user_text, tools, a.stats)
         lanes = [a]
@@ -317,6 +380,38 @@ class GeminiLLM:
         last_err: BaseException | None = None
         last_dead: _Lane | None = None
         can_hedge = True
+        hedge_why = "timer"  # почему стартовала запасная: "timer" (нет первого слова за hedge_s) | "error" (основная упала, идёт повтор)
+        wake = loop.create_future()  # будит главный цикл, когда запасная стартовала не по его таймеру
+
+        def start_hedge(why: str) -> bool:
+            """Запасная цепочка на модели за той, где сейчас основная. Синхронная: основной цепочке ограничение plan.limit
+            ставится в тот же миг, и она не успеет сама уйти на ту же запасную модель."""
+            nonlocal b, can_hedge, hedge_why
+            if b is not None or winner is not None or not can_hedge:
+                return False
+            h = plan.cur + 1
+            if h >= len(plan.models):
+                can_hedge = False  # запасных за текущей моделью нет: хеджировать нечем
+                return False
+            plan.limit = h
+            sb = LLMStats()
+            b = _Lane("fallback", sb, time.perf_counter())
+            b.gen = self._chain(_Plan(plan.models), h, history, user_text, tools, sb, quiet=True)
+            lanes.append(b)
+            b.start()
+            hedge_why = why
+            if why == "timer":
+                log.info("ИИ: %s не дала первого слова за %d мс, параллельно спрашиваю %s (первая ответившая говорит, вторая "
+                         "отменяется)", plan.models[plan.cur], (b.t_start - t0) * 1000, plan.models[h])
+            else:
+                log.info("ИИ: %s перегружена или недоступна (%d мс от начала запроса): не жду таймера, сразу спрашиваю %s, пока "
+                         "основная повторяет запрос (первая ответившая говорит, вторая отменяется)", plan.models[plan.cur],
+                         (b.t_start - t0) * 1000, plan.models[h])
+            if not wake.done():
+                wake.set_result(None)
+            return True
+
+        plan.on_retry = lambda: start_hedge("error")
         a.start()
         try:
             while winner is None:
@@ -326,23 +421,13 @@ class GeminiLLM:
                 timeout = None
                 if b is None and can_hedge:
                     timeout = max(0.0, t0 + hedge_s - time.perf_counter())
-                done, _ = await asyncio.wait([ln.task for ln in live], timeout=timeout,
+                done, _ = await asyncio.wait([*(ln.task for ln in live), wake], timeout=timeout,
                                              return_when=asyncio.FIRST_COMPLETED)
                 if not done:  # прошло hedge_s, а первого куска нет
-                    h = plan.cur + 1
-                    if h >= len(plan.models):
-                        can_hedge = False  # запасных за текущей моделью нет: хеджировать нечем
-                        continue
-                    plan.limit = h
-                    sb = LLMStats()
-                    b = _Lane("fallback", sb, time.perf_counter())
-                    b.gen = self._chain(_Plan(plan.models), h, history, user_text, tools, sb, quiet=True)
-                    lanes.append(b)
-                    b.start()
-                    log.info("ИИ: %s не дала первого слова за %d мс, параллельно спрашиваю %s (первая ответившая "
-                             "говорит, вторая отменяется)", plan.models[plan.cur], (b.t_start - t0) * 1000,
-                             plan.models[h])
+                    start_hedge("timer")
                     continue
+                if wake in done:
+                    wake = loop.create_future()
                 for ln in sorted((x for x in lanes if x.task.done() and not x.seen), key=lambda x: x.t_done):
                     ln.seen = True
                     if ln.error is not None:
@@ -352,9 +437,12 @@ class GeminiLLM:
                     elif winner is None:
                         winner = ln
             assert winner is not None
+            plan.on_retry = None
+            if winner is a:
+                plan.limit = None  # запасная отменена: если после функций основная упадёт, ей можно идти на запасные модели
             stats.attempts = sum(ln.stats.attempts for ln in lanes)
             if b is not None:
-                stats.hedge = winner.name if winner is b else "primary"
+                stats.hedge = ("fallback_err" if hedge_why == "error" else "fallback") if winner is b else "primary"
                 self._log_hedge_result(winner, [ln for ln in lanes if ln is not winner], t0)
             for ln in lanes:
                 if ln is not winner:
@@ -373,6 +461,7 @@ class GeminiLLM:
                 stats.attempts = sum(ln.stats.attempts for ln in lanes)
                 await winner.gen.aclose()
         finally:
+            plan.on_retry = None
             if winner is None:  # ошибка или отмена до первого куска: статистика последней упавшей (или основной)
                 _adopt(stats, (last_dead or a).stats)
                 stats.attempts = sum(ln.stats.attempts for ln in lanes)
@@ -407,35 +496,56 @@ class GeminiLLM:
         t.add_done_callback(self._reapers.discard)
 
     async def _run(self, backend: str, model: str, history: list[Exchange], user_text: str, tools: ToolRegistry,
-                   stats: LLMStats) -> AsyncIterator[Any]:
+                   stats: LLMStats, resume: "_Resume | None" = None) -> AsyncIterator[Any]:
         from google.genai import errors as gerr
         from google.genai import types
 
+        resume = resume if resume is not None else _Resume()
         stats.backend, stats.model = backend, model
         CONN_SINK.set(stats)  # крючок ответа клиента httpx запишет сюда new/reused (только первый запрос хода)
         client = self._client(backend)
-        contents = self._contents(history, user_text)
+        if resume.contents is not None:
+            # продолжение: прошлая попытка выполнила функции и упала до текста. Берём её contents с результатами, функции не зовём
+            contents, first_round = resume.contents, resume.next_round
+            if resume.signer != (backend, model):  # подписи «мыслей» привязаны к модели: на другой подставляем служебную
+                contents = resume.contents = _resign(contents)
+                resume.signer = (backend, model)
+                log.debug("ИИ: продолжение после функций на другой модели (%s), подписи заменены служебной", model)
+        else:
+            contents, first_round = self._contents(history, user_text, tools, with_calls=self._calls_in_history), 0
         t_req = time.perf_counter()
-        executed_tool = False
-        produced_text = False
-        for rnd in range(MAX_TOOL_ROUNDS):
+        for rnd in range(first_round, MAX_TOOL_ROUNDS):
             stats.rounds = rnd + 1
-            cfg = self._config(model, tools)
             parts_acc: list[Any] = []
             calls: list[Any] = []
             block_reason = ""
-            try:
-                stream = await asyncio.wait_for(
-                    client.aio.models.generate_content_stream(model=model, contents=contents, config=cfg),
-                    timeout=self.s.llm_first_token_timeout_s)
-            except gerr.APIError as e:
-                if getattr(e, "code", 0) == 400 and "thinking" in str(e).lower() and cfg.thinking_config is not None:
-                    log.warning("Модель %s не принимает настройку размышлений, отключаю её", model)
-                    self._no_thinking.add(model)
-                    stream = await client.aio.models.generate_content_stream(
-                        model=model, contents=contents, config=self._config(model, tools))
-                else:
-                    raise
+            # история с вызовами функций: если API её не принял (400), один раз повторяем с текстовой историей (как в 0.4.0)
+            history_calls = resume.contents is None and _has_function_parts(contents)
+            to_text = ""  # текст 400, если повторили с текстовой историей и ещё не знаем, помогло ли
+            stream = None
+            while stream is None:
+                cfg = self._config(model, tools)
+                try:
+                    stream = await asyncio.wait_for(
+                        client.aio.models.generate_content_stream(model=model, contents=contents, config=cfg),
+                        timeout=self.s.llm_first_token_timeout_s)
+                except gerr.APIError as e:
+                    msg = str(e)
+                    if getattr(e, "code", 0) == 400 and "thinking" in msg.lower() and cfg.thinking_config is not None:
+                        log.warning("Модель %s не принимает настройку размышлений, отключаю её", model)
+                        self._no_thinking.add(model)
+                    elif getattr(e, "code", 0) == 400 and history_calls:
+                        # подпись, порядок вызовов, незнакомая функция: что бы API ни не понравилось, ходу это не мешает
+                        history_calls, to_text = False, msg
+                        contents = self._contents(history, user_text, tools, with_calls=False)
+                        log.debug("ИИ: 400 при истории с вызовами функций, повторяю с текстовой историей: %s", _short(msg))
+                        if _blames_function_history(msg):
+                            self._history_to_text(msg)  # явная претензия к вызовам или подписи: больше не пробуем
+                            to_text = ""
+                    else:
+                        raise
+            if to_text:  # текстовая история прошла там, где с вызовами был отказ: значит, дело было в них
+                self._history_to_text(f"400 пропал, когда историю послали текстом: {to_text}")
             it = stream.__aiter__()
             try:
                 while True:
@@ -465,7 +575,7 @@ class GeminiLLM:
                         elif getattr(part, "text", None) and not getattr(part, "thought", False):
                             if stats.first_token_s is None:
                                 stats.first_token_s = time.perf_counter() - t_req
-                            produced_text = True
+                            resume.spoke = resume.text_after_flush = True
                             yield part.text
             finally:
                 aclose = getattr(stream, "aclose", None)
@@ -475,24 +585,37 @@ class GeminiLLM:
                     except Exception:
                         pass
             if not calls:
-                if not produced_text and not executed_tool:
-                    if block_reason:
+                if not resume.spoke:
+                    executed = resume.contents is not None
+                    if block_reason and not executed:
                         raise LLMError(MSG_SAFETY, f"заблокировано: {block_reason}", kind="other")
-                    raise LLMError(MSG_EMPTY, "пустой ответ", retryable=True, kind="empty")
+                    # после функций пустой ответ тоже ошибка: _chain повторит продолжение, а в крайнем случае озвучит итог функций
+                    raise LLMError(MSG_EMPTY, "пустое продолжение после функций" if executed else "пустой ответ",
+                                   retryable=True, kind="empty")
                 return
             # ИИ просит выполнить функции: отдать накопленный текст озвучке, выполнить, вернуть результат
+            resume.text_after_flush = False  # текст до вызова не в счёт: после результатов ИИ скажет итог, и его можно перезапросить
             yield FLUSH
-            executed_tool = True
             contents.append(types.Content(role="model", parts=parts_acc))
+            resume.signer = (backend, model)
             results = await asyncio.gather(*(tools.call(fc.name, dict(fc.args or {})) for fc in calls))
             resp_parts = []
             for fc, res in zip(calls, results):
                 stats.tool_calls.append(fc.name)
+                stats.tool_records.append(ToolCall(fc.name, dict(fc.args or {}), res, rnd))
                 log.info("функция %s(%s) -> %s", fc.name, dict(fc.args or {}), _short(str(res)))
                 resp_parts.append(types.Part(function_response=types.FunctionResponse(
                     name=fc.name, response=res, **({"id": fc.id} if getattr(fc, "id", None) else {}))))
             contents.append(types.Content(role="user", parts=resp_parts))
+            resume.contents, resume.next_round = contents, rnd + 1  # с этого места при ошибке продолжаем отсюда, функции не зовём заново
         raise LLMError(MSG_BAD, "слишком много вызовов функций подряд")
+
+    def _history_to_text(self, why: str) -> None:
+        """API не принял вызовы функций в истории: до перезапуска процесса историю шлём текстом (как в 0.4.0). Пишем в лог один раз."""
+        if self._calls_in_history:
+            self._calls_in_history = False
+            log.warning("ИИ: API не принял вызовы функций в истории разговора (%s); дальше в этом процессе историю шлю текстом, "
+                        "без вызовов (ИИ снова может говорить о действиях, которых не делал)", _short(why))
 
     async def aclose(self) -> None:
         reapers = list(self._reapers)
@@ -517,46 +640,75 @@ class GeminiLLM:
             self._http = None
 
     # --- прогрев соединения (listen_start): человек ещё говорит, а рукопожатие с Google уже идёт
-    def _pool_has_live_connection(self) -> bool | None:
-        """Есть ли в пуле простаивающее живое соединение (None: пул не разглядеть, внутренности httpx2 могли измениться)."""
+    def _pool_live_count(self) -> int | None:
+        """Сколько в пуле простаивающих живых соединений (None: пул не разглядеть, внутренности httpx2 могли измениться)."""
         try:
             # при прокси из окружения (HTTPS_PROXY) запросы идут через mounts, а не через основной транспорт
             transports = [self._http._transport, *self._http._mounts.values()]
-            return any(c.is_idle() and not c.has_expired() for t in transports if t is not None for c in t._pool.connections)
+            return sum(1 for t in transports if t is not None for c in t._pool.connections if c.is_idle() and not c.has_expired())
         except Exception:
             return None
 
+    def _pool_has_live_connection(self) -> bool | None:
+        """Есть ли в пуле простаивающее живое соединение (None: пул не разглядеть)."""
+        n = self._pool_live_count()
+        return None if n is None else n > 0
+
+    def _hedge_possible(self) -> bool:
+        return self.s.llm_hedge_ms > 0 and 1 + len(self.s.llm_fallback_models) >= 2
+
+    def _warm_target(self) -> int:
+        """Сколько живых соединений держать про запас. Хедж гонит основную и запасную модели параллельно, а HTTP/1.1 пускает по одному
+        запросу на соединение: одно тёплое соединение достаётся основной, запасная открывала бы своё на пути хода (llm_conn=new, +1-2 с
+        через VPN). Поэтому с хеджем и HTTP/1.1 греем два. HTTP/2 мультиплексирует запросы в одном соединении: хватает одного."""
+        return 2 if self._hedge_possible() and not http2_in_use(self.s.llm_http2) else 1
+
     def prewarm(self) -> None:
-        """Не ждёт и не бросает. Если живого соединения нет, открывает его запросом HEAD на корень хоста Google без ключа и тела:
-        квоту генерации это не тратит. Раньше первого обращения к ИИ (клиент ещё не создан) и без keep-alive ничего не делает."""
+        """Не ждёт и не бросает. Если живых соединений меньше нужного (_warm_target), открывает их параллельными запросами HEAD на корень
+        хоста Google без ключа и тела: квоту генерации это не тратит. Раньше первого обращения к ИИ (клиент ещё не создан) и без keep-alive
+        ничего не делает."""
         if self._http is None or not self.s.llm_prewarm or not self.s.api_key:
             return
         if self._prewarm_task is not None and not self._prewarm_task.done():
             return
         if time.monotonic() - self._prewarm_failed < 10.0:
             return  # недавно не вышло (нет VPN): не долбим на каждом listen_start
-        live = self._pool_has_live_connection()
-        if live is None:  # не разглядеть: считаем живым, если ответ был недавно
-            live = time.monotonic() - self._conn.last_ok < 20.0
-        if live:
+        want = self._warm_target()
+        if want > 1:
+            live = self._pool_live_count()
+        else:
+            ok = self._pool_has_live_connection()
+            live = None if ok is None else int(ok)
+        if live is None:  # не разглядеть: считаем всё тёплым, если ответ был недавно
+            live = want if time.monotonic() - self._conn.last_ok < 20.0 else 0
+        if live >= want:
             return
-        self._prewarm_task = asyncio.ensure_future(self._prewarm())
+        # HEAD идут одновременно и в количестве want, а не want - live: пул отдаёт запрос простаивающему соединению, и один HEAD
+        # лишь освежил бы живое, а не открыл второе; два одновременных HEAD гарантированно занимают два соединения
+        self._prewarm_task = asyncio.ensure_future(self._prewarm(want))
 
-    async def _prewarm(self) -> None:
-        CONN_SINK.set(None)
+    async def _head(self, url: str) -> tuple[str, int]:
+        sink = SimpleNamespace(conn="-")  # своя статистика у каждого запроса: ConnTracker скажет, новое оно открыло или нет
+        CONN_SINK.set(sink)
+        r = await self._http.head(url, timeout=8.0, follow_redirects=False)
+        return sink.conn, r.status_code
+
+    async def _prewarm(self, count: int = 1) -> None:
         t0 = time.perf_counter()
         url = self._base_url or ORIGINS.get(self._backend_order()[0], ORIGINS["gemini"])
-        try:
-            r = await self._http.head(url, timeout=8.0, follow_redirects=False)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
+        results = await asyncio.gather(*(asyncio.ensure_future(self._head(url)) for _ in range(count)), return_exceptions=True)
+        for r in results:
+            if isinstance(r, asyncio.CancelledError):
+                raise r
+        good = [r for r in results if not isinstance(r, BaseException)]
+        if not good:
             self._prewarm_failed = time.monotonic()
-            log.debug("ИИ: прогрев соединения не удался: %s", _short(f"{type(e).__name__}: {e}"))
+            log.debug("ИИ: прогрев соединения не удался: %s", _short(f"{type(results[0]).__name__}: {results[0]}"))
             return
-        lvl = logging.INFO if self._conn.last_conn == "new" else logging.DEBUG
-        log.log(lvl, "ИИ: соединение %s за %d мс (прогрев на listen_start, HTTP %d)",
-                "открыто" if self._conn.last_conn == "new" else "уже было", (time.perf_counter() - t0) * 1000, r.status_code)
+        new = sum(1 for conn, _ in good if conn == "new")
+        lvl = logging.INFO if new else logging.DEBUG
+        log.log(lvl, "ИИ: соединений открыто %d из %d за %d мс (прогрев на listen_start, HTTP %d)", new, len(good),
+                (time.perf_counter() - t0) * 1000, good[0][1])
 
     async def warmup(self) -> None:
         """Импорт SDK (тяжёлый, держит GIL) и первое соединение с Google делаем при старте, а не на первой фразе."""
@@ -604,6 +756,90 @@ class _Plan:
     models: list[str]
     cur: int = 0
     limit: int | None = None
+    # крючок хеджа: _chain зовёт его, когда основная модель упала с перегрузкой или сетью и ждёт 0,4 с перед повтором
+    on_retry: Callable[[], Any] | None = None
+
+
+@dataclass
+class _Resume:
+    """Состояние хода, общее для попыток одной цепочки (_chain): что уже сделано, чтобы после ошибки продолжать, а не начинать заново."""
+
+    contents: list[Any] | None = None  # contents с выполненными функциями и их результатами; None: функции в этом ходе ещё не вызывали
+    next_round: int = 0  # с какого раунда цикла вызова функций продолжать
+    signer: tuple[str, str] | None = None  # (бэкенд, модель), чьи подписи «мыслей» лежат в contents
+    spoke: bool = False  # хоть какой-то текст за ход уже отдан
+    text_after_flush: bool = False  # после последнего вызова функций уже пошёл текст: перезапрашивать поздно, он мог уйти на плату
+
+    def resumable(self) -> bool:
+        """Функции выполнены, а текста после них ещё не было: ошибку можно пережить, не вызывая функции повторно."""
+        return self.contents is not None and not self.text_after_flush
+
+
+def _by_round(calls: list[ToolCall]) -> list[list[ToolCall]]:
+    """Вызовы по раундам: подряд идущие с одним номером были параллельными (один ответ модели)."""
+    out: list[list[ToolCall]] = []
+    for c in calls:
+        if out and out[-1][0].round == c.round:
+            out[-1].append(c)
+        else:
+            out.append([c])
+    return out
+
+
+def _has_function_parts(contents: list[Any]) -> bool:
+    return any(getattr(p, "function_call", None) is not None or getattr(p, "function_response", None) is not None
+               for c in contents for p in (getattr(c, "parts", None) or []))
+
+
+def _blames_function_history(msg: str) -> bool:
+    """Текст ошибки 400 прямо называет вызовы функций, их порядок или подпись «мысли»."""
+    low = msg.lower()
+    return any(w in low for w in ("signature", "function call", "function response", "function_call", "function_response",
+                                  "functioncall", "functionresponse"))
+
+
+def _resign(contents: list[Any]) -> list[Any]:
+    """contents для другой модели: подписи «мыслей» привязаны к модели, поэтому у каждого шага function_call (у первого вызова шага)
+    ставится служебная подпись, а чужие «мысли» выбрасываются. Остальное как есть."""
+    from google.genai import types
+
+    out = []
+    for c in contents:
+        if getattr(c, "role", None) != "model":
+            out.append(c)
+            continue
+        parts, first = [], True
+        for p in getattr(c, "parts", None) or []:
+            fc = getattr(p, "function_call", None)
+            if fc is not None:
+                parts.append(types.Part(
+                    function_call=types.FunctionCall(name=fc.name, args=dict(fc.args or {}),
+                                                     **({"id": fc.id} if getattr(fc, "id", None) else {})),
+                    thought_signature=INJECTED_SIGNATURE if first else None))
+                first = False
+            elif getattr(p, "text", None) and not getattr(p, "thought", False):
+                parts.append(types.Part(text=p.text))
+        if parts:
+            out.append(types.Content(role="model", parts=parts))
+    return out
+
+
+def fallback_phrase(records: list[ToolCall]) -> str:
+    """Короткая честная фраза по результатам функций, когда ИИ не смог их озвучить (ошибка после выполненных функций).
+    Смотрим на последний вызов: раньше ИИ мог исправляться повторами."""
+    res = records[-1].response if records else {}
+    if not isinstance(res, dict):
+        res = {}
+    if res.get("error") == "needs_confirmation":  # питание: действие ждёт ответа «да», выполнено не будет
+        return "Подтвердите, сэр: точно выполнить?"
+    cand = res.get("candidates")
+    if res.get("error") == "ambiguous" and isinstance(cand, list) and cand:
+        return f"Подходит несколько вариантов: {', '.join(str(x) for x in cand[:3])}. Какой нужен, сэр?"
+    if not call_ok(res):
+        return "Не вышло, сэр."
+    if res.get("ok") is True:
+        return "Готово, сэр."
+    return "Не успел ответить, сэр. Спросите ещё раз."  # у функции нет поля ok (get_time): итог в двух словах не передать
 
 
 class _Lane:
@@ -640,6 +876,7 @@ def _adopt(dst: LLMStats, src: LLMStats) -> None:
     dst.backend, dst.model = src.backend, src.model
     dst.first_token_s = src.first_token_s
     dst.tool_calls = list(src.tool_calls)
+    dst.tool_records = list(src.tool_records)
     dst.rounds = src.rounds
     dst.conn = src.conn
 
@@ -690,6 +927,7 @@ class MockLLM:
                 yield FLUSH
                 res = await tools.call("get_time", {})
                 stats.tool_calls.append("get_time")
+                stats.tool_records.append(ToolCall("get_time", {}, res, 0))
                 stats.rounds += 1
                 t = res.get("time", "")
                 tail = [f"Сейчас {t}, {res.get('weekday', '')}, {res.get('date', '')}. ",

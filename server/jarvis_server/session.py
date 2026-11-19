@@ -14,11 +14,12 @@ from typing import Any, Protocol
 from . import __version__, protocol
 from .addressing import SilenceGate, follow_prompt, gate_stream, named_jarvis
 from .audio import float_to_pcm16
+from .claims import lied
 from .config import Settings
 from .engines import Engines, is_fatal_gpu_error
 from .followguard import follow_reject_reason
 from .llm import FLUSH, MSG_SAFETY, LLMError, LLMStats, classify_exception
-from .memory import ConversationMemory
+from .memory import ConversationMemory, ToolCall
 from .pacing import AudioPacer
 from .sentences import Chunk, SentenceSplitter, split_long
 from .textnorm import clean_markdown, mute_own_name, normalize_ru, strip_wake_word
@@ -68,6 +69,7 @@ class _TurnCtx:
         self.spoken: list[str] = []
         self.error: LLMError | None = None
         self.user_text = ""  # распознанная фраза (для памяти разговора)
+        self.calls: list[ToolCall] = []  # фактические вызовы функций хода (имя, аргументы, ответ): тоже в память разговора
         self.cancelled = False  # ход отменяют (abort / новый listen_start / обрыв): плате больше ничего не отправлять
         self.user_text_sent = True  # user_text (субтитр «Вы: ...») ушёл на плату; в follow с вопросом к ИИ он ждёт решения «отвечать/молчать»
         self.silent: tuple[str, str] | None = None  # (вид, причина): follow, ИИ решил молчать; плате уйдёт только state idle
@@ -350,8 +352,9 @@ class Session:
             if tm.total_turn_ms is None:
                 tm.total_turn_ms = (time.perf_counter() - t_stop) * 1000
             self.turns_done += 1
-            if ctx.spoken and ctx.user_text:  # в память идёт то, что реально ушло на плату (и при abort тоже)
-                self.memory.add(ctx.user_text, " ".join(ctx.spoken))
+            if ctx.spoken and ctx.user_text:  # в память идёт то, что реально ушло на плату (и при abort тоже), вместе с вызовами функций
+                self.memory.add(ctx.user_text, " ".join(ctx.spoken), ctx.calls)
+                tm.claim = self._claim(" ".join(ctx.spoken), tm, ctx)
             if tm.outcome not in ("aborted", "disconnected"):  # отменённый ход музыку не трогает: это сделает abort или новая запись
                 await self._music_turn_end()
             if self.music is not None:
@@ -359,6 +362,16 @@ class Session:
             log.info(tm.line())
             if self.state == "busy":
                 self.state = "idle"
+
+    def _claim(self, spoken: str, tm: TurnTiming, ctx: _TurnCtx) -> bool:
+        """Счётчик «вранья» (claim=1 в TURN, только лог): ИИ сказал «Открываю», а функцию управления ПК не вызвал или она не удалась."""
+        try:
+            if not self.eng.tools.is_available("open_app"):  # функций управления ПК нет (выключатель, нет Hyprland): врать им не о чем
+                return False
+            return lied(spoken, tm.tools, ctx.calls)
+        except Exception:  # счётчик не должен ронять ход
+            log.debug("счётчик claim не сработал", exc_info=True)
+            return False
 
     def _maybe_fatal(self, exc: BaseException) -> None:
         """Сбой CUDA: просим главный процесс перезапуститься (systemd поднимет сервер заново за ~минуту)."""
@@ -457,6 +470,7 @@ class Session:
             finally:
                 tm.model = stats.model
                 tm.tools = list(stats.tool_calls)
+                ctx.calls = list(stats.tool_records)
                 tm.llm_hedge = stats.hedge
                 tm.llm_conn = stats.conn
                 first_word.set()

@@ -83,8 +83,24 @@ def test_prompt_text_rules():
     for quoted in re.findall(r"«([^»]+)»", MUSIC_PROMPT):
         assert "джарвис" not in quoted.lower()
     for needle in ("play_music", "music_control", "media_control", "where", "box", "laptop", "soundcloud", "local", "artist",
-                   "ok=true", "ambiguous", "note", "spotify", "на компе", "по умолчанию", "колонк", "ищу, сэр", "пятнадцати секунд"):
+                   "ok=true", "ambiguous", "note", "spotify", "на компе", "по умолчанию", "колонк", "секунду, сэр", "пятнадцати секунд", "до ответа функции"):
         assert needle in low, needle
+
+
+def test_music_wording_fits_the_claim_counter_of_the_pc_prompt():
+    """Правило skills/pc/prompt.py: о действии говорить можно, только если функция в этом ходе вернула ok=true. Слова до вызова
+    («Секунду, сэр») действием не считаются, а «Включаю» после удачного play_music не ложь."""
+    from types import SimpleNamespace
+
+    from jarvis_server.claims import claims_action, lied
+    from jarvis_server.skills.pc.prompt import PC_PROMPT
+
+    assert not claims_action("Секунду, сэр.") and claims_action("Ищу, сэр.")
+    ok = SimpleNamespace(response={"ok": True})
+    bad = SimpleNamespace(response={"ok": False, "error": "not_found"})
+    assert not lied("Секунду, сэр. Включаю, сэр.", ["play_music"], [ok])
+    assert lied("Секунду, сэр. Включаю, сэр.", ["play_music"], [bad]) and lied("Включаю, сэр.", [], [])
+    assert "play_music" in PC_PROMPT and "«ищу»" in MUSIC_PROMPT  # обе подсказки говорят одно: «ищу» и «включаю» только после ok=true
 
 
 # ------------------------------------------------------------------------------------------------ play_music: куда играть
