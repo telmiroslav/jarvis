@@ -255,3 +255,72 @@ async def test_ipc_error_response_and_lost_connection(tmp_path, sock):
     await ipc.close()
     with pytest.raises(Exception):
         await ipc.get("volume")
+
+
+# ------------------------------------------------------------------------------------------------ ошибка загрузки видна сразу
+
+BOT = "ERROR: [youtube] LHiSYbn2pUU: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication."
+
+
+async def test_bot_check_from_the_ytdl_hook_is_detected_in_a_moment_not_after_the_timeout(tmp_path, sock):
+    pl, sp, clock = rig(tmp_path, sock, load_error=BOT, never_plays=True)  # mpv не играет и не выходит (как у человека в Китае)
+    t0 = clock()
+    with pytest.raises(MusicError) as e:
+        await pl.play(queue(1), 0, timeout=16.0)
+    assert e.value.code == "blocked" and "не робот" in e.value.message
+    assert clock() - t0 < 2.0  # а не 16 с и «сеть отвечает медленно»
+    proc = sp.procs[0]
+    assert ["request_log_messages", "error"] in proc.commands  # текст ошибки ytdl_hook читаем из событий mpv
+    assert proc.commands[-1] == ["quit"] and pl.state == "idle"  # зависший mpv закрыт
+
+
+async def test_every_playlist_entry_failing_is_a_failure_but_one_failed_entry_is_skipped(tmp_path, sock):
+    pl, sp, clock = rig(tmp_path, sock, load_error=BOT, never_plays=True, error_events=3, hang=False, stderr="[ytdl_hook] " + BOT)
+    with pytest.raises(MusicError) as e:
+        await pl.play(queue(3), 0, timeout=16.0)  # все три записи не загрузились, mpv вышел (то же сообщение у него в stderr)
+    assert e.value.code == "blocked"
+    pl, sp, clock = rig(tmp_path, sock, load_error="ERROR: Video unavailable", error_events=1, error_at_poll=1)
+    orig = sp.__call__
+
+    async def spawn(argv, env):
+        p = await orig(argv, env)
+        p.props["playlist-pos"] = 1  # первая запись не загрузилась, mpv сам перешёл ко второй и она играет
+        return p
+
+    pl._spawn = spawn
+    track = await pl.play(queue(3), 0)
+    assert track.title == "Трек 2" and pl.state == "playing"
+    await pl.close()
+    # с --playlist-start=2 mpv пробует только последнюю запись: одной ошибки достаточно
+    pl, sp, clock = rig(tmp_path, sock, load_error="ERROR: Video unavailable", never_plays=True, error_events=1)
+    with pytest.raises(MusicError) as e:
+        await pl.play(queue(3), 2, timeout=16.0)
+    assert e.value.code == "unavailable"
+
+
+async def test_failure_text_falls_back_to_mpv_stderr_without_log_messages_or_any_text(tmp_path, sock):
+    # старый mpv не знает request_log_messages: текст берём из stderr процесса
+    pl, sp, clock = rig(tmp_path, sock, load_error="", never_plays=True, supports_log_messages=False, stderr="[ytdl_hook] " + BOT)
+    with pytest.raises(MusicError) as e:
+        await pl.play(queue(1), 0, timeout=16.0)
+    assert e.value.code == "blocked"
+    # событие есть, а текста нигде нет: общая ошибка (но тоже сразу)
+    pl, sp, clock = rig(tmp_path, sock, load_error="", never_plays=True)
+    t0 = clock()
+    with pytest.raises(MusicError) as e:
+        await pl.play(queue(1), 0, timeout=16.0)
+    assert e.value.code == "failed" and clock() - t0 < 2.0
+
+
+async def test_events_and_log_messages_are_collected_by_the_ipc_client(tmp_path, sock):
+    proc = FakeMpvProc(sock, 1, load_error="ERROR: что-то", never_plays=True, error_events=2)
+    await proc.start()
+    ipc = MpvIpc(sock)
+    await ipc.connect(1.0)
+    await ipc.command("request_log_messages", "error")
+    await ipc.get("core-idle")
+    with pytest.raises(Exception):
+        await ipc.get("time-pos")  # на втором опросе mpv присылает сообщение и два end-file, потом ответ (позиции пока нет)
+    assert ipc.load_errors == 2 and "[ytdl_hook] ERROR: что-то" in ipc.error_text()
+    proc.kill()
+    await ipc.close()

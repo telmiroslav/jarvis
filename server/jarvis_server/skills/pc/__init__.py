@@ -35,6 +35,7 @@ def register_pc_tools(reg: ToolRegistry, settings: Any, *, runner: Runner | None
     session = HyprSession(runner, finder, dialect=getattr(settings, "pc_hypr_dialect", "auto"))
     pc = PcControl(session, runner, apps or AppIndex(), which=which, **kw)
     pc.register(reg)
+    reg.services["pc"] = pc  # музыка (skills/music) открывает через неё страницы в браузере: can_open_url() и open_url()
     log.info("управление ПК: функции подключены (%d), появятся у ИИ, пока найден сеанс Hyprland", len(pc._specs()))
     return pc
 

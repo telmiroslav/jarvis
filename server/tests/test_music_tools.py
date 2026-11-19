@@ -58,7 +58,7 @@ def test_registered_tools_blocks_and_service(rig):
     decl = {d["name"]: d for d in rig.registry.declarations()}
     play = decl["play_music"]["parameters"]
     assert play["required"] == ["query"]
-    assert play["properties"]["where"]["enum"] == ["box", "laptop"]
+    assert play["properties"]["where"]["enum"] == ["box", "laptop", "browser"]
     assert play["properties"]["source"]["enum"] == ["auto", "youtube", "soundcloud", "local"]
     assert play["properties"]["kind"]["enum"] == ["track", "artist"]
     ctl = decl["music_control"]["parameters"]
@@ -86,6 +86,39 @@ def test_prompt_text_rules():
     for needle in ("play_music", "music_control", "media_control", "where", "box", "laptop", "soundcloud", "local", "artist",
                    "ok=true", "ambiguous", "note", "spotify", "на компе", "по умолчанию", "колонк", "секунду, сэр", "пятнадцати секунд", "до ответа функции"):
         assert needle in low, needle
+
+
+def test_prompt_rules_full_title_browser_target_and_honest_notes():
+    from jarvis_server.skills.pc.prompt import PC_PROMPT
+
+    low = MUSIC_PROMPT.lower()
+    # query целиком, слова не терять, ошибки распознавания не повод сокращать (случай «Capsize» вместо «Cupsize ты любишь танцевать»)
+    for needle in ("целиком", "ничего не выбрасывай", "не сокращай до одного слова", "«капсайз ты любишь танцевать»", "«cupsize ты любишь танцевать»",
+                   "а не «capsize»", "source не указывай, пока сэр не назвал сервис"):
+        assert needle in low, needle
+    # «в браузере» и «на ютубе» + «включи трек» это play_music с where=browser, а не поиск и не открытие сайта
+    for needle in ("where=browser", "в браузере", "на ютубе", "web_search", "open_website", "ничего не включают", "browser"):
+        assert needle in low, needle
+    assert "play_music с where=browser" in MUSIC_PROMPT and "web_search и open_website для этого не годятся" in MUSIC_PROMPT
+    # жёсткое правило остаётся: слова о действии только после ok=true, до вызова одно «Секунду, сэр»
+    for needle in ("говори «включаю» или «включил» только если play_music вернула ok=true в этом ходе", "секунду, сэр", "слов «ищу» и «включаю» до ответа функции нельзя"):
+        assert needle in low, needle
+    # запасной SoundCloud и страница в браузере: ИИ передаёт их честно, коротко
+    for needle in ("note", "youtube не пустил, играет с soundcloud", "открыл страницу в браузере", "открыл в браузере, сэр", "не обещай, что она играет", "media_control"):
+        assert needle in low, needle
+    assert "джарвис" not in low and "jarvis" not in low
+    # подсказка про ноутбук говорит то же и не противоречит: поиск и сайты только открывают, трек в браузере включает play_music
+    pc = PC_PROMPT.lower()
+    assert "where=browser" in pc and "только открывают страницу" in pc and "джарвис" not in pc
+
+
+def test_tool_schema_describes_the_browser_target_the_full_query_and_the_note(rig):
+    decl = {d["name"]: d for d in rig.registry.declarations()}["play_music"]
+    props = decl["parameters"]["properties"]
+    assert "browser" in props["where"]["enum"] and "браузере" in props["where"]["description"]
+    assert "целиком" in props["query"]["description"] and "не указывай" in props["source"]["description"]
+    d = decl["description"]
+    assert "where=browser" in d and "note" in d and "SoundCloud" in d and "title" in d
 
 
 def test_music_wording_fits_the_claim_counter_of_the_pc_prompt():

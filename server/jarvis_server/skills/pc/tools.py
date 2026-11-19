@@ -430,6 +430,15 @@ class PcControl:
     async def _open_url(self, url: str) -> None:
         await self._dispatch(Dispatch.exec(shlex.join(["xdg-open", url])))
 
+    def can_open_url(self) -> bool:
+        """Для набора музыки (skills/music): страницу в браузере открыть можно, пока есть сеанс Hyprland (проверка дешёвая)."""
+        return self.session.available()
+
+    async def open_url(self, url: str) -> dict[str, Any]:
+        """Для набора музыки: открыть страницу тем же путём, что open_website (проверка адреса, hyprctl dispatch exec, xdg-open без shell
+        и в кавычках). Ответ тот же, что у функции: {"ok": True, ...} или {"ok": False, "error": ..., "message": ...}."""
+        return await self.open_website(url)
+
     async def open_website(self, url: Any = None) -> dict[str, Any]:
         async def go() -> dict[str, Any]:
             try:

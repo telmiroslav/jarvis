@@ -185,6 +185,24 @@ class FakeBoard:
         return len(self.pcm()) / 2 / RATE
 
 
+class FakeBrowser:
+    """Чем музыка открывает страницы в браузере (набор pc: can_open_url, open_url). Настоящий браузер и xdg-open не запускаются:
+    адреса только записываются. available=False: сеанса Hyprland нет; fail: сеанс есть, а команда не прошла."""
+
+    def __init__(self, *, available: bool = True, fail: dict | None = None):
+        self.available, self.fail = available, fail
+        self.opened: list[str] = []
+
+    def can_open_url(self) -> bool:
+        return self.available
+
+    async def open_url(self, url: str) -> dict:
+        if self.fail is not None:
+            return {"ok": False, **self.fail}
+        self.opened.append(url)
+        return {"ok": True, "url": url, "message": "Открыл страницу в браузере"}
+
+
 def make_queue(n: int, seconds: float = 10.0, prefix: str = "t") -> list[Track]:
     return [Track(f"Трек {i + 1}", f"https://example.com/{prefix}{i + 1}", "youtube", duration=seconds) for i in range(n)]
 
