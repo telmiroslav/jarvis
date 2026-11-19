@@ -45,6 +45,25 @@ public:
     // Громкость того, что играет сейчас (по последнему куску в 20 мс), dBFS; в тишине kFloorDbfs. Для лица на экране.
     float level_dbfs() const { return level_dbfs_.load(); }
 
+    // v0.6.0: опорный сигнал для эхоподавления (aec.cc). После записи каждого куска в I2S (поток ответа или музыки; звонок и писк тоже) задача звука
+    // зовёт tap с тем, что РЕАЛЬНО ушло в динамик (после громкости). tap должна быть быстрой и ничего не ждать. nullptr: без опорного сигнала.
+    struct RefChunk {
+        const int16_t *mono = nullptr;   // n отсчётов 24 кГц, моно (остаток куска после настоящего звука это нули)
+        size_t n = 0;                    // обычно kChunkSamples (20 мс), у последнего куска звонка меньше
+        size_t real = 0;                 // сколько из них настоящий звук (остальное тишина)
+        int64_t t_us = 0;                // esp_timer_get_time() сразу после возврата из записи в I2S
+        bool blocked = false;            // запись ждала свободный буфер DMA (вернулась в такт I2S); при быстром возврате в пустую очередь false
+        bool first = false;              // первый кусок потока или звука (между ними такты шли тишиной: отсчёт времени начинается заново)
+    };
+    using RefTapFn = void (*)(void *ctx, const RefChunk &chunk);
+    void set_ref_tap(RefTapFn fn, void *ctx)
+    {
+        ref_ctx_.store(ctx);
+        ref_tap_.store(fn);
+    }
+    // Глубина очереди DMA динамика, мс: запись возвращается, когда данные ещё ждут своей очереди до этого времени (шесть буферов по 10 мс)
+    static constexpr uint32_t kDmaDepthMs = 60;
+
     uint32_t stream_chunks() const { return stream_chunks_.load(); }
     uint32_t plays() const { return plays_.load(); }
     uint32_t write_errors() const { return write_errors_.load(); }
@@ -69,6 +88,8 @@ private:
     std::atomic<float> level_dbfs_{dsp::kFloorDbfs};
     std::atomic<uint32_t> plays_{0};
     std::atomic<uint32_t> write_errors_{0};
+    std::atomic<RefTapFn> ref_tap_{nullptr};
+    std::atomic<void *> ref_ctx_{nullptr};
 };
 
 }  // namespace jarvis

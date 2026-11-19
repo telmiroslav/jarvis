@@ -339,12 +339,17 @@ bool parse_server_message(const char *json, size_t len, ServerMsg *out)
                     return false;
                 }
                 done = true;
+            } else if (streq(key, "title") && is_str) {
+                if (!parse_string(c, out->title, sizeof(out->title), &out->title_truncated)) {
+                    return false;
+                }
+                done = true;
             } else if (streq(key, "server") && is_str) {
                 if (!parse_string(c, out->server, sizeof(out->server), &trunc_dummy)) {
                     return false;
                 }
                 done = true;
-            } else if ((streq(key, "proto") || streq(key, "tts_rate") || streq(key, "rate")) && !is_str &&
+            } else if ((streq(key, "proto") || streq(key, "tts_rate") || streq(key, "rate") || streq(key, "volume")) && !is_str &&
                        *c.p != '{' && *c.p != '[' && *c.p != 't' && *c.p != 'f' && *c.p != 'n') {
                 long v = 0;
                 if (!parse_number(c, &v)) {
@@ -354,6 +359,8 @@ bool parse_server_message(const char *json, size_t len, ServerMsg *out)
                     out->proto = static_cast<int>(v);
                 } else if (streq(key, "tts_rate")) {
                     out->tts_rate = static_cast<int>(v);
+                } else if (streq(key, "volume")) {
+                    out->volume = static_cast<int>(v);
                 } else {
                     out->rate = static_cast<int>(v);
                 }
@@ -412,6 +419,20 @@ bool parse_server_message(const char *json, size_t len, ServerMsg *out)
         out->kind = Kind::AudioEnd;
     } else if (streq(type, "pong")) {
         out->kind = Kind::Pong;
+    } else if (streq(type, "music_start")) {
+        out->kind = Kind::MusicStart;
+    } else if (streq(type, "music_title")) {
+        out->kind = Kind::MusicTitle;
+    } else if (streq(type, "music_pause")) {
+        out->kind = Kind::MusicPause;
+    } else if (streq(type, "music_resume")) {
+        out->kind = Kind::MusicResume;
+    } else if (streq(type, "music_volume")) {
+        out->kind = Kind::MusicVolume;
+    } else if (streq(type, "music_stop")) {
+        out->kind = Kind::MusicStop;
+    } else if (streq(type, "music_end")) {
+        out->kind = Kind::MusicEnd;
     } else {
         out->kind = Kind::Unknown;
     }
@@ -425,6 +446,7 @@ const char *out_text(OutMsg m)
     case OutMsg::ListenStartWake: return "{\"type\":\"listen_start\",\"mode\":\"wake\"}";
     case OutMsg::ListenStartFollow: return "{\"type\":\"listen_start\",\"mode\":\"follow\"}";
     case OutMsg::ListenStop:  return "{\"type\":\"listen_stop\"}";
+    case OutMsg::MusicDone:   return "{\"type\":\"music_done\"}";
     case OutMsg::Abort:       return "{\"type\":\"abort\"}";
     case OutMsg::Ping:
     default:                  return "{\"type\":\"ping\"}";
@@ -436,7 +458,7 @@ size_t build_hello(char *buf, size_t cap, const char *fw, const char *mac)
     char fw_esc[64], mac_esc[40];
     text::json_escape(fw ? fw : "", fw_esc, sizeof(fw_esc));
     text::json_escape(mac ? mac : "", mac_esc, sizeof(mac_esc));
-    const int n = snprintf(buf, cap, "{\"type\":\"hello\",\"proto\":%d,\"fw\":\"%s\",\"mac\":\"%s\",\"mic_rate\":%d,\"spk_rate\":%d}",
+    const int n = snprintf(buf, cap, "{\"type\":\"hello\",\"proto\":%d,\"fw\":\"%s\",\"mac\":\"%s\",\"mic_rate\":%d,\"spk_rate\":%d,\"caps\":[\"music\"]}",
                            kVersion, fw_esc, mac_esc, kMicRate, kSpkRate);
     if (n < 0) {
         if (cap > 0) {

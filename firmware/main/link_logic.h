@@ -61,7 +61,7 @@ const char *phase_name(Phase p);
 
 constexpr uint32_t kConnectTimeoutMs = 8000;     // WebSocket не открылся за это время: считаем отказом
 constexpr uint32_t kWelcomeTimeoutMs = 3000;     // после hello welcome не пришёл: это не наш сервер
-constexpr uint32_t kPingEveryMs = 10000;         // PROTOCOL.md: ping раз в 10 с без другого трафика (с v0.5.1 трафик это и приём, и передача)
+constexpr uint32_t kPingEveryMs = 10000;         // PROTOCOL.md: ping раз в 10 с без другого трафика (с v0.5.1 трафик это и приём, и передача; с v0.6.0 приём кадров музыки тоже)
 constexpr uint32_t kPongTimeoutMs = 8000;        // pong не пришёл: связь мертва
 // v0.5.1: передача звука больше не убивает связь, когда сокет на время не принимает данные (WebSocket-клиент при любом таймауте записи
 // рвёт соединение, поэтому link.cc сам проверяет, что сокет готов, и не пишет, пока он не готов). Простой передачи:

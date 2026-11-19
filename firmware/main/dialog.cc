@@ -209,6 +209,14 @@ Out Dialog::on_release(uint32_t now)
         to_idle(now, &o);
         texts_clear_set_ = false;
         o.clear_texts = true;
+        return o;   // нажатие только убрало ошибку; музыку (если она есть) не трогает
+    }
+    if (phase_ == Phase::Idle && music_ && link_) {
+        // v0.6.0: музыка играет (или на паузе), ни записи, ни ответа нет: короткое нажатие = стоп. Серверу abort («стоп» музыки; он отвечает state idle,
+        // а ответа, который надо было бы пометить «устаревшим», нет)
+        o.music_stop = true;
+        o.abort = true;
+        music_stops_++;
     }
     return o;
 }

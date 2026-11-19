@@ -81,6 +81,29 @@ bool set_wake_gain_db(int db);              // 0..18
 bool set_wake_engine_mww(bool mww);         // true = microWakeWord, false = ESP-SR; действует после перезагрузки
 bool set_wake_mww_threshold(double thr);    // 0 = из манифеста; иначе 0,50..0,99
 bool set_wake_mww_barge_thr(double thr);    // 0 = автоматически; иначе 0,50..0,99
+// v0.6.0, эхоподавление для слова поверх музыки (aec.cc, консоль: aec on|off, aec voice on|off, aec delay <мс>, aec taps <1..8>, aec mode sr_low|sr_high|fd_low|fd_high,
+// aec nlp <0..2>). Ключи в NVS: aec_on (по умолчанию 1), aec_voice (подавлять эхо и от голоса Джарвиса, по умолчанию 1), aec_dly (задержка опоры, мс 0..250,
+// по умолчанию 60), aec_taps (filter_length 1..8, по умолчанию 4), aec_mode (0 sr_low, 1 sr_high, 2 fd_low, 3 fd_high; по умолчанию 2), aec_nlp (0..2, по умолчанию 0).
+// Мусор в NVS игнорируется: остаётся значение по умолчанию.
+struct AecSettings {
+    bool enabled = true;
+    bool voice = true;
+    int delay_ms = 60;
+    int taps = 4;
+    int mode = 2;
+    int nlp = 0;
+};
+AecSettings get_aec();
+bool set_aec_enabled(bool on);
+bool set_aec_voice(bool on);
+bool set_aec_delay_ms(int ms);      // 0..250
+bool set_aec_taps(int taps);        // 1..8
+bool set_aec_mode(int mode);        // 0..3 (aec_logic::Mode)
+bool set_aec_nlp(int level);        // 0..2
+// Сторож эхоподавления (ключ aec_guard): ставится при первом включении AEC после загрузки и снимается после ~20 с его работы. Если плата перезагрузилась, пока
+// он стоял (AEC упало), при следующей загрузке AEC выключен (и сохранено «выключено»), пока не отправят «aec on» и не перезагрузят плату.
+bool get_aec_guard();
+bool set_aec_guard(bool set);
 // Сторож запуска движка слова: ставится перед созданием AFE и снимается через 30 с работы. Если плата упала за это время,
 // при следующем запуске движок не поднимается (кнопка работает), пока не отправят «wake on» и не перезагрузят плату.
 bool get_wake_guard();

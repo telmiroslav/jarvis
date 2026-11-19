@@ -1,9 +1,9 @@
-// Inter (c) 2016 The Inter Project Authors, https://github.com/rsms/inter
+// Inter (c) 2016 The Inter Project Authors, https://github.com/rsms/inter; знаки ♪ и ⏸ (c) 2022 The Noto Project Authors, https://github.com/notofonts/symbols
 // Лицензия: SIL Open Font License 1.1 (текст рядом: OFL.txt). Файл сгенерирован gen_fonts.sh, руками не править.
 /*******************************************************************************
  * Size: 18 px
  * Bpp: 4
- * Opts: --bpp 4 --size 18 --format lvgl --no-compress --lv-font-name jv_font_text_18 --font @fontsource/inter/files/inter-latin-500-normal.woff -r 0x20-0x7E,0xA0,0xAB,0xB0,0xB7,0xBB,0x2013,0x2014,0x2018,0x2019,0x201C,0x201D,0x201E,0x2022,0x2026,0x20AC --font @fontsource/inter/files/inter-cyrillic-500-normal.woff -r 0x401,0x410-0x44F,0x451,0x2116 -o jv_font_text_18.c.tmp
+ * Opts: --bpp 4 --size 18 --format lvgl --no-compress --lv-font-name jv_font_text_18 --font @fontsource/inter/files/inter-latin-500-normal.woff -r 0x20-0x7E,0xA0,0xAB,0xB0,0xB7,0xBB,0x2013,0x2014,0x2018,0x2019,0x201C,0x201D,0x201E,0x2022,0x2026,0x20AC --font @fontsource/inter/files/inter-cyrillic-500-normal.woff -r 0x401,0x410-0x44F,0x451,0x2116 --font @fontsource/noto-sans-symbols/files/noto-sans-symbols-symbols-500-normal.woff -r 0x266A --font @fontsource/noto-sans-symbols-2/files/noto-sans-symbols-2-symbols-400-normal.woff -r 0x23F8 -o jv_font_text_18.c.tmp
  ******************************************************************************/
 
 #ifdef LV_LVGL_H_INCLUDE_SIMPLE
@@ -1750,7 +1750,24 @@ static LV_ATTRIBUTE_LARGE_CONST const uint8_t glyph_bitmap[] = {
     0x11, 0x11, 0x10, 0xcf, 0x10, 0x0, 0x7f, 0xfd,
     0x0, 0x0, 0x0, 0x0, 0xcf, 0x10, 0x0, 0xd,
     0xfd, 0x0, 0x0, 0x0, 0x0, 0xcf, 0x10, 0x0,
-    0x4, 0xfd, 0x0, 0x0, 0x0, 0x0
+    0x4, 0xfd, 0x0, 0x0, 0x0, 0x0,
+
+    /* U+23F8 "⏸" */
+    0xaf, 0xf0, 0xa, 0xff, 0xb, 0xff, 0x10, 0xbf,
+    0xf1, 0xbf, 0xf1, 0xb, 0xff, 0x1b, 0xff, 0x10,
+    0xbf, 0xf1, 0xbf, 0xf1, 0xb, 0xff, 0x1b, 0xff,
+    0x10, 0xbf, 0xf1, 0xbf, 0xf1, 0xb, 0xff, 0x1b,
+    0xff, 0x10, 0xbf, 0xf1, 0xbf, 0xf1, 0xb, 0xff,
+    0x1b, 0xff, 0x10, 0xbf, 0xf1, 0xbf, 0xf1, 0xb,
+    0xff, 0x18, 0xdd, 0x0, 0x8d, 0xd0,
+
+    /* U+266A "♪" */
+    0x0, 0x7, 0x0, 0x0, 0x0, 0xe0, 0x0, 0x0,
+    0xf, 0x90, 0x0, 0x0, 0xff, 0x50, 0x0, 0xe,
+    0xad, 0x0, 0x0, 0xe0, 0xe1, 0x0, 0xe, 0xb,
+    0x30, 0x0, 0xe0, 0xb1, 0x0, 0xe, 0xa, 0x3,
+    0xef, 0xd0, 0x20, 0xcf, 0xf8, 0x0, 0x8, 0xe9,
+    0x0, 0x0
 };
 
 
@@ -1936,7 +1953,9 @@ static const lv_font_fmt_txt_glyph_dsc_t glyph_dsc[] = {
     {.bitmap_index = 10117, .adv_w = 154, .box_w = 7, .box_h = 6, .ofs_x = 1, .ofs_y = 2},
     {.bitmap_index = 10138, .adv_w = 262, .box_w = 14, .box_h = 3, .ofs_x = 1, .ofs_y = 0},
     {.bitmap_index = 10159, .adv_w = 194, .box_w = 12, .box_h = 13, .ofs_x = 0, .ofs_y = 0},
-    {.bitmap_index = 10237, .adv_w = 316, .box_w = 18, .box_h = 14, .ofs_x = 1, .ofs_y = 0}
+    {.bitmap_index = 10237, .adv_w = 316, .box_w = 18, .box_h = 14, .ofs_x = 1, .ofs_y = 0},
+    {.bitmap_index = 10363, .adv_w = 262, .box_w = 9, .box_h = 12, .ofs_x = 4, .ofs_y = 0},
+    {.bitmap_index = 10417, .adv_w = 130, .box_w = 7, .box_h = 12, .ofs_x = 1, .ofs_y = 0}
 };
 
 /*---------------------
@@ -1949,7 +1968,7 @@ static const uint16_t unicode_list_1[] = {
 
 static const uint16_t unicode_list_3[] = {
     0x0, 0x1bc2, 0x1bc3, 0x1bc7, 0x1bc8, 0x1bcb, 0x1bcc, 0x1bcd,
-    0x1bd1, 0x1bd5, 0x1c5b, 0x1cc5
+    0x1bd1, 0x1bd5, 0x1c5b, 0x1cc5, 0x1fa7, 0x2219
 };
 
 /*Collect the unicode lists and glyph_id offsets*/
@@ -1968,8 +1987,8 @@ static const lv_font_fmt_txt_cmap_t cmaps[] =
         .unicode_list = NULL, .glyph_id_ofs_list = NULL, .list_length = 0, .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY
     },
     {
-        .range_start = 1105, .range_length = 7366, .glyph_id_start = 166,
-        .unicode_list = unicode_list_3, .glyph_id_ofs_list = NULL, .list_length = 12, .type = LV_FONT_FMT_TXT_CMAP_SPARSE_TINY
+        .range_start = 1105, .range_length = 8730, .glyph_id_start = 166,
+        .unicode_list = unicode_list_3, .glyph_id_ofs_list = NULL, .list_length = 14, .type = LV_FONT_FMT_TXT_CMAP_SPARSE_TINY
     }
 };
 

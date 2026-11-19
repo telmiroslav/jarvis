@@ -20,11 +20,14 @@
 #include "freertos/task.h"
 #include "model_path.h"
 
+#include "aec.h"
 #include "audio_in.h"
 #include "dsp.h"
 #include "mic_stream.h"
+#include "music.h"
 #include "mww.h"
 #include "mww_logic.h"
+#include "playback.h"
 #include "session.h"
 #include "settings.h"
 #include "time_util.h"
@@ -146,6 +149,12 @@ struct Ctx {
     int16_t *ring = nullptr;       // то, что уходит серверу (предзапись берётся отсюда)
     int16_t *eng_ring = nullptr;   // то же для движка: пока звучит ответ при включённом перебивании на 12 дБ тише
     int64_t ring_w = 0;            // сколько отсчётов принято всего (индекс следующего), общий для обоих колец
+    // v0.6.0: до какого индекса кольцо для движка (eng_ring) готово. Без эхоподавления eng_w == ring_w (sink пишет оба кольца сразу). Пока включён путь AEC
+    // (aec_path), блоки микрофона для движка идут через AEC (aec.h), кольцо дописывает его задача (aec_out), и eng_w отстаёт от ring_w на задержку AEC
+    // (десятки мс). Движок (feed_task, mww) читает кольцо только до eng_w.
+    int64_t eng_w = 0;
+    bool aec_path = false;
+    std::atomic<bool> aec_levelled{false};   // в кольце звук уже приведён к обычному уровню (его даёт AEC): ослабление для движка тогда не нужно
     int64_t feed_pos = 0;          // индекс следующего отсчёта, который уйдёт в AFE
     int64_t t_edge_us = 0;         // когда принят последний блок
     wake_logic::Gate gate;
@@ -305,11 +314,11 @@ size_t src_read(int64_t *pos, int16_t *dst, size_t max, bool *skipped)
 {
     std::lock_guard<std::mutex> lock(C.mu);
     *skipped = false;
-    int64_t lag = C.ring_w - *pos;
+    int64_t lag = C.eng_w - *pos;   // кольцо для движка готово до eng_w (v0.6.0: с эхоподавлением это позже ring_w на задержку AEC)
     if (lag > static_cast<int64_t>(kRingSamples)) {
         // движок не успевает: самые старые отсчёты в кольце уже затёрты, прыгаем к живому звуку (как feed_task)
-        *pos = C.ring_w - static_cast<int64_t>(2 * mww_logic::kWindowSamples);
-        lag = C.ring_w - *pos;
+        *pos = C.eng_w - static_cast<int64_t>(2 * mww_logic::kWindowSamples);
+        lag = C.eng_w - *pos;
         *skipped = true;
     }
     if (lag <= 0) {
@@ -321,15 +330,18 @@ size_t src_read(int64_t *pos, int16_t *dst, size_t max, bool *skipped)
     return n;
 }
 
-// Усиление для движка: wake gain; пока звучит ответ, звук в кольце уже ослаблен на 12 дБ и усиление не применяется (как у feed_task)
-float src_gain() { return C.atten.load() ? 1.0f : C.gain_lin.load(); }
+// Усиление для движка: wake gain; пока звучит ответ (или музыка), звук в кольце уже ослаблен на 12 дБ и усиление не применяется (как у feed_task).
+// v0.6.0: если звук прошёл через эхоподавление, его уровень уже приведён к обычному, и wake gain применяется как всегда.
+float engine_gain_now() { return (C.atten.load() && !C.aec_levelled.load()) ? 1.0f : C.gain_lin.load(); }
+
+float src_gain() { return engine_gain_now(); }
 
 bool src_running() { return C.run.load(); }
 
 int64_t src_edge()
 {
     std::lock_guard<std::mutex> lock(C.mu);
-    return C.ring_w;
+    return C.eng_w;
 }
 
 // Слово услышано (из задачи mww): та же ячейка C.det, что у AFE, tick() заберёт её и пропустит через автомат
@@ -347,6 +359,70 @@ void src_hit(const mww::Hit &h)
     C.det.prob_avg = h.avg;
     C.det.prob_peak = h.peak;
     C.det.count++;
+}
+
+// ---- эхоподавление (v0.6.0, aec.h): три крючка для задачи AEC. Все берут замок C.mu: sink() решает, куда писать звук для движка, под тем же замком.
+
+// Очищенный звук для движка: дописываем в кольцо для движка продолжение того, что уже лежит (eng_w), и будим читателей
+void aec_out(const int16_t *clean, size_t n)
+{
+    {
+        std::lock_guard<std::mutex> lock(C.mu);
+        if (!C.eng_ring || n == 0 || n > kRingSamples) {
+            return;
+        }
+        ring_copy_in(C.eng_ring, C.eng_w, clean, n);
+        C.eng_w += static_cast<int64_t>(n);
+        if (C.eng_w > C.ring_w) {
+            C.eng_w = C.ring_w;   // не должно быть: очищенного не больше, чем принято
+        }
+    }
+    if (C.feed_task) {
+        xTaskNotifyGive(C.feed_task);
+    }
+    if (C.engine == mww_logic::Engine::Mww) {
+        mww::notify();
+    }
+}
+
+bool aec_activate()
+{
+    std::lock_guard<std::mutex> lock(C.mu);
+    if (!C.ok || !C.eng_ring || !C.run.load()) {
+        return false;
+    }
+    C.eng_w = C.ring_w;   // до сих пор sink писал оба кольца сразу: ничего не ждёт обработки
+    aec::mark_activated();
+    C.aec_path = true;
+    C.aec_levelled.store(true);
+    return true;
+}
+
+bool aec_try_deactivate()
+{
+    std::lock_guard<std::mutex> lock(C.mu);
+    if (aec::pending_samples() != 0) {
+        return false;   // очередь ещё не пуста (sink успел положить блок): задача AEC обработает и спросит снова
+    }
+    aec::mark_deactivated();
+    C.aec_path = false;
+    C.aec_levelled.store(false);
+    if (C.eng_w < C.ring_w) {
+        // Защита: AEC отдал меньше, чем принял (не должно быть). Недостающее заполняем тишиной, чтобы прямой путь продолжил с ровного места
+        static const int16_t kZeros[256] = {0};
+        int64_t gap = C.ring_w - C.eng_w;
+        if (gap > static_cast<int64_t>(kRingSamples)) {
+            gap = static_cast<int64_t>(kRingSamples);
+        }
+        while (gap > 0) {
+            const size_t k = gap > 256 ? 256 : static_cast<size_t>(gap);
+            ring_copy_in(C.eng_ring, C.eng_w, kZeros, k);
+            C.eng_w += static_cast<int64_t>(k);
+            gap -= static_cast<int64_t>(k);
+        }
+        C.eng_w = C.ring_w;
+    }
+    return true;
 }
 
 // ---- задачи
@@ -373,13 +449,13 @@ void feed_task(void *)
                 int64_t skipped = 0;
                 {
                     std::lock_guard<std::mutex> lock(C.mu);
-                    const int64_t lag = C.ring_w - C.feed_pos;
+                    const int64_t lag = C.eng_w - C.feed_pos;   // кольцо для движка готово до eng_w (с эхоподавлением позже ring_w)
                     if (lag > static_cast<int64_t>(kRingSamples)) {
                         // движок не успевает: самые старые отсчёты в кольце уже затёрты, прыгаем к живому звуку
-                        C.feed_pos = C.ring_w - static_cast<int64_t>(2 * chunk);
+                        C.feed_pos = C.eng_w - static_cast<int64_t>(2 * chunk);
                         skipped = lag;
                     }
-                    if (C.ring_w - C.feed_pos >= static_cast<int64_t>(chunk)) {
+                    if (C.eng_w - C.feed_pos >= static_cast<int64_t>(chunk)) {
                         ring_read(C.eng_ring, C.feed_pos, chunk, C.feed_buf);
                         C.feed_pos += static_cast<int64_t>(chunk);
                         got = true;
@@ -400,7 +476,7 @@ void feed_task(void *)
                 }
                 // Усиление только для движка (кольцо и звук серверу остаются как были). Пока звучит ответ, звук уже ослаблен
                 // на 12 дБ в audio_in; усиление wake gain тогда не применяем (оно вернуло бы срез: 4x и насыщение)
-                const float gain = C.atten.load() ? 1.0f : C.gain_lin.load();
+                const float gain = engine_gain_now();
                 if (gain != 1.0f) {
                     dsp::scale_i16_sat(C.feed_buf, chunk, gain);
                 }
@@ -683,6 +759,11 @@ void do_start(const Detection &d, const wake_logic::Out &o, uint32_t now, dialog
     if (beep && kind == RecKind::Barge) {
         // Динамик только что остановлен (playback::abort): поток доигрывает последний кусок (20 мс), потом писк можно начать
         C.out->wait_idle(100);
+    }
+    if (beep && music::active()) {
+        // v0.6.0: слово посреди музыки. Разговор уже поставил музыку на паузу (session::apply -> music::pause_for_talk); ждём, пока она дозатухнет, и освобождаем
+        // динамик под писк: пока идёт поток музыки, play() отказывает
+        playback::release_speaker(150);
     }
     beep = beep && !C.out->busy();
     int pre_ms = 0;
@@ -1190,6 +1271,22 @@ bool init(AudioOut *out, AudioIn *in)
              C.engine == mww_logic::Engine::Mww ? mww_logic::barge_cutoff(C.m_cutoff, C.m_barge_custom)
                                                 : static_cast<double>(wake_logic::barge_threshold(C.thr_now, C.barge_thr_custom)),
              wake_logic::kBargeAttenDb);
+    // v0.6.0: эхоподавление (слово поверх музыки и поверх своего голоса). Поднимается последним: ему достаётся то, что осталось от внутренней памяти;
+    // не вышло, всё работает как раньше (строже порог слова, ослабленный звук для движка)
+    aec::Hooks hk;
+    hk.out = &aec_out;
+    hk.activate = &aec_activate;
+    hk.try_deactivate = &aec_try_deactivate;
+    if (aec::init(out, hk)) {
+        ESP_LOGI(TAG, "WAKE v0.6.0: music on the speaker: the word keeps listening while it plays (stricter threshold %.3f, engine input %d dB quieter, echo cancellation ON)",
+                 C.engine == mww_logic::Engine::Mww ? mww_logic::barge_cutoff(C.m_cutoff, C.m_barge_custom)
+                                                    : static_cast<double>(wake_logic::barge_threshold(C.thr_now, C.barge_thr_custom)),
+                 wake_logic::kBargeAttenDb);
+    } else {
+        ESP_LOGW(TAG, "WAKE v0.6.0: echo cancellation is NOT running (%s): over the music the word works with the stricter threshold and a 12 dB quieter engine input only; "
+                      "set the music volume lower (default 40) for the word to be heard",
+                 aec::why());
+    }
     return true;
 }
 
@@ -1228,6 +1325,7 @@ void sink(void *, const int16_t *pcm, const int16_t *engine_pcm, size_t n)
     }
     const int64_t now_us = esp_timer_get_time();
     const bool run = C.run.load();
+    aec::note_mic_block(n, now_us);   // якорь времени блока для выравнивания с опорным сигналом (всегда, это дёшево)
     {
         std::lock_guard<std::mutex> lock(C.mu);
         C.last_rms_db = mean_sq_to_db(sum_sq / static_cast<double>(n));   // уровень для команды wake виден и при «wake off»
@@ -1237,7 +1335,13 @@ void sink(void *, const int16_t *pcm, const int16_t *engine_pcm, size_t n)
         }
         const int64_t b0 = C.ring_w;
         ring_copy_in(C.ring, b0, pcm, n);
-        ring_copy_in(C.eng_ring, b0, eng, n);
+        if (C.aec_path) {
+            // v0.6.0: пока динамик играет, звук для движка идёт через эхоподавление: задача AEC дозапишет очищенное в кольцо для движка (aec_out)
+            aec::push_mic(eng, n);
+        } else {
+            ring_copy_in(C.eng_ring, b0, eng, n);
+            C.eng_w = b0 + static_cast<int64_t>(n);
+        }
         C.ring_w += static_cast<int64_t>(n);
         C.t_edge_us = now_us;
         C.period_sum_sq += sum_sq;
@@ -1275,8 +1379,10 @@ static void apply_attenuation(bool on)
     if (C.in) {
         C.in->set_engine_gain(on ? kEngineGainAtten : AudioIn::kPcmGain);   // со следующего блока микрофона (до 100 мс)
     }
+    // Эхоподавлению вход приходит ослабленным; его выход возвращается к обычному уровню этим множителем (4 при ослаблении на 12 дБ, иначе 1)
+    aec::set_makeup(on ? AudioIn::kPcmGain / kEngineGainAtten : 1);
     ESP_LOGI(TAG, "WAKE engine input %s (%s)", on ? "attenuated by 12 dB" : "back to normal",
-             on ? "the answer is playing: the speaker would clip the microphone path" : "the answer has finished");
+             on ? "the speaker is loud (answer or music): it would clip the microphone path" : "the speaker is quiet");
 }
 
 // Порог слова в движке: на время ответа (SPEAKING) строже, потом обычный. Зовётся под ctl_mu. Сам порог в движке меняет
@@ -1294,7 +1400,7 @@ static void apply_threshold(bool answer_playing)
                 mww::set_cutoff(want);
                 C.thr_barge_on = true;
                 C.m_barge_applied = want;
-                ESP_LOGI(TAG, "WAKE cutoff %.3f while the answer plays (normal %.3f)", want, C.m_cutoff);
+                ESP_LOGI(TAG, "WAKE cutoff %.3f while the speaker plays (the answer or the music; normal %.3f)", want, C.m_cutoff);
             }
         } else if (C.thr_barge_on) {
             mww::set_cutoff(C.m_cutoff);
@@ -1309,7 +1415,7 @@ static void apply_threshold(bool answer_playing)
             C.thr_req.store(want);
             C.thr_barge_on = true;
             C.thr_barge_applied = want;
-            ESP_LOGI(TAG, "WAKE word threshold %.3f while the answer plays (normal %.3f)", static_cast<double>(want),
+            ESP_LOGI(TAG, "WAKE word threshold %.3f while the speaker plays (the answer or the music; normal %.3f)", static_cast<double>(want),
                      static_cast<double>(C.thr_now));
         }
     } else if (C.thr_barge_on) {
@@ -1337,6 +1443,8 @@ void tick(uint32_t now, const Env &env)
     c.button_down = sv.button_down;
     c.diag_busy = env.diag_busy;
     c.answers_done = sv.answers_done;
+    c.music_mode = music::active();            // v0.6.0: режим музыки (играет или на паузе по ходу): окно follow не открываем
+    c.music_audible = music::audible(now);     // и музыка слышна в динамике: звук для движка тише, порог строже, эхоподавление
 
     const wake_logic::State before = C.machine.state();
     const uint32_t rec_ms = C.machine.recording_ms(now);
@@ -1358,9 +1466,31 @@ void tick(uint32_t now, const Env &env)
         mww::set_paused(c.dialog_listening);
     }
 
-    // Звук и порог для движка на время ответа
+    // Звук и порог для движка на время ответа и музыки (v0.6.0: порог во время музыки строже так же, как при перебивании: настройка wake barge thr общая)
     apply_attenuation(C.machine.engine_attenuated());
-    apply_threshold(C.machine.barge() && sv.phase == dialog::Phase::Speaking);
+    apply_threshold((C.machine.barge() && sv.phase == dialog::Phase::Speaking) || c.music_audible);
+
+    // v0.6.0: эхоподавление, пока динамик играет музыку (или голос Джарвиса, если aec voice on). Хвост 0,6 с и готовность выравнивания внутри aec.
+    aec::request(c.music_audible || (sv.phase == dialog::Phase::Speaking && aec::config().voice), now);
+    if (aec::stalled(now)) {
+        // Задача AEC не отдаёт звук (завис или процессора не хватило): слово возвращается к прямому пути, остаток очереди отдаём как есть
+        std::lock_guard<std::mutex> g(C.mu);
+        int16_t tmp[256];
+        for (;;) {
+            const size_t k = aec::take_pending_raw(tmp, sizeof(tmp) / sizeof(tmp[0]));
+            if (k == 0) {
+                break;
+            }
+            ring_copy_in(C.eng_ring, C.eng_w, tmp, k);
+            C.eng_w += static_cast<int64_t>(k);
+        }
+        if (C.eng_w > C.ring_w) {
+            C.eng_w = C.ring_w;
+        }
+        C.aec_path = false;
+        C.aec_levelled.store(false);
+        aec::note_stall_recovery();
+    }
 
     // Где в кольце начался ответ: слово, которое движок нашёл в звуке ДО этой позиции, относится к вопросу, а не к перебиванию
     if (c.dialog_answering && !C.was_answering) {

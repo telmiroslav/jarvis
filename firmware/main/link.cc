@@ -218,7 +218,7 @@ void ws_event(void *arg, esp_event_base_t, int32_t id, void *data)
         C.ev.fetch_or(kEvError);
         break;
     case WEBSOCKET_EVENT_DATA:
-        C.rx_ms.store(now_ms());   // любой кадр от сервера (и управляющий: ping сервера) значит, что связь жива
+        C.rx_ms.store(now_ms());   // любой кадр от сервера значит, что связь жива: и голос ответа, и кадры музыки (v0.6.0), и ping сервера
         handle_data(e);
         break;
     default:
@@ -524,7 +524,7 @@ void connect_client()
 
 void send_hello()
 {
-    char buf[200];
+    char buf[256];   // с v0.6.0 в hello ещё "caps":["music"]
     const esp_app_desc_t *app = esp_app_get_description();
     proto::build_hello(buf, sizeof(buf), app->version, C.mac);
     if (send_text(buf) != Tx::Sent) {
@@ -727,6 +727,7 @@ bool run_command(proto::OutMsg m)
         return send_text(proto::out_text(m)) != Tx::Busy;
     }
     case proto::OutMsg::Ping:
+    case proto::OutMsg::MusicDone:   // v0.6.0: буфер музыки доигран (сообщение «для сведения», порядок относительно остального важен мало)
         return send_text(proto::out_text(m)) != Tx::Busy;
     }
     return true;

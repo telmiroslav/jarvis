@@ -7,6 +7,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
+#include "aec_logic.h"
 #include "lcd_cfg.h"
 #include "mww_logic.h"
 #include "wake_logic.h"
@@ -37,6 +38,13 @@ const char *kKeyWakeGuard = "wake_guard";
 const char *kKeyWakeEngine = "wake_eng";        // v0.5.0
 const char *kKeyWakeMwwThr = "wake_mthr";
 const char *kKeyWakeMwwBargeThr = "wake_mbthr";
+const char *kKeyAecOn = "aec_on";               // v0.6.0
+const char *kKeyAecVoice = "aec_voice";
+const char *kKeyAecDelay = "aec_dly";
+const char *kKeyAecTaps = "aec_taps";
+const char *kKeyAecMode = "aec_mode";
+const char *kKeyAecNlp = "aec_nlp";
+const char *kKeyAecGuard = "aec_guard";
 
 bool g_ready = false;
 
@@ -459,6 +467,122 @@ bool set_wake_mww_barge_thr(double thr)
         return false;
     }
     return commit_close(h, nvs_set_u16(h, kKeyWakeMwwBargeThr, mww_logic::cutoff_to_saved(thr)));
+}
+
+AecSettings get_aec()
+{
+    AecSettings a;
+    if (!g_ready) {
+        return a;
+    }
+    nvs_handle_t h;
+    if (nvs_open(kNs, NVS_READONLY, &h) != ESP_OK) {
+        return a;   // ничего не сохраняли: всё по умолчанию
+    }
+    uint8_t u8 = 0;
+    uint16_t u16 = 0;
+    if (nvs_get_u8(h, kKeyAecOn, &u8) == ESP_OK) {
+        a.enabled = (u8 != 0);
+    }
+    if (nvs_get_u8(h, kKeyAecVoice, &u8) == ESP_OK) {
+        a.voice = (u8 != 0);
+    }
+    a.delay_ms = aec_logic::delay_from_saved(nvs_get_u16(h, kKeyAecDelay, &u16) == ESP_OK, u16);
+    a.taps = aec_logic::taps_from_saved(nvs_get_u8(h, kKeyAecTaps, &u8) == ESP_OK, u8);
+    a.mode = static_cast<int>(aec_logic::mode_from_saved(nvs_get_u8(h, kKeyAecMode, &u8) == ESP_OK, u8));
+    a.nlp = aec_logic::nlp_from_saved(nvs_get_u8(h, kKeyAecNlp, &u8) == ESP_OK, u8);
+    nvs_close(h);
+    return a;
+}
+
+bool set_aec_enabled(bool on)
+{
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u8(h, kKeyAecOn, on ? 1 : 0));
+}
+
+bool set_aec_voice(bool on)
+{
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u8(h, kKeyAecVoice, on ? 1 : 0));
+}
+
+bool set_aec_delay_ms(int ms)
+{
+    if (!aec_logic::delay_valid(ms)) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u16(h, kKeyAecDelay, static_cast<uint16_t>(ms)));
+}
+
+bool set_aec_taps(int taps)
+{
+    if (!aec_logic::taps_valid(taps)) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u8(h, kKeyAecTaps, static_cast<uint8_t>(taps)));
+}
+
+bool set_aec_mode(int mode)
+{
+    if (mode < 0 || mode > 3) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u8(h, kKeyAecMode, static_cast<uint8_t>(mode)));
+}
+
+bool set_aec_nlp(int level)
+{
+    if (!aec_logic::nlp_valid(level)) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u8(h, kKeyAecNlp, static_cast<uint8_t>(level)));
+}
+
+bool get_aec_guard()
+{
+    if (!g_ready) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (nvs_open(kNs, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    uint8_t v = 0;
+    const bool set = (nvs_get_u8(h, kKeyAecGuard, &v) == ESP_OK && v != 0);
+    nvs_close(h);
+    return set;
+}
+
+bool set_aec_guard(bool set)
+{
+    nvs_handle_t h;
+    if (!open_rw(&h)) {
+        return false;
+    }
+    return commit_close(h, nvs_set_u8(h, kKeyAecGuard, set ? 1 : 0));
 }
 
 bool get_wake_guard()

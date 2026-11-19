@@ -1,3 +1,6 @@
+Знаки ♪ (U+266A) и ⏸ (U+23F8) в шрифтах интерфейса взяты из Noto Sans Symbols и Noto Sans Symbols 2:
+Copyright 2022 The Noto Project Authors (https://github.com/notofonts/symbols)
+Остальные символы это Inter:
 Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter) Inter-Italic[opsz,wght].ttf: Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.

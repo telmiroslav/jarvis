@@ -28,6 +28,19 @@
 //   wake gain <0..18>              усиление в дБ (целые) звука, который идёт в движок слова; для тихого микрофона (по умолчанию 0)
 //   wake bench                     стенд (v0.5.1): сколько времени тратят признаки и модель microWakeWord и по операциям модели, для весов
 //                                  в копии PSRAM и прямо во flash; идёт ~5 с, слово на это время глухо; результат строками «WAKE bench ...» в ответе на wake
+//   aec                            эхоподавление (v0.6.0): состояние, настройки, время на кадр, ослабление эха
+//   aec on | aec off               включить / выключить (запоминается; выключенное при загрузке не поднимается: aec on и reboot)
+//   aec voice on | aec voice off   подавлять эхо и от голоса Джарвиса (перебивание словом); по умолчанию on
+//   aec delay <0..250>             задержка опорного сигнала в мс: «запись в динамик -> эхо в микрофоне» (по умолчанию 60; aec cal измеряет сам)
+//   aec taps <1..8>                длина фильтра AEC (по умолчанию 4; больше = дольше хвост эха и больше процессора)
+//   aec mode sr_low|sr_high|fd_low|fd_high  режим AEC из ESP-SR (по умолчанию fd_low); пересоздаёт AEC, когда динамик молчит
+//   aec nlp <0..2>                 подавитель остатка у режимов fd: 0 normal (по умолчанию), 1 aggressive, 2 very aggressive
+//   aec bench                      стенд (v0.6.0): ~4 с синтетического эха, время на кадр и ослабление; идёт, пока динамик молчит; результат в ответе на aec
+//   aec cal                        измерить задержку эха: плата 1,8 с играет шум и слушает его; в тишине; результат в ответе на aec, aec delay ставится сам
+//   music | music stat             музыка на колонке (v0.6.0): состояние, буфер, недоборы, громкость, эхоподавление
+//   music vol <0..100>             громкость ТОЛЬКО музыки (как music_volume от сервера)
+//   music test [<0..100>]          плата сама играет синтетическую «музыку» (проверка слова поверх музыки без сервера)
+//   music pause | resume | stop    то же, что music_pause / music_resume / music_stop от сервера
 //   echo                           диагностика звука: запись 4 с с микрофона и воспроизведение
 //   status                         одна строка состояния
 //   reboot                         перезагрузка
@@ -40,9 +53,13 @@
 namespace jarvis {
 namespace cmd {
 
-enum class Kind { Empty, WifiSet, WifiClear, Tz, Lcd, Server, Echo, Wake, Status, Reboot, Help, Error };
+enum class Kind { Empty, WifiSet, WifiClear, Tz, Lcd, Server, Echo, Wake, Status, Reboot, Help, Aec, Music, Error };
 
 enum class WakeOp { Status, On, Off, BeepOn, BeepOff, Threshold, Silence, Gain, BeepLevel, Follow, BargeOn, BargeOff, BargeThr, Engine, Bench };
+
+// v0.6.0
+enum class AecOp { Status, On, Off, VoiceOn, VoiceOff, Delay, Taps, Mode, Nlp, Bench, Cal };
+enum class MusicOp { Stat, Vol, Test, Pause, Resume, Stop };
 
 constexpr size_t kMaxSsid = 32;      // байт, предел стандарта 802.11
 constexpr size_t kMaxPass = 64;      // 8..63 символа или ровно 64 шестнадцатеричные цифры
@@ -65,6 +82,10 @@ struct Command {
     int wake_beep_level = 0;             // Kind::Wake, BeepLevel (0..5); BeepOn = 4, BeepOff = 0 разбираются как BeepOn/BeepOff
     bool wake_engine_mww = true;         // Kind::Wake, Engine: true = mww, false = esp
     uint32_t wake_follow_ms = 0;         // Kind::Wake, Follow (0 или 2000..15000); для BargeThr порог лежит в wake_thr (0 = auto)
+    AecOp aec_op = AecOp::Status;        // Kind::Aec
+    int aec_value = 0;                   // Kind::Aec: Delay (мс), Taps, Nlp; для Mode номер aec_logic::Mode 0..3
+    MusicOp music_op = MusicOp::Stat;    // Kind::Music
+    int music_volume = -1;               // Kind::Music: Vol 0..100; Test: громкость или -1 (по умолчанию)
     // для Kind::Error: имя команды (или "cmd") и причина, обе строки статические, без пробелов
     const char *err_cmd = "cmd";
     const char *err_reason = "";

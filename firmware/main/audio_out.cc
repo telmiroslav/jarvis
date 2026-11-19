@@ -5,6 +5,7 @@
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "board.h"
 
@@ -17,6 +18,9 @@ const char *TAG = "audio_out";
 constexpr size_t kChunkFrames = 480;          // 20 мс
 constexpr size_t kTailFrames = 2400;          // 100 мс тишины после звука: пока он доиграет из DMA
 constexpr uint32_t kWriteTimeoutMs = 500;
+// Запись в I2S, которая простояла не меньше этого, ждала свободный буфер DMA, а значит вернулась в такт I2S (не успела проскочить в пустую очередь
+// в начале потока): по таким возвратам эхоподавление привязывает опорный сигнал ко времени (aec.cc)
+constexpr int64_t kBlockedUs = 3000;
 
 }  // namespace
 
@@ -128,6 +132,7 @@ bool AudioOut::stream_start(PullFn fn, void *ctx)
 void AudioOut::run_stream(int16_t *stereo)
 {
     int16_t mono[kChunkFrames];
+    bool first = true;
     while (stream_active_.load()) {
         size_t real = pull_fn_(pull_ctx_, mono, kChunkFrames);
         if (real > kChunkFrames) {
@@ -142,14 +147,26 @@ void AudioOut::run_stream(int16_t *stereo)
         }
         level_dbfs_.store(real > 0 ? dsp::rms_dbfs_i16(mono, real) : dsp::kFloorDbfs);
         size_t written = 0;
+        const int64_t t0 = esp_timer_get_time();
         const esp_err_t err = i2s_channel_write(tx_, stereo, kChunkFrames * 2 * sizeof(int16_t), &written, kWriteTimeoutMs);
+        const int64_t t1 = esp_timer_get_time();
         if (err != ESP_OK) {
             if (write_errors_.fetch_add(1) == 0) {
                 ESP_LOGE(TAG, "i2s_channel_write failed in the stream: %s (further failures are only counted)",
                          esp_err_to_name(err));
             }
             vTaskDelay(pdMS_TO_TICKS(20));   // не крутим цикл вхолостую при поломке
+        } else if (const RefTapFn tap = ref_tap_.load()) {
+            RefChunk rc;
+            rc.mono = mono;
+            rc.n = kChunkFrames;
+            rc.real = real;
+            rc.t_us = t1;
+            rc.blocked = (t1 - t0) >= kBlockedUs;
+            rc.first = first;
+            tap(ref_ctx_.load(), rc);
         }
+        first = false;
         stream_chunks_.fetch_add(1);
     }
     level_dbfs_.store(dsp::kFloorDbfs);
@@ -159,8 +176,8 @@ void AudioOut::task_entry(void *arg) { static_cast<AudioOut *>(arg)->run(); }
 
 void AudioOut::run()
 {
-    // Стерео-буфер: каждый отсчёт дважды (левый и правый слот)
-    int16_t *stereo = static_cast<int16_t *>(heap_caps_malloc(kChunkFrames * 2 * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    // Стерео-буфер: каждый отсчёт дважды (левый и правый слот), за ним ещё моно-копия куска (kChunkFrames отсчётов) для звонка и писка
+    int16_t *stereo = static_cast<int16_t *>(heap_caps_malloc(kChunkFrames * 3 * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (!stereo) {
         ESP_LOGE(TAG, "no memory for the chunk buffer, playback disabled");
         ok_ = false;
@@ -181,10 +198,12 @@ void AudioOut::run()
 
         size_t pos = 0;
         bool failed = false;
+        int16_t *mono = stereo + 2 * kChunkFrames;   // моно-копия куска для опорного сигнала эхоподавления (aec.cc); лежит за стерео-буфером
         while (pos < total + kTailFrames && !failed) {
             const size_t n = (total + kTailFrames - pos) < kChunkFrames ? (total + kTailFrames - pos) : kChunkFrames;
             for (size_t i = 0; i < n; i++) {
                 const int16_t v = (pos + i < total) ? pcm[pos + i] : 0;
+                mono[i] = v;
                 stereo[2 * i] = v;
                 stereo[2 * i + 1] = v;
             }
@@ -192,13 +211,24 @@ void AudioOut::run()
             const size_t real = pos < total ? ((total - pos) < n ? (total - pos) : n) : 0;
             level_dbfs_.store(real > 0 ? dsp::rms_dbfs_i16(pcm + pos, real) : dsp::kFloorDbfs);
             size_t written = 0;
+            const int64_t t0 = esp_timer_get_time();
             const esp_err_t err = i2s_channel_write(tx_, stereo, n * 2 * sizeof(int16_t), &written, kWriteTimeoutMs);
+            const int64_t t1 = esp_timer_get_time();
             if (err != ESP_OK) {
                 if (write_errors_.fetch_add(1) == 0) {
                     ESP_LOGE(TAG, "i2s_channel_write failed: %s (further failures are only counted)",
                              esp_err_to_name(err));
                 }
                 failed = true;
+            } else if (const RefTapFn tap = ref_tap_.load()) {
+                RefChunk rc;
+                rc.mono = mono;
+                rc.n = n;
+                rc.real = real;
+                rc.t_us = t1;
+                rc.blocked = (t1 - t0) >= kBlockedUs;
+                rc.first = (pos == 0);
+                tap(ref_ctx_.load(), rc);
             }
             pos += n;
         }

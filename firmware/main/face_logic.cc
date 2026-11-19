@@ -50,6 +50,11 @@ Out decide(const In &in)
         o.hint = in.server_hint;
         return o;
     }
+    // 4а. Музыка (v0.6.0): лицо спокойное, в строке «♪ название» (или со значком паузы). Окно follow в музыке не открывается (wake_logic)
+    if (in.music_line && in.music_line[0]) {
+        o.hint = in.music_line;
+        return o;
+    }
     // 5. Окно «договорить без слова»: лицо слушает спокойно, подсказка «Слушаю…» (Listening с полосками и свечением появится,
     // когда начнётся запись по голосу)
     if (in.follow_window) {

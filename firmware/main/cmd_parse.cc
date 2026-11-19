@@ -1,5 +1,6 @@
 #include "cmd_parse.h"
 
+#include "aec_logic.h"
 #include "link_logic.h"
 
 #include <ctype.h>
@@ -329,6 +330,184 @@ Command parse_wake(const char *a)
     return make_error("wake", "usage");
 }
 
+// Целое число без хвоста: «60», «-5» не годится (минус отсекается диапазоном выше по коду)
+bool parse_whole(const char *s, long *out)
+{
+    if (!s || *s == '\0') {
+        return false;
+    }
+    char *endp = nullptr;
+    const long v = strtol(s, &endp, 10);
+    if (endp == s || *endp != '\0') {
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+// Аргументы команды aec (после слова aec)
+Command parse_aec(const char *a)
+{
+    size_t alen = strlen(a);
+    while (alen > 0 && is_space(a[alen - 1])) {
+        alen--;
+    }
+    char buf[48];
+    if (alen >= sizeof(buf)) {
+        return make_error("aec", "usage");
+    }
+    memcpy(buf, a, alen);
+    buf[alen] = '\0';
+    Command c;
+    c.kind = Kind::Aec;
+    if (alen == 0) {
+        c.aec_op = AecOp::Status;
+        return c;
+    }
+    const char *p = buf;
+    const char *w = p;
+    while (*p && !is_space(*p)) {
+        p++;
+    }
+    const size_t wl = static_cast<size_t>(p - w);
+    const char *arg = skip_spaces(p);
+    const size_t al = strlen(arg);
+    if (word_eq(w, wl, "on") && al == 0) {
+        c.aec_op = AecOp::On;
+        return c;
+    }
+    if (word_eq(w, wl, "off") && al == 0) {
+        c.aec_op = AecOp::Off;
+        return c;
+    }
+    if (word_eq(w, wl, "bench")) {
+        if (al != 0) {
+            return make_error("aec", "usage");
+        }
+        c.aec_op = AecOp::Bench;
+        return c;
+    }
+    if (word_eq(w, wl, "cal")) {
+        if (al != 0) {
+            return make_error("aec", "usage");
+        }
+        c.aec_op = AecOp::Cal;
+        return c;
+    }
+    if (word_eq(w, wl, "voice")) {
+        if (word_eq(arg, al, "on")) {
+            c.aec_op = AecOp::VoiceOn;
+            return c;
+        }
+        if (word_eq(arg, al, "off")) {
+            c.aec_op = AecOp::VoiceOff;
+            return c;
+        }
+        return make_error("aec", "usage");
+    }
+    if (word_eq(w, wl, "delay") || word_eq(w, wl, "taps") || word_eq(w, wl, "nlp")) {
+        long v = 0;
+        if (!parse_whole(arg, &v)) {
+            return make_error("aec", "usage");
+        }
+        if (word_eq(w, wl, "delay")) {
+            if (!aec_logic::delay_valid(static_cast<int>(v)) || v > 100000) {
+                return make_error("aec", "delay_range");
+            }
+            c.aec_op = AecOp::Delay;
+        } else if (word_eq(w, wl, "taps")) {
+            if (v < aec_logic::kTapsMin || v > aec_logic::kTapsMax) {
+                return make_error("aec", "taps_range");
+            }
+            c.aec_op = AecOp::Taps;
+        } else {
+            if (v < 0 || v > aec_logic::kNlpMax) {
+                return make_error("aec", "nlp_range");
+            }
+            c.aec_op = AecOp::Nlp;
+        }
+        c.aec_value = static_cast<int>(v);
+        return c;
+    }
+    if (word_eq(w, wl, "mode")) {
+        if (al == 0) {
+            return make_error("aec", "usage");
+        }
+        aec_logic::Mode m;
+        if (!aec_logic::parse_mode(arg, &m)) {
+            return make_error("aec", "mode_value");
+        }
+        c.aec_op = AecOp::Mode;
+        c.aec_value = static_cast<int>(m);
+        return c;
+    }
+    return make_error("aec", "usage");
+}
+
+// Аргументы команды music (после слова music)
+Command parse_music(const char *a)
+{
+    size_t alen = strlen(a);
+    while (alen > 0 && is_space(a[alen - 1])) {
+        alen--;
+    }
+    char buf[48];
+    if (alen >= sizeof(buf)) {
+        return make_error("music", "usage");
+    }
+    memcpy(buf, a, alen);
+    buf[alen] = '\0';
+    Command c;
+    c.kind = Kind::Music;
+    if (alen == 0) {
+        c.music_op = MusicOp::Stat;
+        return c;
+    }
+    const char *p = buf;
+    const char *w = p;
+    while (*p && !is_space(*p)) {
+        p++;
+    }
+    const size_t wl = static_cast<size_t>(p - w);
+    const char *arg = skip_spaces(p);
+    const size_t al = strlen(arg);
+    if (word_eq(w, wl, "stat") && al == 0) {
+        c.music_op = MusicOp::Stat;
+        return c;
+    }
+    if (word_eq(w, wl, "pause") && al == 0) {
+        c.music_op = MusicOp::Pause;
+        return c;
+    }
+    if (word_eq(w, wl, "resume") && al == 0) {
+        c.music_op = MusicOp::Resume;
+        return c;
+    }
+    if (word_eq(w, wl, "stop") && al == 0) {
+        c.music_op = MusicOp::Stop;
+        return c;
+    }
+    if (word_eq(w, wl, "vol") || word_eq(w, wl, "volume") || word_eq(w, wl, "test")) {
+        const bool is_test = word_eq(w, wl, "test");
+        if (is_test && al == 0) {
+            c.music_op = MusicOp::Test;
+            c.music_volume = -1;
+            return c;
+        }
+        long v = 0;
+        if (!parse_whole(arg, &v)) {
+            return make_error("music", "usage");
+        }
+        if (v < 0 || v > 100) {
+            return make_error("music", "vol_range");
+        }
+        c.music_op = is_test ? MusicOp::Test : MusicOp::Vol;
+        c.music_volume = static_cast<int>(v);
+        return c;
+    }
+    return make_error("music", "usage");
+}
+
 }  // namespace
 
 bool is_valid_posix_tz(const char *tz)
@@ -506,6 +685,12 @@ Command parse_command(const char *line)
     if (word_eq(w, wlen, "wake")) {
         return parse_wake(skip_spaces(rest));
     }
+    if (word_eq(w, wlen, "aec")) {
+        return parse_aec(skip_spaces(rest));
+    }
+    if (word_eq(w, wlen, "music")) {
+        return parse_music(skip_spaces(rest));
+    }
     if (word_eq(w, wlen, "status")) {
         Command c;
         c.kind = Kind::Status;
@@ -552,6 +737,11 @@ const char *describe_error(const char *reason)
         {"gain_range", "усиление для слова в децибелах, целое число от 0 до 18"},
         {"beep_range", "громкость писка: целое число от 0 (выключен) до 5 (самый громкий), или on, off"},
         {"follow_range", "окно «договорить без слова» в миллисекундах: 0 (выключено) или от 2000 до 15000"},
+        {"delay_range", "задержка опоры эхоподавления в миллисекундах, от 0 до 250"},
+        {"taps_range", "длина фильтра эхоподавления, целое число от 1 до 8"},
+        {"nlp_range", "подавитель остатка эха: 0 (normal), 1 (aggressive) или 2 (very aggressive)"},
+        {"mode_value", "режим эхоподавления: sr_low, sr_high, fd_low или fd_high"},
+        {"vol_range", "громкость музыки: целое число от 0 до 100"},
     };
     for (const Item &it : kItems) {
         if (strcmp(it.key, reason) == 0) {

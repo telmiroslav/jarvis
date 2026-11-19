@@ -1,8 +1,14 @@
-// Jarvis v0.5.1: голосовой помощник. Плата слышит слово «Джарвис» сама (wake.cc: microWakeWord с моделью Давида или ESP-SR) или слушает кнопку BOOT, отправляет
+// Jarvis v0.6.0: голосовой помощник. Плата слышит слово «Джарвис» сама (wake.cc: microWakeWord с моделью Давида или ESP-SR) или слушает кнопку BOOT, отправляет
 // голос серверу на ноутбуке, показывает лицо и субтитры и играет ответ (поверх проверки железа из v0.1 и экрана, Wi-Fi и
-// часов из v0.2).
+// часов из v0.2). С v0.6.0 ещё играет музыку с ноутбука на своей колонке и слышит слово «Джарвис» поверх неё.
 //
 // Что делает:
+//   - МУЗЫКА НА КОЛОНКЕ (v0.6.0, music.cc, music_logic.cc, docs/PROTOCOL.md раздел 10): сервер шлёт готовый звук 24 кГц, плата копит 4 с в PSRAM
+//     и играет тихо (громкость задаёт сервер, по умолчанию 40 из 100). Слово или зажатая BOOT посреди музыки: пауза, писк, запись, дальше музыку
+//     продолжает сервер (music_resume). Короткое нажатие BOOT = стоп. На лице «♪ название», на паузе «⏸ название»;
+//   - ЭХОПОДАВЛЕНИЕ (v0.6.0, aec.cc, aec_logic.cc): плата вычитает из микрофона то, что сама играет (опорный сигнал берётся с I2S динамика, ESP-SR AEC на
+//     ядре 1), поэтому слово слышно поверх музыки (и поверх её собственного голоса, при перебивании). Только для распознавания слова: на сервер звук идёт
+//     как был. Команды aec и music (console.cc) показывают время на кадр, ослабление эха (ERLE), задержку; aec bench, aec cal измеряют;
 //   - СЛОВО «ДЖАРВИС» (wake.cc, wake_logic.cc): пока Wi-Fi и связь с ноутбуком есть, а разговор в покое, плата слушает слово
 //     на самой плате (без интернета). Услышала: писк, лицо LISTENING, запись; конец фразы по VAD (пауза 800 мс), 5 с тишины
 //     после слова или 12 с записи = конец. v0.4.2: после ответа ещё 6 с можно говорить без слова (окно follow, лицо «Слушаю…»), а
@@ -16,7 +22,7 @@
 //     NO_WIFI / NO_SERVER / ERROR / SLEEP, субтитры и подсказки («Ищу ноутбук…», «Нет связи с ноутбуком…», «Нет Wi-Fi…»);
 //   - Wi-Fi и время: net.cc. Сеть и пароль задаются командой по серийному порту (./tools/flash.sh wifi),
 //     время по SNTP (серверы, доступные из Китая, первыми), часовой пояс по умолчанию CST-8;
-//   - серийные команды: console.cc (wifi_set, wifi_clear, tz, lcd, server, wake, echo, status, reboot). Слушаются оба порта платы;
+//   - серийные команды: console.cc (wifi_set, wifi_clear, tz, lcd, server, wake, aec, music, echo, status, reboot). Слушаются оба порта платы;
 //   - при старте: отчёт о плате, тест PSRAM, звонок + проверка «динамик услышан микрофоном» (LOOPBACK);
 //   - каждые 30 с одна строка "STATUS: ..." (Wi-Fi, сервер, время, память, loopback, сброс) и строка "HEAP ok/CORRUPT" (проверка куч);
 //   - светодиод: ожидание плавно зелёный, слушает красный, думает янтарный пульс, говорит синий, нет сервера или
@@ -46,6 +52,7 @@
 #include "freertos/task.h"
 #include "led_strip.h"
 
+#include "aec.h"
 #include "audio_in.h"
 #include "audio_out.h"
 #include "board.h"
@@ -59,6 +66,7 @@
 #include "link.h"
 #include "link_logic.h"
 #include "mic_stream.h"
+#include "music.h"
 #include "net.h"
 #include "net_logic.h"
 #include "playback.h"
@@ -85,6 +93,7 @@ constexpr uint32_t kPsramTestSeed = 0x9E3779B9u;
 
 constexpr uint8_t kLedLevel = 20;           // яркость из 255, чтобы не слепило
 constexpr int64_t kReportMs = 30000;
+constexpr int64_t kMusicLogMs = 10000;      // строки про музыку и эхоподавление, пока играет музыка
 constexpr TickType_t kPollTicks = pdMS_TO_TICKS(10);
 constexpr int64_t kDebounceMs = 30;         // уровень кнопки должен продержаться 30 мс (по времени, не по числу опросов)
 
@@ -555,6 +564,14 @@ void ui_sync(int64_t now_ms)
     fin.server_hint = g_link_started ? link_logic::server_hint(hin.connected, ls.ready, ls.down_ms) : nullptr;
     fin.idle_hint = wake::idle_hint(static_cast<uint32_t>(now_ms));
     fin.follow_window = wake::follow_window();
+    // Музыка (v0.6.0): в строке «♪ название», на паузе «⏸ название». Шрифт имеет оба знака (fonts/gen_fonts.sh)
+    char music_line[proto::kMaxTitle + 16];
+    if (music::active()) {
+        char title[proto::kMaxTitle + 1];
+        music::title(title, sizeof(title));
+        snprintf(music_line, sizeof(music_line), "%s %s", music::paused() ? "\xE2\x8F\xB8" : "\xE2\x99\xAA", title);
+        fin.music_line = music_line;
+    }
     const face_logic::Out fo = face_logic::decide(fin);
 
     const ui::State want = static_cast<ui::State>(fo.face);
@@ -1026,13 +1043,22 @@ void print_status_line()
     } else {
         snprintf(wake_v, sizeof(wake_v), "%s det=%u", wake_logic::state_name(ws.state), static_cast<unsigned>(ws.stats.detections));
     }
-    char line[1000];
+    // v0.6.0: музыка и эхоподавление одним словом каждое (подробности: команды music и aec)
+    char mus_v[40];
+    if (!music::active()) {
+        snprintf(mus_v, sizeof(mus_v), "off");
+    } else {
+        snprintf(mus_v, sizeof(mus_v), "%s buf=%ums", music::paused() ? "paused" : "playing", static_cast<unsigned>(music::status().buffered_ms));
+    }
+    const aec::Status as = aec::status();
+    const char *aec_v = !as.available ? "unavailable" : !as.enabled ? "off" : as.active ? "ACTIVE" : "idle";
+    char line[1100];
     snprintf(line, sizeof(line),
-             "STATUS: wifi=%s | server=%s | time=%s tz=%s | state=%s dialog=%s wake=%s | heap=%uKB min=%uKB largest=%uKB psram=%uKB | "
+             "STATUS: wifi=%s | server=%s | time=%s tz=%s | state=%s dialog=%s wake=%s music=%s aec=%s | heap=%uKB min=%uKB largest=%uKB psram=%uKB | "
              "audio: rx=%uKB tx_frames=%u underruns=%u overflow=%u mic_drop=%u | loopback=%s mic=%s mic30s=%.1fdBFS | "
              "ui_frames=%u | up=%" PRIu32 "s reset=%s fw=%s",
              wifi, srv, tm, net::timezone(), ui::state_name(static_cast<ui::State>(g_ui_state.load())),
-             dialog::phase_name(sv.phase), wake_v, static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             dialog::phase_name(sv.phase), wake_v, mus_v, aec_v, static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024),
              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
@@ -1108,7 +1134,7 @@ bool apply_lcd_cfg(int n)
 void print_greeting()
 {
     ESP_LOGI(TAG, "################################################################");
-    ESP_LOGI(TAG, "# JARVIS v0.5.1: связь не рвётся на записи (Wi-Fi без экономии питания, передача не блокирует сокет, слово на записи не считает), слово «Джарвис» (microWakeWord), wake bench");
+    ESP_LOGI(TAG, "# JARVIS v0.6.0: музыка на колонке (сервер шлёт звук), слово «Джарвис» слышно поверх неё (эхоподавление ESP-SR AEC), короткое нажатие BOOT = стоп музыки, команды aec и music");
     ESP_LOGI(TAG, "################################################################");
     ESP_LOGI(TAG, "Привет, Давид! Что должно быть:");
     ESP_LOGI(TAG, "  1. ЭКРАН: два бирюзовых глаза. Без Wi-Fi внизу подсказка, с Wi-Fi без ноутбука «Ищу ноутбук…» и «Нет связи…».");
@@ -1120,6 +1146,7 @@ void print_greeting()
     ESP_LOGI(TAG, "  7. СЛОВО: когда внизу «Скажи «Джарвис»», скажи «Джарвис», дождись писка и говори. Пауза в речи 0,8 с = конец. Команды: wake, wake thr 0.88 (не слышит) или 0.93 (срабатывает само), wake engine esp (старый движок, потом reboot), wake beep 0..5, wake off.");
     ESP_LOGI(TAG, "  8. ПОСЛЕ ОТВЕТА 6 секунд внизу «Слушаю…»: можно говорить без слова «Джарвис» (без писка). Выключить: wake follow 0.");
     ESP_LOGI(TAG, "  9. ПЕРЕБИТЬ: скажи «Джарвис», пока он думает или говорит: он замолчит и начнёт слушать (писк). Выключить: wake barge off.");
+    ESP_LOGI(TAG, " 10. МУЗЫКА: «Джарвис, включи …» (на ноутбуке сервер 0.5.0 и новее): играет колонка платы, на лице «♪ название». «Джарвис» поверх музыки: пауза, писк, говори; BOOT коротко = стоп. Проверка без сервера: music test; настройка эха: aec, aec cal.");
     ESP_LOGI(TAG, "Пришли мне весь лог и скажи, что видел и слышал. В логе главное: «STATUS:», «HWCHECK RESULT», «WIFI», «link», «session», «WAKE».");
 }
 
@@ -1168,6 +1195,7 @@ void run_boot_chime_test()
 void main_loop()
 {
     int64_t next_report_ms = uptime_ms() + kReportMs;
+    int64_t next_music_log_ms = uptime_ms() + kMusicLogMs;
     log_mic_slot_if_changed();
     g_in.take_summary();   // сбрасываем накопитель, чтобы первое окно было «чистым»
 
@@ -1235,6 +1263,14 @@ void main_loop()
             next_report_ms += kReportMs;
             print_status_line();
         }
+        // v0.6.0: пока играет музыка, раз в 10 с строки про буфер (недоборы, громкость) и про эхоподавление (время на кадр, ослабление эха)
+        if (now >= next_music_log_ms) {
+            next_music_log_ms = now + kMusicLogMs;
+            if (music::active()) {
+                music::log_stat("MUSIC stat");
+                aec::log_stat("AEC stat");
+            }
+        }
     }
 }
 
@@ -1292,6 +1328,7 @@ extern "C" void app_main(void)
     // Разговор: кольцо ответа (3 с) и кольцо голоса (2 с) в PSRAM, блоки микрофона идут в кольцо голоса
     mic_stream::init(AudioIn::kSampleRate * 2);
     playback::init(&g_out);
+    music::init();   // v0.6.0: буфер музыки 4 с в PSRAM (кадры музыки сервер шлёт только после hello с caps music, то есть после старта связи)
     g_in.set_sink(&mic_stream::sink, nullptr);
     session::init();
 

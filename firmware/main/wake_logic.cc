@@ -259,11 +259,12 @@ Out Machine::on_tick(const Cond &c, uint32_t now)
         answering_ = false;
         speaking_ = false;
     }
-    if (barge_on_ && c.enabled && c.engine_ok && c.dialog_speaking) {
+    // Динамик громкий: звучит ответ (при включённом перебивании) или музыка (v0.6.0, независимо от перебивания: «wake barge off» про ответы)
+    if (c.enabled && c.engine_ok && ((barge_on_ && c.dialog_speaking) || c.music_audible)) {
         atten_ = true;
         atten_until_ = now + kAttenTailMs;
-    } else if (!barge_on_ || reached(now, atten_until_)) {
-        atten_ = false;
+    } else if (reached(now, atten_until_)) {
+        atten_ = false;   // (set_barge(false) гасит ослабление сразу; ответ без перебивания его больше не включает)
     }
 
     // ---- ответ закончился нормально: окно follow ждёт, пока автомат встанет на взвод
@@ -272,10 +273,16 @@ Out Machine::on_tick(const Cond &c, uint32_t now)
         seen_answers_ = c.answers_done;
     } else if (c.answers_done != seen_answers_) {
         seen_answers_ = c.answers_done;
-        if (follow_ms_ > 0) {
+        if (follow_ms_ > 0 && !c.music_mode) {
             pending_ = true;
             pending_since_ = now;
         }
+    }
+    // v0.6.0: в режиме музыки (играет или на паузе по ходу разговора) окно «договорить без слова» не открывается и не ждёт: детектор речи слышал бы
+    // саму музыку. Включилась музыка, пока окно открыто или ждёт (ответ «Включаю...», потом music_start): окно закрывается молча.
+    if (c.music_mode) {
+        pending_ = false;
+        follow_open_ = false;
     }
 
     if (state_ == State::Recording) {

@@ -33,6 +33,8 @@ bool font_has_codepoint(uint32_t cp)
     case 0x2022:  // •
     case 0x2026:  // …
     case 0x20AC:  // €
+    case 0x266A:  // ♪ (v0.6.0, строка музыки; из Noto Sans Symbols, см. fonts/gen_fonts.sh)
+    case 0x23F8:  // ⏸ (v0.6.0, значок паузы; из Noto Sans Symbols 2)
         return true;
     default:
         return false;
