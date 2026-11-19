@@ -56,6 +56,7 @@ class _AudioItem:
     pcm: bytes
     seconds: float
     last: bool
+    filler: bool = False  # заглушка «Секунду, сэр.»: уходит на плату как обычное предложение, но в память разговора не попадает
 
 
 class _TurnCtx:
@@ -329,6 +330,8 @@ class Session:
         stats = LLMStats()
         sent_q: asyncio.Queue[_Sentence | None] = asyncio.Queue()
         audio_q: asyncio.Queue[_AudioItem | None] = asyncio.Queue(maxsize=1)
+        first_word = asyncio.Event()  # первое слово ИИ пришло (или ИИ закончил): заглушка больше не нужна
+        filler = self.eng.filler if self.s.llm_filler_ms > 0 else None
 
         async def llm_stage() -> None:
             splitter = SentenceSplitter(self.s.first_chunk_max_chars, self.s.chunk_max_chars,
@@ -351,6 +354,7 @@ class Session:
                             continue
                         if tm.llm_first_token_ms is None and item:
                             tm.llm_first_token_ms = (time.perf_counter() - t0) * 1000
+                            first_word.set()
                         for c in splitter.feed_chunks(item):
                             emit(c)
                 tail = splitter.flush_chunks()
@@ -366,7 +370,21 @@ class Session:
             finally:
                 tm.model = stats.model
                 tm.tools = list(stats.tool_calls)
+                tm.llm_hedge = stats.hedge
+                first_word.set()
                 sent_q.put_nowait(None)
+
+        async def filler_stage() -> None:
+            """Первого слова ИИ нет за llm_filler_ms: произнести заранее синтезированную заглушку, чтобы не молчать."""
+            try:
+                await asyncio.wait_for(first_word.wait(), self.s.llm_filler_ms / 1000)
+                return  # слово пришло вовремя (или ИИ уже закончил)
+            except TimeoutError:
+                pass
+            if ctx.cancelled or first_word.is_set():
+                return
+            log.info("ИИ молчит уже %d мс: говорю заглушку «%s»", self.s.llm_filler_ms, filler.text)
+            await audio_q.put(_AudioItem(filler.text, filler.pcm, filler.seconds, last=False, filler=True))
 
         async def tts_stage() -> None:
             first = True
@@ -401,6 +419,7 @@ class Session:
             pacer = AudioPacer(self.s.pacing_burst_s, self.s.pacing_max_lead_s)
             frame_bytes = max(2, protocol.TTS_RATE * self.s.frame_ms // 1000 * 2)
             n_items = 0
+            prev_filler = False
             while True:
                 item = await audio_q.get()
                 if item is None:
@@ -417,7 +436,7 @@ class Session:
                     if ctx.cancelled:
                         return
                 gap = pacer.underrun_gap()
-                if n_items > 1 and gap > 0.05:
+                if n_items > 1 and gap > 0.05 and not prev_filler:  # пауза после заглушки ожидаема: ради неё заглушка и нужна
                     tm.underruns += 1
                     tm.max_gap_s = max(tm.max_gap_s, gap)
                     log.warning("пауза в речи %.2f с: следующее предложение не успели синтезировать", gap)
@@ -425,7 +444,9 @@ class Session:
                 for pi, piece in enumerate(pieces):
                     await self._send(protocol.jarvis_text(piece, final=item.last and pi == len(pieces) - 1))
                 ctx.last_text_final = item.last
-                ctx.spoken.append(item.display)
+                prev_filler = item.filler
+                if not item.filler:
+                    ctx.spoken.append(item.display)
                 tm.sentences += 1
                 tm.chars += len(item.display)
                 if item.pcm:
@@ -457,6 +478,8 @@ class Session:
         tasks = [asyncio.create_task(llm_stage(), name="llm"),
                  asyncio.create_task(tts_stage(), name="tts"),
                  asyncio.create_task(sender_stage(), name="send")]
+        if filler is not None:
+            tasks.append(asyncio.create_task(filler_stage(), name="filler"))
         try:
             done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
             for t in done:

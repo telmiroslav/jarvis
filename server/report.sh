@@ -61,9 +61,13 @@ PY
 import re, sys, statistics as st
 keys = ["stt_ms", "llm_first_token_ms", "first_sentence_ms", "tts_first_audio_ms", "total_to_first_audio_ms", "total_turn_ms", "audio_s", "tts_rtf"]
 vals = {k: [] for k in keys}
+hedge = {}
 n = 0
 for line in sys.stdin:
     n += 1
+    m = re.search(r"llm_hedge=(\S+)", line)
+    if m:
+        hedge[m.group(1)] = hedge.get(m.group(1), 0) + 1
     for k in keys:
         m = re.search(k + r"=([0-9.]+)", line)
         if m:
@@ -74,6 +78,9 @@ if n:
         v = vals[k]
         if v:
             print(f"  {k:26s} {st.median(v):9.1f} {min(v):9.1f} {max(v):9.1f}")
+    if hedge:
+        print("  llm_hedge: " + ", ".join(f"{k}={v}" for k, v in sorted(hedge.items()))
+              + "  (-: запасной запрос не запускали; primary: запускали, но успела основная; fallback: ответила запасная)")
 else:
     print("Успешных ходов в этом логе нет.")
 '

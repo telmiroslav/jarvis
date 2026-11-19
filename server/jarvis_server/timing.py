@@ -28,6 +28,7 @@ class TurnTiming:
     max_gap_s: float = 0.0
     outcome: str = "ok"
     first_split: int = 0  # длина первого куска, если первое предложение разрезали (0 = не резали)
+    llm_hedge: str = "-"  # запасной запрос к ИИ: "-" не запускали (или никто не ответил), "primary" запускали, но первой ответила основная модель, "fallback" первой ответила запасная
     mode: str = "ptt"  # listen_start.mode (ptt | wake | follow); в строке TURN всегда последний ключ
 
     def line(self) -> str:
@@ -39,5 +40,5 @@ class TurnTiming:
             f"audio_s={self.audio_s:.1f} | sentences={self.sentences} tts_ms={_ms(self.tts_ms_total)} tts_rtf={rtf} "
             f"underruns={self.underruns} max_gap_s={self.max_gap_s:.2f} chars={self.chars} "
             f"first_split={self.first_split or '-'} model={self.model or '-'} "
-            f"tools={','.join(self.tools) or '-'} mode={self.mode}"
+            f"tools={','.join(self.tools) or '-'} llm_hedge={self.llm_hedge or '-'} mode={self.mode}"
         )

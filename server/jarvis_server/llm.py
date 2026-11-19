@@ -3,12 +3,16 @@
 stream() отдаёт кусочки текста (str) по мере генерации и маркер Flush перед вызовом функции (чтобы фразу
 «Сейчас посмотрю» можно было озвучить, пока функция выполняется). Цикл вызова функций ручной: так его можно
 в любой момент отменить, а подписи «мыслей» Gemini 3 (thought_signature) возвращаются обратно как есть.
+
+Хедж (JARVIS_LLM_HEDGE_MS): если основная модель не дала первого куска за это время, тот же запрос параллельно уходит
+на следующую запасную; говорит та, что дала кусок первой, вторая отменяется. Подробности: GeminiLLM._hedged.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Protocol
 
@@ -50,6 +54,9 @@ class LLMStats:
     tool_calls: list[str] = field(default_factory=list)
     rounds: int = 0
     attempts: int = 0
+    # запасной (хедж) запрос: "-" не запускали (или никто не ответил); "primary" запускали, но первой ответила основная
+    # модель; "fallback" первой ответила запасная. model/backend/tool_calls всегда от той цепочки, что реально отвечала.
+    hedge: str = "-"
 
 
 class LLM(Protocol):
@@ -138,6 +145,7 @@ class GeminiLLM:
         self._clients: dict[str, Any] = {}
         self._resolved: str | None = None  # какой бэкенд ответил (для auto)
         self._no_thinking: set[str] = set()
+        self._reapers: set[asyncio.Task] = set()  # фоновая уборка проигравших цепочек хеджа
 
     # --- клиент и настройки запроса
     def _backend_order(self) -> list[str]:
@@ -201,24 +209,42 @@ class GeminiLLM:
         return out
 
     # --- публичный поток
-    async def stream(self, history: list[Exchange], user_text: str, tools: ToolRegistry,
-                     stats: LLMStats) -> AsyncIterator[Any]:
-        primary = self.s.llm_model
-        plan = [primary, *self.s.llm_fallback_models]
+    async def stream(self, history: list[Exchange], user_text: str, tools: ToolRegistry, stats: LLMStats,
+                     *, hedge: bool = True) -> AsyncIterator[Any]:
+        plan = _Plan([self.s.llm_model, *self.s.llm_fallback_models])
+        hedge_s = self.s.llm_hedge_ms / 1000.0
+        if not hedge or hedge_s <= 0 or len(plan.models) < 2:
+            async with aclosing(self._chain(plan, 0, history, user_text, tools, stats)) as chain:
+                async for item in chain:
+                    yield item
+            return
+        async with aclosing(self._hedged(plan, hedge_s, history, user_text, tools, stats)) as hedged:
+            async for item in hedged:
+                yield item
+
+    async def _chain(self, plan: "_Plan", start: int, history: list[Exchange], user_text: str, tools: ToolRegistry,
+                     stats: LLMStats, *, quiet: bool = False) -> AsyncIterator[Any]:
+        """Последовательные попытки: модели plan.models[start:], бэкенды, один быстрый повтор, запасные модели при ошибках
+        до начала ответа. quiet: цепочка запасного (хедж) запроса, её ошибки не повод для тревоги (пишем в debug)."""
+        models = plan.models
+        lvl_warn = logging.DEBUG if quiet else logging.WARNING
+        lvl_info = logging.DEBUG if quiet else logging.INFO
         started = False
         last: LLMError | None = None
-        retried_primary = False
-        idx = 0
-        while idx < len(plan):
-            model = plan[idx]
+        retried_first = False
+        idx = start
+        while idx < len(models) and (plan.limit is None or idx < plan.limit):
+            plan.cur = idx
+            model = models[idx]
             backends = self._backend_order()
             err: LLMError | None = None
             for bi, backend in enumerate(backends):
                 stats.attempts += 1
                 try:
-                    async for item in self._run(backend, model, history, user_text, tools, stats):
-                        started = True
-                        yield item
+                    async with aclosing(self._run(backend, model, history, user_text, tools, stats)) as run:
+                        async for item in run:
+                            started = True
+                            yield item
                     if self.s.llm_backend == "auto":
                         self._resolved = backend
                     return
@@ -227,7 +253,8 @@ class GeminiLLM:
                 except Exception as e:
                     err = classify_exception(e)
                     err.started = started or err.started
-                    log.warning("ИИ: ошибка (%s, %s, %s): %s", backend, model, err.kind, _short(err.detail or err.user_msg))
+                    log.log(lvl_warn, "ИИ: ошибка (%s, %s, %s): %s", backend, model, err.kind,
+                            _short(err.detail or err.user_msg))
                     if err.started:
                         raise err from e
                     if err.kind == "auth" and bi + 1 < len(backends):
@@ -237,14 +264,124 @@ class GeminiLLM:
             last = err
             if not err.retryable:
                 raise err
-            if err.kind in ("overload", "network") and idx == 0 and not retried_primary:
-                retried_primary = True  # один быстрый повтор той же моделью
+            if err.kind in ("overload", "network") and idx == start and not retried_first:
+                retried_first = True  # один быстрый повтор той же моделью
                 await asyncio.sleep(0.4)
                 continue
             idx += 1
-            if idx < len(plan):
-                log.info("ИИ: пробую запасную модель %s", plan[idx])
+            if idx < len(models) and (plan.limit is None or idx < plan.limit):
+                log.log(lvl_info, "ИИ: пробую запасную модель %s", models[idx])
         raise last or LLMError(MSG_BAD)
+
+    async def _hedged(self, plan: "_Plan", hedge_s: float, history: list[Exchange], user_text: str,
+                      tools: ToolRegistry, stats: LLMStats) -> AsyncIterator[Any]:
+        """Основная цепочка (_chain по всему списку моделей) идёт как обычно. Если первого куска нет за hedge_s, тот же
+        запрос параллельно уходит на следующую модель за той, на которой сейчас основная цепочка (вторая цепочка,
+        _chain с quiet). Основная при этом дальше своей текущей модели не идёт: остальные модели принадлежат запасной.
+
+        Кто первой отдал первый кусок (текст, либо FLUSH перед вызовом функции), тот и отвечает; вторая отменяется
+        сразу. Функции не выполняются дважды: пока цепочку не объявили победителем, из неё тянется ровно один элемент,
+        а FLUSH и выполнение функции — это уже следующий шаг генератора, который проигравшей никто не даст сделать.
+        Цепочка, упавшая до первого куска, просто выбывает (её ошибка уходит в debug), пока жива другая. Когда
+        упали обе, поднимается ошибка той, что упала последней. Победитель, упавший после первого куска, ведёт себя
+        как раньше: ошибка наружу (повторять поздно, плате уже что-то ушло)."""
+        t0 = time.perf_counter()
+        a = _Lane("primary", LLMStats(), t0)
+        a.gen = self._chain(plan, 0, history, user_text, tools, a.stats)
+        lanes = [a]
+        b: _Lane | None = None
+        winner: _Lane | None = None
+        last_err: BaseException | None = None
+        last_dead: _Lane | None = None
+        can_hedge = True
+        a.start()
+        try:
+            while winner is None:
+                live = [ln for ln in lanes if not ln.task.done()]
+                if not live:
+                    raise last_err if last_err is not None else LLMError(MSG_BAD)
+                timeout = None
+                if b is None and can_hedge:
+                    timeout = max(0.0, t0 + hedge_s - time.perf_counter())
+                done, _ = await asyncio.wait([ln.task for ln in live], timeout=timeout,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if not done:  # прошло hedge_s, а первого куска нет
+                    h = plan.cur + 1
+                    if h >= len(plan.models):
+                        can_hedge = False  # запасных за текущей моделью нет: хеджировать нечем
+                        continue
+                    plan.limit = h
+                    sb = LLMStats()
+                    b = _Lane("fallback", sb, time.perf_counter())
+                    b.gen = self._chain(_Plan(plan.models), h, history, user_text, tools, sb, quiet=True)
+                    lanes.append(b)
+                    b.start()
+                    log.info("ИИ: %s не дала первого слова за %d мс, параллельно спрашиваю %s (первая ответившая "
+                             "говорит, вторая отменяется)", plan.models[plan.cur], (b.t_start - t0) * 1000,
+                             plan.models[h])
+                    continue
+                for ln in sorted((x for x in lanes if x.task.done() and not x.seen), key=lambda x: x.t_done):
+                    ln.seen = True
+                    if ln.error is not None:
+                        last_err, last_dead = ln.error, ln
+                        log.debug("ИИ: цепочка %s (%s) выбыла до первого слова: %s", ln.name, ln.stats.model,
+                                  _short(str(ln.error)))
+                    elif winner is None:
+                        winner = ln
+            assert winner is not None
+            stats.attempts = sum(ln.stats.attempts for ln in lanes)
+            if b is not None:
+                stats.hedge = winner.name if winner is b else "primary"
+                self._log_hedge_result(winner, [ln for ln in lanes if ln is not winner], t0)
+            for ln in lanes:
+                if ln is not winner:
+                    self._discard(ln)
+            _adopt(stats, winner.stats)
+            if winner.ended:  # цепочка закончилась, ничего не отдав (как пустой ответ)
+                return
+            try:
+                _adopt(stats, winner.stats)
+                yield winner.item
+                async for item in winner.gen:
+                    _adopt(stats, winner.stats)
+                    yield item
+            finally:
+                _adopt(stats, winner.stats)
+                stats.attempts = sum(ln.stats.attempts for ln in lanes)
+                await winner.gen.aclose()
+        finally:
+            if winner is None:  # ошибка или отмена до первого куска: статистика последней упавшей (или основной)
+                _adopt(stats, (last_dead or a).stats)
+                stats.attempts = sum(ln.stats.attempts for ln in lanes)
+            for ln in lanes:
+                if ln is not winner:
+                    self._discard(ln)
+
+    @staticmethod
+    def _log_hedge_result(winner: "_Lane", losers: list["_Lane"], t0: float) -> None:
+        def lat(ln: "_Lane") -> str:
+            if not ln.task.done():
+                return "первого слова ещё не было, отменена"
+            ms = (ln.t_done - t0) * 1000
+            return f"ошибка через {ms:.0f} мс" if ln.error is not None else f"первое слово через {ms:.0f} мс, но позже"
+
+        who = "запасная" if winner.name == "fallback" else "основная"
+        log.info("ИИ: хедж: первой ответила %s (%s), первое слово через %.0f мс от начала запроса; %s",
+                 who, winner.stats.model, (winner.t_done - t0) * 1000,
+                 "; ".join(f"{'основная' if ln.name == 'primary' else 'запасная'} ({ln.stats.model or '?'}): {lat(ln)}"
+                           for ln in losers))
+
+    def _discard(self, lane: "_Lane") -> None:
+        """Проигравшую цепочку отменяем сразу: задача чтения получает CancelledError, поток ответа закрывается в finally
+        (_run), больше из него никто не читает. Доуборку ждём в фоне, чтобы победитель не ждал ни мгновения."""
+        if lane.discarded:
+            return
+        lane.discarded = True
+        if lane.task is not None and not lane.task.done():
+            lane.task.cancel()
+        t = asyncio.ensure_future(_reap(lane))
+        self._reapers.add(t)
+        t.add_done_callback(self._reapers.discard)
 
     async def _run(self, backend: str, model: str, history: list[Exchange], user_text: str, tools: ToolRegistry,
                    stats: LLMStats) -> AsyncIterator[Any]:
@@ -334,6 +471,11 @@ class GeminiLLM:
         raise LLMError(MSG_BAD, "слишком много вызовов функций подряд")
 
     async def aclose(self) -> None:
+        reapers = list(self._reapers)
+        for t in reapers:
+            t.cancel()
+        if reapers:
+            await asyncio.gather(*reapers, return_exceptions=True)
         for c in self._clients.values():
             try:
                 await c.aio.aclose()
@@ -366,7 +508,7 @@ class GeminiLLM:
         try:
             stats = LLMStats()
             text = ""
-            async for item in self.stream([], "Ответь одним словом: ок", ToolRegistry(), stats):
+            async for item in self.stream([], "Ответь одним словом: ок", ToolRegistry(), stats, hedge=False):
                 if isinstance(item, str):
                     text += item
             return True, f"{stats.backend}/{stats.model}: {text.strip()[:40]}", time.perf_counter() - t0
@@ -377,6 +519,63 @@ class GeminiLLM:
 def _short(s: str, n: int = 220) -> str:
     s = " ".join(str(s).split())
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+@dataclass
+class _Plan:
+    """Список моделей одной цепочки попыток. cur: на какой модели цепочка сейчас; limit: хедж забрал модели с этого
+    индекса, дальше него цепочка не идёт."""
+
+    models: list[str]
+    cur: int = 0
+    limit: int | None = None
+
+
+class _Lane:
+    """Одна цепочка запросов под присмотром хеджа. До объявления победителя из неё тянется только первый элемент."""
+
+    def __init__(self, name: str, stats: LLMStats, t_start: float):
+        self.name = name  # "primary" | "fallback"
+        self.stats = stats  # у каждой цепочки свои: общая статистика берётся у победителя
+        self.t_start = t_start
+        self.gen: Any = None
+        self.task: asyncio.Task | None = None
+        self.item: Any = None  # первый элемент (текст или FLUSH)
+        self.ended = False  # цепочка закончилась, ничего не отдав
+        self.error: BaseException | None = None  # цепочка упала, ничего не отдав
+        self.t_done = 0.0  # perf_counter, когда пришёл первый элемент или ошибка
+        self.seen = False
+        self.discarded = False
+
+    def start(self) -> None:
+        self.task = asyncio.ensure_future(self._first())
+
+    async def _first(self) -> None:
+        try:
+            self.item = await self.gen.__anext__()
+        except StopAsyncIteration:
+            self.ended = True
+        except Exception as e:
+            self.error = e
+        self.t_done = time.perf_counter()
+
+
+def _adopt(dst: LLMStats, src: LLMStats) -> None:
+    """Общая статистика ведёт себя как у цепочки-победителя (attempts и hedge считает хедж сам)."""
+    dst.backend, dst.model = src.backend, src.model
+    dst.first_token_s = src.first_token_s
+    dst.tool_calls = list(src.tool_calls)
+    dst.rounds = src.rounds
+
+
+async def _reap(lane: _Lane) -> None:
+    """Дождаться, пока отменённая задача чтения закончится, и закрыть генератор цепочки (если она стояла на yield)."""
+    if lane.task is not None:
+        await asyncio.wait({lane.task})
+    try:
+        await lane.gen.aclose()
+    except Exception:
+        pass
 
 
 # -------------------------------------------------------------------- mock ----

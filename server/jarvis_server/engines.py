@@ -11,14 +11,29 @@ from typing import Any, Callable
 
 import numpy as np
 
+from . import protocol
+from .audio import float_to_pcm16
 from .config import Settings
 from .gpu import vram_summary
 from .llm import LLM, build_llm
 from .skills import ToolRegistry, build_default_registry
 from .stt import SttResult, WhisperSTT
-from .tts import TTS, build_tts
+from .textnorm import normalize_ru
+from .tts import TTS, build_tts, postprocess
 
 log = logging.getLogger("jarvis.engines")
+
+
+FILLER_TEXT = "Секунду, сэр."
+
+
+@dataclass
+class Filler:
+    """Заглушка на случай долгого молчания ИИ (JARVIS_LLM_FILLER_MS): звук синтезирован один раз при старте."""
+
+    text: str
+    pcm: bytes  # PCM16, protocol.TTS_RATE
+    seconds: float
 
 
 @dataclass
@@ -28,6 +43,7 @@ class Engines:
     llm: LLM
     tools: ToolRegistry
     on_fatal: Callable[[str], None] | None = field(default=None, repr=False)  # вызывается при сбое видеокарты
+    filler: Filler | None = None  # None = заглушки нет (выключена или не удалось синтезировать)
     _stt_pool: ThreadPoolExecutor = field(default_factory=lambda: ThreadPoolExecutor(1, "stt"), repr=False)
     _tts_pool: ThreadPoolExecutor = field(default_factory=lambda: ThreadPoolExecutor(1, "tts"), repr=False)
 
@@ -71,6 +87,22 @@ def is_fatal_gpu_error(exc: BaseException | str) -> bool:
     return any(m in text for m in _FATAL_MARKERS)
 
 
+def make_filler(tts: TTS, settings: Settings) -> Filler | None:
+    """Синтез заглушки голосом помощника (блокирующий, один раз при старте). При сбое заглушки просто не будет."""
+    try:
+        t0 = time.perf_counter()
+        raw = tts.synth(normalize_ru(FILLER_TEXT))
+        a = postprocess(raw, tts.sample_rate, protocol.TTS_RATE, settings.tts_peak_db, settings.tts_gap_ms)
+        if len(a) == 0:
+            raise ValueError("синтез вернул тишину")
+        f = Filler(FILLER_TEXT, float_to_pcm16(a), len(a) / protocol.TTS_RATE)
+        log.info("заглушка «%s» синтезирована за %.1f с (звук %.2f с)", f.text, time.perf_counter() - t0, f.seconds)
+        return f
+    except Exception as e:
+        log.warning("заглушку «%s» синтезировать не удалось, она не будет использоваться: %s", FILLER_TEXT, e)
+        return None
+
+
 def build_engines(settings: Settings, load: bool = True) -> Engines:
     """Создаёт движки; load=True загружает модели в память и прогревает (один раз при старте сервера)."""
     stt: Any
@@ -95,5 +127,7 @@ def build_engines(settings: Settings, load: bool = True) -> Engines:
         log.info("после загрузки TTS: %s", vram_summary())
         eng.stt.warmup()
         eng.tts.warmup()
+        if settings.llm_filler_ms > 0:
+            eng.filler = make_filler(eng.tts, settings)
         log.info("модели загружены и прогреты за %.1f с. %s", time.perf_counter() - t0, vram_summary())
     return eng

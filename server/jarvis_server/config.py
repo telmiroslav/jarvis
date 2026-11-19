@@ -98,6 +98,8 @@ class Settings:
     llm_max_tokens: int = 1024
     llm_first_token_timeout_s: float = 20.0
     llm_total_timeout_s: float = 60.0
+    llm_hedge_ms: int = 2500  # основная модель не дала первого слова за столько мс: параллельно спросить запасную (0 = не хеджировать)
+    llm_filler_ms: int = 0  # первого слова ИИ всё ещё нет за столько мс: сказать «Секунду, сэр.» (0 = выкл.)
     api_key: str = field(default="", repr=False)
     # распознавание речи
     stt_model: str = "large-v3-turbo"
@@ -142,8 +144,9 @@ class Settings:
     def describe(self) -> str:
         """Одна строка для лога, без секретов."""
         key = "задан" if self.api_key else "НЕ задан"
+        hedge = f"{self.llm_hedge_ms}мс" if self.llm_hedge_ms else "выкл"
         return (
-            f"llm={self.llm}/{self.llm_backend}/{self.llm_model} ключ={key} stt={self.stt_model}/{self.stt_device}/"
+            f"llm={self.llm}/{self.llm_backend}/{self.llm_model} хедж={hedge} ключ={key} stt={self.stt_model}/{self.stt_device}/"
             f"{self.stt_compute} подсказка_stt={self.stt_hotwords or '-'} tts={self.tts}/{self.tts_device}/{self.tts_dtype}/steps={self.tts_steps} "
             f"порты udp={self.discovery_port} ws={self.ws_port}"
         )
@@ -178,6 +181,8 @@ def load_settings(env_override: dict[str, str] | None = None, *, files: list[Pat
         llm_max_tokens=_int(env, "JARVIS_LLM_MAX_TOKENS", base.llm_max_tokens),
         llm_first_token_timeout_s=_float(env, "JARVIS_LLM_FIRST_TOKEN_TIMEOUT", base.llm_first_token_timeout_s),
         llm_total_timeout_s=_float(env, "JARVIS_LLM_TOTAL_TIMEOUT", base.llm_total_timeout_s),
+        llm_hedge_ms=max(0, _int(env, "JARVIS_LLM_HEDGE_MS", base.llm_hedge_ms)),
+        llm_filler_ms=max(0, _int(env, "JARVIS_LLM_FILLER_MS", base.llm_filler_ms)),
         api_key=key,
         stt_model=(env.get("JARVIS_STT_MODEL") or base.stt_model).strip(),
         stt_device=(env.get("JARVIS_STT_DEVICE") or dev).strip().lower(),
