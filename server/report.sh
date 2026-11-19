@@ -54,6 +54,8 @@ PY
         if command -v "$prog" >/dev/null 2>&1; then echo "$prog: $("$prog" --version 2>&1 | head -1)"; else echo "$prog: нет"; fi
     done
     pacman -Q mpv-mpris 2>/dev/null || echo "mpv-mpris: нет"
+    COOKIES_BROWSER="$(env_get JARVIS_MUSIC_COOKIES_BROWSER)"
+    echo "cookies браузера для YouTube (JARVIS_MUSIC_COOKIES_BROWSER): ${COOKIES_BROWSER:-не заданы}"
     section "Служба"
     systemctl --user status "$UNIT_NAME" --no-pager -l 2>&1 | head -20
     echo
@@ -106,6 +108,7 @@ else:
     print("Успешных ходов в этом логе нет.")
 '
     echo "Молчаливых ходов (follow, ИИ решил, что фраза не к Джарвису): $(echo "$LOGTXT" | grep -cE ' TURN silent\(' || true)"
+    echo "Блокировок YouTube («подтвердите, что вы не робот») в этом логе: $(echo "$LOGTXT" | grep -cE 'следующие [0-9]+ мин source=auto идёт сразу на SoundCloud' || true) (дальше музыка идёт с SoundCloud или в браузере; помогает другая страна в VPN или JARVIS_MUSIC_COOKIES_BROWSER)"
     section "Лог службы (последние $N строк)"
     echo "$LOGTXT"
 } 2>&1 | python3 -c '

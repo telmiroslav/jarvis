@@ -34,6 +34,15 @@ def yt_results(*items) -> str:
     return "\n".join(yt_line(*i) for i in items)
 
 
+def sc_line(id_, title, dur, uploader, page):
+    d = {"_type": "url", "ie_key": "Soundcloud", "id": id_, "url": f"https://api.soundcloud.com/tracks/soundcloud%3Atracks%3A{id_}",
+         "title": title, "duration": dur, "uploader": uploader, "channel": None, "live_status": None, "webpage_url": page}
+    return json.dumps(d, ensure_ascii=False)
+
+
+SC_URL = "https://soundcloud.com/cupsize/ty-lyubish-tantsevat"
+SC_CUPSIZE = sc_line("111", "Ты любишь танцевать", 144.0, "CUPSIZE", SC_URL)  # выдача SoundCloud на тот же запрос
+BOT = "ERROR: [youtube] LHiSYbn2pUU: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication."
 CUPSIZE = yt_results(("LHiSYbn2pUU", "ты любишь танцевать", 145.0, "CUPSIZE"), ("DShMg5Z6C3E", "CUPSIZE - Ты любишь танцевать", 143.0, "CupsizeArchive"),
                      ("OV39rELfsrE", "CUPSIZE – Ты любишь танцевать 1 час (Demo)", 3616.0, "wowmeow"))
 URL1 = "https://www.youtube.com/watch?v=LHiSYbn2pUU"
@@ -43,18 +52,21 @@ URL2 = "https://www.youtube.com/watch?v=DShMg5Z6C3E"
 class MusicRig:
     def __init__(self, tmp_path: Path | None = None, *, specs: dict[str, TrackSpec] | None = None, mpv: bool = True, ytdlp: bool = True,
                  ffmpeg: bool = True, search: str | None = CUPSIZE, settings: dict | None = None, polls_to_start: int = 1,
-                 mpv_kw: dict | None = None, search_factory=None):
+                 mpv_kw: dict | None = None, search_factory=None, sc_search: str | None = None, browser=None, cookies: str = ""):
         self.tmp = tmp_path or Path(tempfile.mkdtemp(prefix="jvr"))
         self._sock_dir = tempfile.mkdtemp(prefix="jvs")
         self.clock = FakeClock()
         self.fac = FakeFactory(specs)
         avail = {"yt-dlp": "/opt/venv/bin/yt-dlp" if ytdlp else None, "ffmpeg": "/usr/bin/ffmpeg" if ffmpeg else None,
                  "mpv": "/usr/bin/mpv" if mpv else None, "deno": "/usr/bin/deno"}
-        self.tb = Toolbox(SimpleNamespace(music_proxy=""), which=lambda n: avail.get(n), environ={"XDG_RUNTIME_DIR": self._sock_dir},
+        self.tb = Toolbox(SimpleNamespace(music_proxy="", music_cookies_browser=cookies), which=lambda n: avail.get(n), environ={"XDG_RUNTIME_DIR": self._sock_dir},
                           prefix="/nonexistent")
         self.runner = FakeRunner()
         if search is not None:
             self.runner.on(["--flat-playlist"], stdout=search)
+        if sc_search is not None:  # SoundCloud (scsearch) отвечает своим списком, а не списком YouTube; правило позднее = главнее
+            self.runner.on(lambda a: "--flat-playlist" in a and a[-1].startswith("scsearch"), stdout=sc_search)
+        self.browser = browser
         self.spawner = MpvSpawner(polls_to_start=polls_to_start, **(mpv_kw or {}))
         self.box = BoxPlayer(self.fac, volume=40, frame_ms=FRAME_MS, abort_grace_s=0.1, clock=self.clock, sleep=self.clock.sleep)
         self.laptop = LaptopPlayer(self.tb, socket_path=os.path.join(self._sock_dir, "mpv.sock"), spawn=self.spawner, clock=self.clock,
@@ -64,7 +76,7 @@ class MusicRig:
         self.settings = make_settings(music=True, **{"music_speculative": False, **(settings or {})})
         self.registry = build_default_registry()
         self.svc = register_music_tools(self.registry, self.settings, tb=self.tb, runner=self.runner, box=self.box, laptop=self.laptop,
-                                        local=self.local, search_factory=search_factory, clock=self.clock)
+                                        local=self.local, search_factory=search_factory, clock=self.clock, browser=browser)
 
     async def call(self, tool: str, /, **args):
         return await self.registry.call(tool, args)

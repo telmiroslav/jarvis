@@ -27,7 +27,10 @@ _ERRORS: tuple[tuple[tuple[str, ...], str, str], ...] = (
       "no supported javascript"), "no_js_runtime",
      "YouTube не отдаёт звук без deno и свежего yt-dlp. Нужно поставить deno и обновить yt-dlp: ./server/install.sh"),
     (("sign in to confirm", "not a bot", "confirm you’re not a bot", "confirm you're not a bot"), "blocked",
-     "YouTube просит подтвердить, что это не робот. Поможет другой выход в сеть (VPN) или обновление yt-dlp"),
+     "YouTube просит подтвердить, что это не робот. Поможет другой выход в сеть (другая страна в VPN), вход в YouTube в браузере с "
+     "JARVIS_MUSIC_COOKIES_BROWSER или обновление yt-dlp"),
+    (("cookie database", "cookies database", "unsupported browser", "failed to decrypt", "decrypt cookie"), "cookies",
+     "yt-dlp не смог прочитать cookies браузера из JARVIS_MUSIC_COOKIES_BROWSER: закрой этот браузер или проверь имя и профиль"),
     (("http error 403", "403: forbidden", "forbidden"), "forbidden",
      "Сервис не отдал звук (ошибка 403). Обычно помогает обновить yt-dlp: ./server/install.sh"),
     (("http error 429", "too many requests"), "rate_limited", "Сервис просит подождать: слишком много запросов. Попробуй через минуту"),

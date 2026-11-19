@@ -2,6 +2,11 @@
 
 Куда играть решает вызов: по умолчанию колонка платы; «на компе» играет на ноутбуке; плата без возможности music (прошивка старше
 v0.6.0) тоже получает музыку на ноутбуке, и ИИ честно говорит об этом. Играет одно место сразу: включили на одном, второе останавливается.
+Третье место, browser: страница трека открывается в браузере (без mpv и ffmpeg), дальше она играет там и управляется как музыка в браузере.
+
+YouTube из некоторых сетей (VPN в Китае и др.) просит «подтвердить, что вы не робот»: поиск работает, а звук нет (код blocked). Тогда:
+колонка сама ищет тот же трек на SoundCloud и помнит блокировку BLOCK_MEMORY_S секунд (auto сразу идёт на SoundCloud), а ноутбук открывает
+страницу трека в браузере, где человек вошёл в YouTube.
 
 Сессия платы (session.py) сообщает службе: hello (возможности платы), listen_start, конец хода, abort, music_done, обрыв связи.
 Функции ИИ (tools.py) вызывают play() и control().
@@ -12,7 +17,8 @@ import asyncio
 import inspect
 import logging
 import time
-from typing import Any, Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Protocol
 
 from ... import protocol
 from ..pc.runner import Runner
@@ -25,7 +31,7 @@ from .search import normalize_query, rank_tracks, search_tracks
 
 log = logging.getLogger("jarvis.music")
 
-WHERES = ("box", "laptop")
+WHERES = ("box", "laptop", "browser")
 SOURCES = ("auto", "youtube", "soundcloud", "local")
 KINDS = ("track", "artist")
 ACTIONS = ("pause", "resume", "stop", "next", "previous", "volume_up", "volume_down", "set_volume", "status")
@@ -33,6 +39,39 @@ QUEUE_LEN = 10
 VOLUME_STEP = 15  # «громче» и «тише» на колонке: на сколько пунктов из 100
 ATTEMPTS = 3  # сколько треков из выдачи пробуем, если первые не запускаются (удалён, закрыт по региону)
 SEARCH_MAX_S = 8.0  # поиск не дольше
+BLOCK_MEMORY_S = 30 * 60.0  # после «YouTube просит подтвердить, что это не робот» source=auto столько секунд идёт сразу на SoundCloud
+NOTHING_FOUND = ("not_found", "unavailable", "failed")  # SoundCloud ничего не дал: можно пробовать другой источник
+NOTE_SOUNDCLOUD = "YouTube сейчас не пускает (проверка на робота), поэтому играет с SoundCloud"
+MSG_BROWSER = ("Открыл страницу трека в браузере: музыка играет там, а не через меня (если не заиграла сама, в браузере её нужно запустить). "
+               "Пауза, следующий трек и громкость: media_control и volume_control, music_control к браузеру не относится")
+
+
+class UrlOpener(Protocol):
+    """Открывает страницу в браузере. Это набор pc (PcControl): тот же безопасный путь, что у open_website, через сеанс Hyprland."""
+
+    def can_open_url(self) -> bool: ...
+
+    async def open_url(self, url: str) -> dict[str, Any]: ...
+
+
+@dataclass
+class _Run:
+    """Один вызов play_music: что просили, что нашли (после неудачи на ноутбуке тот же трек открывается в браузере)."""
+
+    q: str
+    kind: str
+    target: str  # box | laptop
+    deadline: float
+    t0: float
+    found: list[Track] = field(default_factory=list)
+
+
+@dataclass
+class _Started:
+    track: Track
+    queue: list[Track]
+    t_search: float
+    t_start: float
 
 
 def _enum(value: Any, name: str, allowed: tuple[str, ...], default: str) -> str:
@@ -45,8 +84,11 @@ def _enum(value: Any, name: str, allowed: tuple[str, ...], default: str) -> str:
 
 class MusicService:
     def __init__(self, settings: Any, tb: Toolbox, runner: Runner, box: BoxPlayer, laptop: LaptopPlayer, local: LocalFinder, *,
-                 search_factory: Callable[[str], Awaitable[Any]] | None = None, clock: Callable[[], float] = time.monotonic):
+                 search_factory: Callable[[str], Awaitable[Any]] | None = None, clock: Callable[[], float] = time.monotonic,
+                 browser: UrlOpener | None = None):
         self.s, self.tb, self.runner = settings, tb, runner
+        self.browser = browser  # None: страницу в браузере открыть нечем (нет набора pc)
+        self._blocked_at: float | None = None  # когда YouTube последний раз просил подтвердить, что это не робот
         self.search_factory = search_factory  # запуск потока первого результата поиска (sources.open_search_source); None = не запускать
         self.box, self.laptop, self.local = box, laptop, local
         self.clock = clock
@@ -176,8 +218,8 @@ class MusicService:
         where = _enum(where, "where", WHERES, "box")
         source = _enum(source, "source", SOURCES, "auto")
         kind = _enum(kind, "kind", KINDS, "track")
-        if source == "auto":
-            source = "youtube"
+        if where == "browser":
+            return await self._play_in_browser(q, source, kind, deadline)
         target, note = where, ""
         if where == "box":
             if not self.board_present:
@@ -187,14 +229,99 @@ class MusicService:
                 note = "Колонка пока не умеет играть музыку (на ней старая прошивка, нужна v0.6.0), поэтому музыка играет на ноутбуке."
                 log.warning("музыка: у платы нет возможности music, включаю на ноутбуке")
         if target == "laptop" and not self.tb.mpv:
-            raise MusicError("no_mpv", (note + " " if note else "") +
+            err = MusicError("no_mpv", (note + " " if note else "") +
                              "На ноутбуке нет mpv, музыку на компьютере не включить. Установщик ставит его: ./server/install.sh")
+            res = await self._browser_instead(err, q, source, kind, deadline, [], note, "На ноутбуке нет mpv, поэтому видео открыто в браузере")
+            if res is not None:
+                return res
+            raise err
+        return await self._start_chain(_Run(q, kind, target, deadline, t0), source, note)
 
+    # ------------------------------------------------------------------ запуск: источники, запасные пути
+    def _youtube_blocked(self) -> bool:
+        """YouTube недавно просил подтвердить, что это не робот (BLOCK_MEMORY_S секунд)."""
+        at = self._blocked_at
+        if at is None:
+            return False
+        if self.clock() - at >= BLOCK_MEMORY_S:
+            self._blocked_at = None
+            log.info("музыка: с блокировки YouTube прошло больше %d мин, снова пробую его первым", int(BLOCK_MEMORY_S // 60))
+            return False
+        return True
+
+    def _mark_blocked(self) -> None:
+        self._blocked_at = self.clock()
+        log.warning("музыка: YouTube просит подтвердить, что это не робот; следующие %d мин source=auto идёт сразу на SoundCloud",
+                    int(BLOCK_MEMORY_S // 60))
+
+    def _order(self, source: str, target: str) -> list[str]:
+        """Какие источники пробовать по порядку. Блокировку YouTube помним для колонки: ноутбуку в этом случае открывается браузер."""
+        if source != "auto":
+            return [source]
+        if target == "box" and self._youtube_blocked():
+            log.info("музыка: YouTube просил подтвердить, что это не робот %d мин назад: сразу ищу на SoundCloud, YouTube только если там пусто",
+                     int((self.clock() - (self._blocked_at or 0.0)) // 60))
+            return ["soundcloud", "youtube"]
+        return ["youtube"]
+
+    async def _start_chain(self, run: _Run, source: str, note: str) -> dict[str, Any]:
+        order = self._order(source, run.target)
+        sc_err: MusicError | None = None
+        for i, src in enumerate(order):
+            try:
+                st = await self._start(run, src)
+            except MusicError as e:
+                if src == "youtube" and e.code == "blocked":
+                    return await self._after_block(run, e, sc_err, note)
+                if i + 1 < len(order) and e.code in NOTHING_FOUND:
+                    sc_err = e
+                    log.info("музыка: на SoundCloud «%s» не нашлось (%s), пробую YouTube", run.q, e.code)
+                    continue
+                raise
+            extra = NOTE_SOUNDCLOUD if src == "soundcloud" and source == "auto" else ""
+            return self._result(run, st, " ".join(x for x in (note, extra) if x))
+        raise MusicError("failed", "Не удалось включить музыку")  # недостижимо: порядок не пуст
+
+    async def _after_block(self, run: _Run, err: MusicError, sc_err: MusicError | None, note: str) -> dict[str, Any]:
+        """YouTube не пустил (код blocked). Колонка: тот же запрос на SoundCloud в оставшееся время; ноутбук: страница трека в браузере."""
+        self._mark_blocked()
+        if run.target == "laptop":
+            res = await self._browser_instead(err, run.q, "youtube", run.kind, run.deadline, run.found, note,
+                                              "YouTube не пустил ноутбук (проверка на робота), поэтому видео открыто в браузере")
+            if res is not None:
+                return res
+            raise err
+        if sc_err is not None:  # SoundCloud уже пробовали первым и он ничего не дал
+            raise self._blocked_error(sc_err)
+        log.info("музыка: YouTube просит подтвердить, что это не робот: ищу «%s» на SoundCloud (осталось %.0f с)", run.q,
+                 run.deadline - self.clock())
+        try:
+            st = await self._start(run, "soundcloud")
+        except MusicError as e:
+            raise self._blocked_error(e) from None
+        return self._result(run, st, " ".join(x for x in (note, NOTE_SOUNDCLOUD) if x))
+
+    def _blocked_error(self, sc: MusicError) -> MusicError:
+        """YouTube не пустил, а запасной SoundCloud тоже не помог: код остаётся blocked (его и ждёт ИИ), в тексте совет."""
+        tail = " На SoundCloud такого трека не нашлось." if sc.code in NOTHING_FOUND else " SoundCloud тоже не включился."
+        if self.tb.cookies_browser:
+            advice = (f"Cookies браузера «{self.tb.cookies_browser}» уже подключены: проверь, что в нём выполнен вход в YouTube, "
+                      "или выбери другую страну в VPN")
+        else:
+            advice = "Поможет другая страна в VPN или вход в YouTube в браузере и настройка JARVIS_MUSIC_COOKIES_BROWSER"
+        log.warning("музыка: YouTube не пустил, а запасной SoundCloud не помог (%s: %s)", sc.code, sc.message)
+        return MusicError("blocked", "YouTube не пускает с этого выхода в сеть (просит подтвердить, что это не робот)." + tail + " " + advice)
+
+    async def _start(self, run: _Run, source: str) -> _Started:
+        """Найти трек в источнике и запустить его на колонке или ноутбуке. MusicError: не нашёлся, не запустился, нет сети, blocked."""
+        t0 = self.clock()
+        q, kind, target, deadline = run.q, run.kind, run.target, run.deadline
         # YouTube на колонку: поток первого результата поиска стартует ПАРАЛЛЕЛЬНО с обычным поиском (разбор страницы идёт 3-4 секунды,
         # и вместе с поиском это было бы подряд). Если выбор лучшего трека совпал с тем, что взял yt-dlp, второй раз разбирать не нужно.
         spec = await self._start_speculative(q, source, target)
         try:
             found = await self._find(q, source, kind, deadline)
+            run.found = found
             t_search = self.clock() - t0
             log.info("музыка: «%s» (%s, %s, %s): найдено %d за %.1f с, лучшее «%s»", q, source, kind, target, len(found), t_search,
                      found[0].title)
@@ -237,19 +364,84 @@ class MusicService:
             await self._drop(spec)  # поток, который так и не пригодился (другой ролик, ошибка, отмена), не должен висеть в фоне
         if track is None:
             raise last or MusicError("failed", "Не удалось включить музыку")
-        log.info("музыка: «%s» пошла за %.1f с (поиск %.1f с, запуск звука %.1f с)", track.title, self.clock() - t0, t_search,
-                 self.clock() - t1)
-        out: dict[str, Any] = {"ok": True, "playing": track.title, "where": target, "source": track.source}
-        if kind == "artist" and len(queue) > 1:
-            out["queue_length"] = len(queue)
+        if track.source == "youtube" and self._blocked_at is not None:
+            self._blocked_at = None  # звук с YouTube пошёл: блокировки нет (сменили выход в сеть, вошли в браузере)
+            log.info("музыка: YouTube снова отдаёт звук, блокировку забываю")
+        return _Started(track, queue, t_search, self.clock() - t1)
+
+    def _result(self, run: _Run, st: _Started, note: str) -> dict[str, Any]:
+        track = st.track
+        log.info("музыка: «%s» пошла за %.1f с (поиск %.1f с, запуск звука %.1f с)", track.title, self.clock() - run.t0, st.t_search,
+                 st.t_start)
+        out: dict[str, Any] = {"ok": True, "playing": track.title, "where": run.target, "source": track.source}
+        if run.kind == "artist" and len(st.queue) > 1:
+            out["queue_length"] = len(st.queue)
         if track.duration:
             out["duration"] = fmt_duration(track.duration)
         if note:
             out["note"] = note
-        if target == "box":
+        if run.target == "box":
             out["message"] = "Музыка заиграет в колонке сразу после твоей реплики"
         else:
             out["message"] = "Музыка играет на ноутбуке"
+        return out
+
+    # ------------------------------------------------------------------ браузер
+    def _can_browser(self) -> bool:
+        try:
+            return self.browser is not None and bool(self.browser.can_open_url())
+        except Exception:
+            return False
+
+    async def _play_in_browser(self, q: str, source: str, kind: str, deadline: float) -> dict[str, Any]:
+        """where=browser: найти трек, как обычно (плоский поиск и выбор), и открыть его страницу в браузере. Ни mpv, ни ffmpeg, ни потока."""
+        if source == "local":
+            raise MusicError("bad_argument", "Файл с ноутбука в браузере не открыть: он играет на колонке или на ноутбуке (where box или laptop)")
+        if not self._can_browser():
+            raise MusicError("no_browser", "Открыть страницу в браузере сейчас нельзя: на ноутбуке не найден сеанс Hyprland. "
+                                           "Можно включить музыку в колонке или на ноутбуке")
+        src = "soundcloud" if source == "soundcloud" else "youtube"
+        found = await self._find(q, src, kind, deadline)
+        log.info("музыка: «%s» (%s, %s, browser): найдено %d, лучшее «%s»", q, src, kind, len(found), found[0].title)
+        return await self._open_in_browser(found[0])
+
+    async def _browser_instead(self, err: MusicError, q: str, source: str, kind: str, deadline: float, found: list[Track], note: str,
+                               why: str) -> dict[str, Any] | None:
+        """Запасной путь вместо ошибки err (blocked у YouTube на ноутбуке, нет mpv): открыть страницу трека в браузере. None: нельзя,
+        тогда вызывающий отдаёт исходную ошибку."""
+        if source == "local" or not self._can_browser():
+            return None
+        try:
+            if not found:
+                if err.code != "no_mpv":
+                    return None  # блокировка случилась уже на поиске: открывать нечего
+                found = await self._find(q, "soundcloud" if source == "soundcloud" else "youtube", kind, deadline)
+            track = found[0]
+            if track.is_local:
+                return None
+            log.info("музыка: %s (%s), открываю «%s» в браузере", why, err.code, track.title)
+            return await self._open_in_browser(track, " ".join(x for x in (note, why) if x))
+        except MusicError as e:
+            log.warning("музыка: в браузере тоже не вышло: %s (%s)", e.message, e.code)
+            return None
+
+    async def _open_in_browser(self, track: Track, note: str = "") -> dict[str, Any]:
+        """Открыть страницу трека через набор pc (hyprctl dispatch exec xdg-open, адрес проверен и в кавычках). MusicError, если не открылась."""
+        if not self._can_browser():
+            raise MusicError("no_browser", "Открыть страницу в браузере сейчас нельзя: на ноутбуке не найден сеанс Hyprland")
+        assert self.browser is not None
+        res = await self.browser.open_url(track.url)
+        if res.get("ok") is not True:
+            raise MusicError(str(res.get("error") or "no_browser"), str(res.get("message") or "Браузер не открыл страницу"))
+        await self._stop_box()  # музыка играет в браузере: у колонки и mpv она замолкает, чтобы не играли два места сразу
+        await self._stop_laptop()
+        log.info("музыка: «%s» открыт в браузере (%s)", track.title, track.url)
+        out: dict[str, Any] = {"ok": True, "where": "browser", "title": track.title, "source": track.source, "url": track.url,
+                               "message": MSG_BROWSER}
+        if track.duration:
+            out["duration"] = fmt_duration(track.duration)
+        if note:
+            out["note"] = note
         return out
 
     async def _start_speculative(self, q: str, source: str, target: str) -> Any:

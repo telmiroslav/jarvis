@@ -38,7 +38,9 @@ class MpvError(Exception):
 
 
 class MpvIpc:
-    """Клиент JSON IPC mpv: команда -> ответ по request_id. События (end-file и др.) игнорируются, состояние опрашиваем сами."""
+    """Клиент JSON IPC mpv: команда -> ответ по request_id. Состояние опрашиваем сами; из событий нужны два, чтобы сразу понять, что
+    трек не загрузился (а не ждать конца таймаута): end-file с причиной error и сообщения уровня error (там пишет своё сообщение
+    ytdl_hook, например «Sign in to confirm you’re not a bot»; их присылает mpv после request_log_messages)."""
 
     def __init__(self, path: str):
         self.path = path
@@ -47,6 +49,21 @@ class MpvIpc:
         self._pending: dict[int, asyncio.Future] = {}
         self._ids = itertools.count(1)
         self._task: asyncio.Task | None = None
+        self.load_errors = 0  # сколько записей плейлиста mpv закончил с ошибкой (end-file, reason=error)
+        self.log_tail: collections.deque[str] = collections.deque(maxlen=20)  # сообщения mpv уровня error
+
+    def error_text(self) -> str:
+        return "\n".join(self.log_tail)
+
+    def _on_event(self, ev: dict[str, Any]) -> None:
+        kind = ev.get("event")
+        if kind == "end-file" and ev.get("reason") == "error":
+            self.load_errors += 1
+        elif kind == "log-message" and ev.get("level") in (None, "fatal", "error"):
+            text = ev.get("text")
+            if isinstance(text, str) and text.strip():
+                prefix = ev.get("prefix")
+                self.log_tail.append(f"[{prefix}] {text.strip()}" if isinstance(prefix, str) and prefix else text.strip())
 
     async def connect(self, timeout: float, alive: Callable[[], bool] = lambda: True,
                       sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -72,6 +89,9 @@ class MpvIpc:
                 try:
                     obj = json.loads(line)
                 except ValueError:
+                    continue
+                if isinstance(obj, dict) and "event" in obj:
+                    self._on_event(obj)
                     continue
                 rid = obj.get("request_id") if isinstance(obj, dict) else None
                 fut = self._pending.pop(rid, None) if rid is not None else None
@@ -153,6 +173,8 @@ def mpv_argv(tb: Toolbox, sock: str, volume: int, queue: list[Track], start_inde
         argv.append(f"--ytdl-raw-options-append=js-runtimes={js[0]}:{js[1]}")
     if tb.proxy and tb.proxy.lower() not in ("off", "none", "direct", "no", "0"):
         argv.append(f"--ytdl-raw-options-append=proxy={tb.proxy}")
+    if tb.cookies_browser:  # то же, что --cookies-from-browser у yt-dlp на колонке (проверенное значение: env.clean_cookies_browser)
+        argv.append(f"--ytdl-raw-options-append=cookies-from-browser={tb.cookies_browser}")
     if start_index:
         argv.append(f"--playlist-start={start_index}")
     argv.append("--")
@@ -317,6 +339,10 @@ class LaptopPlayer:
                 except MpvError:
                     await proc.settle()
                     raise self._failure(proc, queue[index]) from None
+                try:  # сообщения об ошибках (ytdl_hook) придут событиями: так причина известна в ту же секунду, а не после таймаута
+                    await ipc.command("request_log_messages", "error", timeout=1.0)
+                except MpvError:
+                    pass  # старый mpv: причину возьмём из его stderr
                 self.proc, self.ipc, self.queue, self.index, self.paused = proc, ipc, list(queue), index, False
                 self._watch = asyncio.create_task(self._watch_exit(proc), name="mpv-watch")
                 await self._wait_playing(proc, ipc, deadline)
@@ -334,8 +360,8 @@ class LaptopPlayer:
                 await self._quit_locked(remember=False, proc=proc, ipc=ipc)
                 raise
 
-    def _failure(self, proc: _Proc, track: Track) -> MusicError:
-        text = proc.error_text()
+    def _failure(self, proc: _Proc, track: Track, ipc: MpvIpc | None = None) -> MusicError:
+        text = "\n".join(x for x in (ipc.error_text() if ipc is not None else "", proc.error_text()) if x)
         low = text.lower()
         log.warning("музыка на ноутбуке: mpv не запустил «%s»: %s", track.title, " ".join(text.split())[:300] or "(сообщений нет)")
         if track.is_local and ("no such file" in low or "failed to open" in low or "cannot open" in low):
@@ -343,10 +369,21 @@ class LaptopPlayer:
         return classify_ytdlp_error(text)
 
     async def _wait_playing(self, proc: _Proc, ipc: MpvIpc, deadline: float) -> None:
+        """Ждать, пока звук пойдёт. Ошибку видим сразу: mpv вышел, либо каждая запись плейлиста, которую он должен был попробовать,
+        закончилась событием end-file с причиной error (mpv при этом может висеть и не выходить). Без этого мы узнавали бы о
+        «YouTube просит подтвердить, что это не робот» только по таймауту и называли бы это «сеть отвечает медленно»."""
+        entries = max(1, len(self.queue) - self.index)  # с --playlist-start mpv пробует записи с этой и дальше
+        t0 = self.clock()
         while True:
             if proc.returncode is not None:
                 await proc.settle()
-                raise self._failure(proc, self.queue[min(self.index, len(self.queue) - 1)])
+                raise self._failure(proc, self.queue[min(self.index, len(self.queue) - 1)], ipc)
+            if ipc.load_errors >= entries:
+                if not ipc.error_text() and not proc.error_text():
+                    await self.sleep(0.2)  # сообщение ytdl_hook и stderr могут прийти на мгновение позже события
+                err = self._failure(proc, self.queue[-1], ipc)
+                log.info("музыка на ноутбуке: mpv не загрузил трек, узнал за %.1f с (%s)", self.clock() - t0, err.code)
+                raise err
             try:
                 idle = await ipc.get("core-idle")
                 pos = await ipc.get("time-pos")

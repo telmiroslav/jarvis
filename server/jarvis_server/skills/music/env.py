@@ -1,4 +1,4 @@
-"""Какие программы есть на ноутбуке и как их запускать для музыки: yt-dlp, ffmpeg, mpv, JavaScript-рантайм для YouTube, прокси.
+"""Какие программы есть на ноутбуке и как их запускать для музыки: yt-dlp, ffmpeg, mpv, JavaScript-рантайм для YouTube, прокси, cookies браузера.
 
 yt-dlp берётся ПЕРВЫМ из окружения сервера (<venv>/bin/yt-dlp): install.sh обновляет его при каждом запуске, потому что YouTube
 ломает старые версии каждые несколько недель. Системный yt-dlp из PATH только запасной.
@@ -7,17 +7,37 @@ yt-dlp берётся ПЕРВЫМ из окружения сервера (<venv
 """
 from __future__ import annotations
 
+import logging
 import os
+import re
 import shutil
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+log = logging.getLogger("jarvis.music")
+
 # имя рантайма для --js-runtimes -> исполняемый файл; порядок: как yt-dlp считает приоритет
 JS_RUNTIMES = (("deno", "deno"), ("node", "node"), ("quickjs", "qjs"), ("bun", "bun"))
 PROXY_VARS = ("http_proxy", "https_proxy", "all_proxy")
 NO_PROXY_WORDS = ("off", "none", "direct", "no", "0")  # JARVIS_MUSIC_PROXY=off: идти напрямую, даже если в окружении есть прокси
+# JARVIS_MUSIC_COOKIES_BROWSER: «firefox», «chromium», «brave», «chrome:Profile1», «firefox+gnomekeyring:путь/к/профилю». Только эти знаки и начало
+# с буквы или цифры: значение уходит в yt-dlp и mpv отдельным аргументом (не через shell), но ключом (-что-то) и запятой (разделитель
+# опций mpv) оно стать не должно
+_COOKIES_OK = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_\-./+]{0,199}")
+
+
+def clean_cookies_browser(value: Any) -> str:
+    """Значение JARVIS_MUSIC_COOKIES_BROWSER, если оно допустимо, иначе пустая строка (и предупреждение в лог)."""
+    v = value.strip() if isinstance(value, str) else ""
+    if not v:
+        return ""
+    if not _COOKIES_OK.fullmatch(v):
+        log.warning("музыка: JARVIS_MUSIC_COOKIES_BROWSER=%r не годится (допустимы буквы, цифры и : _ - . / +, начинаться с буквы или цифры), "
+                    "cookies браузера не используются", v[:60])
+        return ""
+    return v
 
 
 class Toolbox:
@@ -27,6 +47,7 @@ class Toolbox:
                  environ: Mapping[str, str] | None = None, prefix: str | None = None, ttl: float = 30.0,
                  clock: Callable[[], float] = time.monotonic):
         self.proxy = (getattr(settings, "music_proxy", "") or "").strip()
+        self.cookies_browser = clean_cookies_browser(getattr(settings, "music_cookies_browser", ""))  # пусто: cookies не берём
         self._which = which
         self._environ = environ
         self._prefix = prefix if prefix is not None else sys.prefix
@@ -117,6 +138,8 @@ class Toolbox:
         js = self.js_runtime()
         if js:
             args += ["--js-runtimes", f"{js[0]}:{js[1]}"]
+        if self.cookies_browser:  # вошёл в YouTube в этом браузере: так проходит «Sign in to confirm you're not a bot»
+            args += ["--cookies-from-browser", self.cookies_browser]
         return args
 
     def describe_missing(self) -> list[str]:

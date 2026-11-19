@@ -2,7 +2,9 @@
 
 Подключение: register_music_tools(registry, settings). Включается JARVIS_MUSIC (по умолчанию 1). Функции видны ИИ, пока на ноутбуке
 есть хоть что-то для музыки (yt-dlp, mpv или ffmpeg); без Hyprland музыка работает: колонке нужен только сервер, ноутбуку mpv.
-Источники: YouTube (по умолчанию), SoundCloud, файлы на ноутбуке. Подробности: docs/SERVER.md, раздел «Музыка».
+Источники: YouTube (по умолчанию), SoundCloud, файлы на ноутбуке. Если YouTube просит «подтвердить, что вы не робот», колонка играет с
+SoundCloud, а ноутбук открывает страницу трека в браузере (через набор pc: нужен сеанс Hyprland); так же играет where=browser.
+Подробности: docs/SERVER.md, раздел «Музыка».
 """
 from __future__ import annotations
 
@@ -29,8 +31,9 @@ __all__ = ["MusicService", "MusicTools", "Toolbox", "check_music", "register_mus
 def register_music_tools(reg: ToolRegistry, settings: Any, *, tb: Toolbox | None = None, runner: Runner | None = None,
                          factory: SourceFactory | None = None, search_factory: Any = None, local: LocalFinder | None = None,
                          box: BoxPlayer | None = None,
-                         laptop: LaptopPlayer | None = None, clock: Any = None) -> MusicService | None:
-    """Регистрирует play_music и music_control, блок инструкции и службу reg.services["music"]. None, если выключено (music=False)."""
+                         laptop: LaptopPlayer | None = None, clock: Any = None, browser: Any = None) -> MusicService | None:
+    """Регистрирует play_music и music_control, блок инструкции и службу reg.services["music"]. None, если выключено (music=False).
+    browser: чем открывать страницы в браузере (can_open_url, open_url); по умолчанию набор pc из reg.services["pc"], если он есть."""
     if not getattr(settings, "music", True):
         log.info("музыка выключена (JARVIS_MUSIC=0)")
         return None
@@ -46,7 +49,8 @@ def register_music_tools(reg: ToolRegistry, settings: Any, *, tb: Toolbox | None
     if search_factory is None:
         async def search_factory(query, _tb=tb):  # type: ignore[misc]
             return await open_search_source(_tb, query)
-    svc = MusicService(settings, tb, runner, box, laptop, local, search_factory=search_factory, **ckw)
+    svc = MusicService(settings, tb, runner, box, laptop, local, search_factory=search_factory,
+                       browser=browser if browser is not None else reg.services.get("pc"), **ckw)
     MusicTools(svc, tb.anything_to_play, **ckw).register(reg)
     reg.services["music"] = svc
     reg.add_closer(svc.close)
@@ -99,6 +103,15 @@ async def check_music(settings: Any) -> list[str]:
         problems.append("mpv")
     proxy = (getattr(settings, "music_proxy", "") or "").strip()
     lines.append(f"Прокси для музыки: {proxy or 'как в окружении сервера (JARVIS_MUSIC_PROXY пуст)'}")
+    raw_cookies = (getattr(settings, "music_cookies_browser", "") or "").strip()
+    if tb.cookies_browser:
+        lines.append(f"Cookies браузера для YouTube: {tb.cookies_browser} (yt-dlp и mpv берут их оттуда; помогает против «подтвердите, что вы не робот»)")
+    elif raw_cookies:
+        lines.append(f"Cookies браузера для YouTube: НЕ ИСПОЛЬЗУЮТСЯ, значение JARVIS_MUSIC_COOKIES_BROWSER={raw_cookies[:60]!r} недопустимо "
+                     "(буквы, цифры и : _ - . / +, например firefox или chromium:Default)")
+    else:
+        lines.append("Cookies браузера для YouTube: не заданы (JARVIS_MUSIC_COOKIES_BROWSER пуст; если YouTube просит подтвердить, "
+                     "что вы не робот, укажи браузер, где выполнен вход: firefox, chromium, chrome, brave)")
     from .local import default_dirs
 
     dirs = [str(p) for p, _ in default_dirs(extra=tuple(getattr(settings, "music_dirs", ()) or ()))]

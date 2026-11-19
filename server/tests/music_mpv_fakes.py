@@ -15,10 +15,17 @@ class FakeStderr:
 
 
 class FakeMpvProc:
-    """Процесс mpv и его IPC-сервер. polls_to_start: сколько опросов свойства mpv «грузит» трек, потом играет."""
+    """Процесс mpv и его IPC-сервер. polls_to_start: сколько опросов свойства mpv «грузит» трек, потом играет.
+
+    Ошибка загрузки, как её видит IPC: load_error это текст сообщения ytdl_hook (уровень error, приходит событием log-message, но только
+    после request_log_messages, как у настоящего mpv); на опросе номер error_at_poll mpv присылает error_events событий end-file с
+    причиной error (по одному на запись плейлиста, которая не загрузилась). hang=True: mpv после этого не выходит (так он вёл себя у
+    человека в Китае: висел, пока сервер не прекратил ждать); hang=False: выходит с кодом 2, как при пустом плейлисте с --idle=no."""
 
     def __init__(self, sock: str, n_tracks: int, *, polls_to_start: int = 2, stderr: str = "", dies_at_start: bool = False,
-                 duration: float = 180.0, start_index: int = 0, volume: int = 100, never_plays: bool = False):
+                 duration: float = 180.0, start_index: int = 0, volume: int = 100, never_plays: bool = False,
+                 load_error: str | None = None, error_events: int = 1, error_at_poll: int = 2, hang: bool = True,
+                 supports_log_messages: bool = True):
         self.sock, self.pid = sock, 999999
         self.returncode: int | None = None
         self.stderr = FakeStderr(stderr)
@@ -30,6 +37,11 @@ class FakeMpvProc:
         self.exited = asyncio.Event()
         self._server = None
         self.dies_at_start = dies_at_start
+        self.load_error, self.error_events, self.error_at_poll, self.hang = load_error, error_events, error_at_poll, hang
+        self.supports_log_messages = supports_log_messages
+        self.log_level: str | None = None  # что подписал request_log_messages
+        self._events: list[dict] = []  # события, которые уйдут клиенту перед ответом на текущую команду
+        self._error_sent = False
 
     async def start(self) -> None:
         if self.dies_at_start:
@@ -48,8 +60,13 @@ class FakeMpvProc:
                 cmd, rid = msg["command"], msg.get("request_id")
                 self.commands.append(cmd)
                 resp = self._handle(cmd)
+                for ev in self._events:
+                    writer.write(json.dumps(ev).encode() + b"\n")
+                self._events.clear()
                 writer.write(json.dumps({**resp, "request_id": rid}).encode() + b"\n")
                 await writer.drain()
+                if self._error_sent and not self.hang and self.returncode is None:
+                    self._exit(2)
                 if cmd[0] == "quit":
                     self._exit(0)
                     return
@@ -58,11 +75,18 @@ class FakeMpvProc:
 
     def _handle(self, cmd: list) -> dict:
         name = cmd[0]
+        if name == "request_log_messages":
+            if not self.supports_log_messages:
+                return {"error": "invalid parameter"}
+            self.log_level = cmd[1]
+            return {"error": "success"}
         if name == "get_property":
             p = cmd[1]
-            if p in ("core-idle", "time-pos") and not self.never_plays:
+            if p in ("core-idle", "time-pos"):
                 self.polls += 1
-                if self.polls > self.polls_to_start:
+                if self.load_error is not None and not self._error_sent and self.polls >= self.error_at_poll:
+                    self._fail_load()
+                if not self.never_plays and self.polls > self.polls_to_start:
                     self.props["core-idle"], self.props["time-pos"] = False, self.props["time-pos"] or 0.0
             v = self.props.get(p)
             if v is None:
@@ -84,6 +108,14 @@ class FakeMpvProc:
         if name == "quit":
             return {"error": "success"}
         return {"error": "invalid parameter"}
+
+    def _fail_load(self) -> None:
+        """Записи плейлиста не загрузились: сообщение ytdl_hook (если клиент подписан на сообщения) и end-file с ошибкой."""
+        self._error_sent = True
+        if self.log_level is not None and self.load_error:
+            self._events.append({"event": "log-message", "prefix": "ytdl_hook", "level": "error", "text": self.load_error + "\n"})
+        for i in range(self.error_events):
+            self._events.append({"event": "end-file", "reason": "error", "playlist_entry_id": i + 1, "file_error": "loading failed"})
 
     def _exit(self, code: int) -> None:
         self.returncode = code

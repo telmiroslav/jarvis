@@ -155,6 +155,9 @@ class Settings:
     music_volume: int = 40  # JARVIS_MUSIC_VOLUME: громкость музыки на колонке по умолчанию, 0..100 (громче слово слышно хуже)
     music_dirs: tuple[str, ...] = ()  # JARVIS_MUSIC_DIRS: свои каталоги для поиска файлов на ноутбуке (через «:»), ищутся первыми
     music_speculative: bool = True  # JARVIS_MUSIC_SPECULATIVE: YouTube: поток первого результата запускается параллельно с поиском (быстрее на 2-3 с)
+    # JARVIS_MUSIC_COOKIES_BROWSER: браузер, из которого yt-dlp и mpv берут cookies (firefox, chromium, chrome, brave, можно firefox:профиль). Это штатный
+    # способ пройти «Sign in to confirm you're not a bot» на YouTube, если человек вошёл в YouTube в этом браузере. Пусто = не использовать
+    music_cookies_browser: str = ""
     music_start_timeout_s: float = 20.0  # JARVIS_MUSIC_START_TIMEOUT: сколько ждать, пока музыка реально пойдёт (поиск ~2 с, разбор YouTube ~4 с, у роликов с рекламой ещё её 5-20 с)
 
     def describe(self) -> str:
@@ -248,5 +251,6 @@ def load_settings(env_override: dict[str, str] | None = None, *, files: list[Pat
         music_volume=min(100, max(0, _int(env, "JARVIS_MUSIC_VOLUME", base.music_volume))),
         music_dirs=tuple(x.strip() for x in (env.get("JARVIS_MUSIC_DIRS") or "").split(":") if x.strip()),
         music_speculative=_bool(env, "JARVIS_MUSIC_SPECULATIVE", base.music_speculative),
+        music_cookies_browser=(env.get("JARVIS_MUSIC_COOKIES_BROWSER") or base.music_cookies_browser).strip(),
         music_start_timeout_s=max(5.0, _float(env, "JARVIS_MUSIC_START_TIMEOUT", base.music_start_timeout_s)),
     )

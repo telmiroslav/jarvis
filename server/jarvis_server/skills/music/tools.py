@@ -47,14 +47,20 @@ class MusicTools:
         return [
             ("play_music",
              "Включить музыку: трек, исполнителя или файл с ноутбука. По умолчанию играет в колонке (where=box), по просьбе «на компе» "
-             "или «на ноутбуке» на ноутбуке (where=laptop). Поиск на YouTube (по умолчанию) или SoundCloud, source=local ищет файл "
-             "на ноутбуке. kind=artist для группы или «что-нибудь из …»: очередь до 10 треков, работает «следующий». ok=true только когда "
-             "звук реально пошёл; в playing название трека. Колонка заиграет сразу после твоей реплики. Если ok=false, скажи причину "
-             "из message; ambiguous: назови candidates и спроси, какой файл.",
+             "или «на ноутбуке» на ноутбуке (where=laptop), по просьбе «в браузере» или «на ютубе открой» открывает страницу трека в "
+             "браузере (where=browser; там она и играет). Поиск на YouTube (по умолчанию) или SoundCloud, source=local ищет файл "
+             "на ноутбуке. kind=artist для группы или «что-нибудь из …»: очередь до 10 треков, работает «следующий». В query название "
+             "и исполнитель целиком, как сказал сэр, без пропусков. ok=true только когда звук реально пошёл (у where=browser когда "
+             "страница открыта); в playing название трека (у browser в title). Колонка заиграет сразу после твоей реплики. Если в "
+             "ответе есть note (например, играет с SoundCloud, потому что YouTube не пустил), передай его суть. Если ok=false, скажи "
+             "причину из message; ambiguous: назови candidates и спроси, какой файл.",
              {"type": "object", "properties": {
-                 "query": {"type": "string", "description": "название трека и исполнитель или название файла, без слов «включи» и «песню»"},
-                 "where": {"type": "string", "enum": list(WHERES), "description": "box колонка (по умолчанию) | laptop ноутбук"},
-                 "source": {"type": "string", "enum": list(SOURCES), "description": "auto/youtube по умолчанию | soundcloud | local файл на ноутбуке"},
+                 "query": {"type": "string", "description": "название трека и исполнитель (или название файла) целиком, как сказал сэр, "
+                                                            "без слов «включи» и «песню» и без пропущенных слов"},
+                 "where": {"type": "string", "enum": list(WHERES),
+                           "description": "box колонка (по умолчанию) | laptop ноутбук | browser открыть страницу трека в браузере"},
+                 "source": {"type": "string", "enum": list(SOURCES),
+                            "description": "не указывай, пока сэр не назвал сервис: auto по умолчанию | youtube | soundcloud | local файл на ноутбуке"},
                  "kind": {"type": "string", "enum": list(KINDS), "description": "track один трек (по умолчанию) | artist исполнитель или «что-нибудь из»"},
              }, "required": ["query"]},
              self.play_music),
