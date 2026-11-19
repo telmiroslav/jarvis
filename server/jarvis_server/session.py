@@ -18,7 +18,7 @@ from .claims import lied
 from .config import Settings
 from .engines import Engines, is_fatal_gpu_error
 from .followguard import follow_reject_reason
-from .llm import FLUSH, MSG_SAFETY, LLMError, LLMStats, classify_exception
+from .llm import FLUSH, MSG_SAFETY, RESET, Commit, LLMError, LLMStats, classify_exception
 from .memory import ConversationMemory, ToolCall
 from .pacing import AudioPacer
 from .sentences import Chunk, SentenceSplitter, split_long
@@ -68,6 +68,7 @@ class _TurnCtx:
         self.last_text_final = True  # последний отправленный jarvis_text был final (или ничего не отправляли)
         self.spoken: list[str] = []
         self.error: LLMError | None = None
+        self.error_logged = False  # ошибку ИИ уже записали в лог (llm_stage): ход при показе ошибки её повторно не пишет
         self.user_text = ""  # распознанная фраза (для памяти разговора)
         self.calls: list[ToolCall] = []  # фактические вызовы функций хода (имя, аргументы, ответ): тоже в память разговора
         self.cancelled = False  # ход отменяют (abort / новый listen_start / обрыв): плате больше ничего не отправлять
@@ -339,7 +340,8 @@ class Session:
             await self._fail(ctx, e.msg)
         except LLMError as e:
             tm.outcome = "error"
-            log.error("ИИ: %s", e.detail or e.user_msg)
+            if not ctx.error_logged:  # ИИ вернул пустой текст: в llm_stage это не исключение, и там ничего не записано
+                log.error("ИИ: %s", e.detail or e.user_msg)
             await self._fail(ctx, e.user_msg)
         except TtsError as e:
             tm.outcome = "error"
@@ -414,7 +416,8 @@ class Session:
         ctx.user_text_sent = not gated
         self.eng.tools.begin_turn(user_text)  # управление ПК: подтверждение питания смотрит на слова этой реплики
         history = self.memory.history()
-        stats = LLMStats()
+        commit = Commit()  # сколько предложений ушло плате: по нему ИИ решает, можно ли после обрыва потока перезапросить ответ (llm.py)
+        stats = LLMStats(commit=commit)
         gate = SilenceGate() if gated else None
         llm_input = follow_prompt(user_text, history[-1].assistant if history else "") if gated else user_text
         sent_q: asyncio.Queue[_Sentence | None] = asyncio.Queue()
@@ -433,6 +436,7 @@ class Session:
                     if c.cont:
                         tm.first_split = len(c.text)
                 sent_q.put_nowait(_Sentence(c.text, last))
+                commit.mark()  # с этой минуты предложение уйдёт плате: перезапрашивать ответ ИИ уже нельзя, повторилась бы речь
 
             try:
                 async with asyncio.timeout(self.s.llm_total_timeout_s):
@@ -440,6 +444,9 @@ class Session:
                     if gate is not None:
                         src = gate_stream(src, gate)
                     async for item in src:
+                        if item is RESET:  # ответ оборвался, плате ничего не ушло: недосказанное выбрасываем, ИИ скажет заново
+                            splitter.reset()
+                            continue
                         if not ctx.user_text_sent:  # решение «отвечать» принято: субтитр «Вы: ...» и дальше как обычно
                             ctx.user_text_sent = True
                             await self._send(protocol.user_text(user_text))
@@ -467,8 +474,9 @@ class Session:
             except Exception as e:  # ошибка ИИ: озвучиваем то, что уже получено, потом покажем ошибку
                 ctx.error = classify_exception(e)
                 # follow без обращения: отказ по безопасности на чужой болтовне не авария (дальше он станет молчанием)
-                log.log(logging.INFO if gated and ctx.error.user_msg == MSG_SAFETY else logging.ERROR, "ИИ: %s",
-                        ctx.error.detail or ctx.error.user_msg)
+                silent_safety = gated and ctx.error.user_msg == MSG_SAFETY and not ctx.user_text_sent
+                log.log(logging.INFO if silent_safety else logging.ERROR, "ИИ: %s", ctx.error.detail or ctx.error.user_msg)
+                ctx.error_logged = True  # ход покажет ошибку плате (_turn_main), но в лог второй раз её не пишет
             finally:
                 tm.model = stats.model
                 tm.tools = list(stats.tool_calls)

@@ -266,6 +266,10 @@ class SentenceSplitter:
             self.emitted += 1
         return out
 
+    def reset(self) -> None:
+        """Выбросить недосказанное (ответ ИИ оборвался и запрашивается заново). Отданные предложения остаются отданными."""
+        self.buf = ""
+
     def _pieces(self, sent: str) -> list[str]:
         return split_long(sent, self.hard_max) if self.hard_max > 0 else [sent]
 
