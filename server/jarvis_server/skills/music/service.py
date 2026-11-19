@@ -27,7 +27,7 @@ from .env import Toolbox
 from .laptop import LaptopPlayer
 from .local import LocalFinder
 from .model import MusicError, Track, fmt_duration
-from .search import normalize_query, rank_tracks, search_tracks
+from .search import _tokens, normalize_query, overlap, rank_tracks, search_tracks
 
 log = logging.getLogger("jarvis.music")
 
@@ -40,6 +40,7 @@ VOLUME_STEP = 15  # «громче» и «тише» на колонке: на �
 ATTEMPTS = 3  # сколько треков из выдачи пробуем, если первые не запускаются (удалён, закрыт по региону)
 SEARCH_MAX_S = 8.0  # поиск не дольше
 BLOCK_MEMORY_S = 30 * 60.0  # после «YouTube просит подтвердить, что это не робот» source=auto столько секунд идёт сразу на SoundCloud
+SUBSTITUTE_MIN_OVERLAP = 0.5  # SoundCloud вместо YouTube: играем, только если в названии или у исполнителя есть хотя бы половина слов запроса
 NOTHING_FOUND = ("not_found", "unavailable", "failed")  # SoundCloud ничего не дал: можно пробовать другой источник
 NOTE_SOUNDCLOUD = "YouTube сейчас не пускает (проверка на робота), поэтому играет с SoundCloud"
 MSG_BROWSER = ("Открыл страницу трека в браузере: музыка играет там, а не через меня (если не заиграла сама, в браузере её нужно запустить). "
@@ -72,6 +73,18 @@ class _Started:
     queue: list[Track]
     t_search: float
     t_start: float
+
+
+def _similar(q: str, found: list[Track], source: str) -> list[Track]:
+    """Запасной источник: только треки, где есть хотя бы половина слов запроса (с поправкой на опечатки распознавания). Иначе
+    вместо нужной песни заиграла бы первая попавшаяся. Запрос из одних коротких слов проверить нечем: тогда как есть."""
+    if not _tokens(q):
+        return found
+    keep = [t for t in found if overlap(q, t) >= SUBSTITUTE_MIN_OVERLAP]
+    if not keep:
+        log.info("музыка: на %s по «%s» нашлось только непохожее (лучшее «%s»), не включаю", source, q, found[0].title if found else "-")
+        raise MusicError("not_found", f"На {'SoundCloud' if source == 'soundcloud' else source} похожего на «{q}» не нашлось")
+    return keep
 
 
 def _enum(value: Any, name: str, allowed: tuple[str, ...], default: str) -> str:
@@ -269,7 +282,7 @@ class MusicService:
         sc_err: MusicError | None = None
         for i, src in enumerate(order):
             try:
-                st = await self._start(run, src)
+                st = await self._start(run, src, substitute=src == "soundcloud" and source == "auto")
             except MusicError as e:
                 if src == "youtube" and e.code == "blocked":
                     return await self._after_block(run, e, sc_err, note)
@@ -296,7 +309,7 @@ class MusicService:
         log.info("музыка: YouTube просит подтвердить, что это не робот: ищу «%s» на SoundCloud (осталось %.0f с)", run.q,
                  run.deadline - self.clock())
         try:
-            st = await self._start(run, "soundcloud")
+            st = await self._start(run, "soundcloud", substitute=True)
         except MusicError as e:
             raise self._blocked_error(e) from None
         return self._result(run, st, " ".join(x for x in (note, NOTE_SOUNDCLOUD) if x))
@@ -312,8 +325,9 @@ class MusicService:
         log.warning("музыка: YouTube не пустил, а запасной SoundCloud не помог (%s: %s)", sc.code, sc.message)
         return MusicError("blocked", "YouTube не пускает с этого выхода в сеть (просит подтвердить, что это не робот)." + tail + " " + advice)
 
-    async def _start(self, run: _Run, source: str) -> _Started:
-        """Найти трек в источнике и запустить его на колонке или ноутбуке. MusicError: не нашёлся, не запустился, нет сети, blocked."""
+    async def _start(self, run: _Run, source: str, substitute: bool = False) -> _Started:
+        """Найти трек в источнике и запустить его на колонке или ноутбуке. MusicError: не нашёлся, не запустился, нет сети, blocked.
+        substitute: источник не тот, что просили (SoundCloud вместо YouTube): берём только похожее на запрос, а не что попало."""
         t0 = self.clock()
         q, kind, target, deadline = run.q, run.kind, run.target, run.deadline
         # YouTube на колонку: поток первого результата поиска стартует ПАРАЛЛЕЛЬНО с обычным поиском (разбор страницы идёт 3-4 секунды,
@@ -321,6 +335,8 @@ class MusicService:
         spec = await self._start_speculative(q, source, target)
         try:
             found = await self._find(q, source, kind, deadline)
+            if substitute:
+                found = _similar(q, found, source)
             run.found = found
             t_search = self.clock() - t0
             log.info("музыка: «%s» (%s, %s, %s): найдено %d за %.1f с, лучшее «%s»", q, source, kind, target, len(found), t_search,

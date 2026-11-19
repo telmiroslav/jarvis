@@ -65,7 +65,7 @@ async def test_hello_ping_unknown_and_bad_json(link):
     await sess.on_text("не json")
     await sess.on_text("[]")
     assert link.jsons() == [{"type": "welcome", "proto": 1, "server": __version__, "tts_rate": 24000}, {"type": "pong"}]
-    assert __version__ == "0.5.0"
+    assert __version__ == "0.5.1"
     assert sess.state == "idle"
 
 

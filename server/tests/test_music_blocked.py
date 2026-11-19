@@ -495,3 +495,45 @@ async def test_cancel_during_the_soundcloud_fallback_closes_every_stream(tmp_pat
         assert r.fac.sources and all(s.closed for s in r.fac.sources)
     finally:
         r.close()
+
+
+# ------------------------------------------------------------------------------------------------ SoundCloud вместо YouTube: только похожее
+
+async def test_soundcloud_substitute_with_only_unrelated_results_is_not_played(tmp_path):
+    """YouTube не пустил, а на SoundCloud по запросу нашлось только непохожее: не включаем первое попавшееся, ответ blocked с «не нашлось»."""
+    from music_rig import sc_line
+    other = sc_line("222", "Summer Vibes Mix 2026", 180.0, "dj_random", "https://soundcloud.com/dj_random/summer-vibes")
+    r = MusicRig(tmp_path, specs=BLOCKED, sc_search=other)
+    try:
+        await with_board(r)
+        res = await r.call("play_music", query=QUERY)
+        assert res["ok"] is False and res["error"] == "blocked" and "не нашлось" in res["message"]
+        assert [c[0] for c in r.fac.calls] == [URL1]  # SoundCloud-трек даже не запускали
+    finally:
+        r.close()
+
+
+async def test_soundcloud_substitute_keeps_a_misspelled_but_similar_title(tmp_path):
+    """Распознавание пишет «Капсайз», а на SoundCloud «CUPSIZE»: это похоже (поправка на опечатки в overlap), играет."""
+    r = MusicRig(tmp_path, specs=BLOCKED, sc_search=SC_CUPSIZE)
+    try:
+        await with_board(r)
+        res = await r.call("play_music", query="капсайз ты любишь танцевать")
+        assert res["ok"] is True and res["source"] == "soundcloud" and res["playing"] == "CUPSIZE — Ты любишь танцевать"
+        await r.box.close()
+    finally:
+        r.close()
+
+
+async def test_explicit_soundcloud_request_is_not_filtered(tmp_path):
+    """Сэр сам назвал SoundCloud: это не замена, порога похожести нет, играет лучший результат, как раньше."""
+    from music_rig import sc_line
+    other = sc_line("222", "Summer Vibes Mix 2026", 180.0, "dj_random", "https://soundcloud.com/dj_random/summer-vibes")
+    r = MusicRig(tmp_path, sc_search=other)
+    try:
+        await with_board(r)
+        res = await r.call("play_music", query=QUERY, source="soundcloud")
+        assert res["ok"] is True and res["source"] == "soundcloud" and res["playing"].endswith("Summer Vibes Mix 2026")
+        await r.box.close()
+    finally:
+        r.close()
