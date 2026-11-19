@@ -63,6 +63,7 @@ keys = ["stt_ms", "llm_first_token_ms", "first_sentence_ms", "tts_first_audio_ms
 vals = {k: [] for k in keys}
 hedge = {}
 conn = {}
+claim = {}
 n = 0
 for line in sys.stdin:
     n += 1
@@ -72,6 +73,9 @@ for line in sys.stdin:
     m = re.search(r"llm_conn=(\S+)", line)
     if m:
         conn[m.group(1)] = conn.get(m.group(1), 0) + 1
+    m = re.search(r" claim=(\S+)", line)
+    if m:
+        claim[m.group(1)] = claim.get(m.group(1), 0) + 1
     for k in keys:
         m = re.search(k + r"=([0-9.]+)", line)
         if m:
@@ -84,10 +88,14 @@ if n:
             print(f"  {k:26s} {st.median(v):9.1f} {min(v):9.1f} {max(v):9.1f}")
     if hedge:
         print("  llm_hedge: " + ", ".join(f"{k}={v}" for k, v in sorted(hedge.items()))
-              + "  (-: запасной запрос не запускали; primary: запускали, но успела основная; fallback: ответила запасная)")
+              + "  (-: запасной запрос не запускали; primary: запускали, но успела основная; fallback: ответила запасная,"
+              + " запущена по таймеру; fallback_err: ответила запасная, запущена сразу после перегрузки основной)")
     if conn:
         print("  llm_conn: " + ", ".join(f"{k}={v}" for k, v in sorted(conn.items()))
               + "  (new: на пути хода было новое соединение с Google; reused: старое или прогретое на listen_start)")
+    if claim:
+        print("  claim: " + ", ".join(f"{k}={v}" for k, v in sorted(claim.items()))
+              + "  (1: ИИ сказал о действии в первом лице, а функцию управления ПК не вызвал или она не удалась; -: нет)")
 else:
     print("Успешных ходов в этом логе нет.")
 '

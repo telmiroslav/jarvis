@@ -114,8 +114,9 @@ async def test_thought_parts_are_not_spoken():
 
 
 async def test_overload_retries_same_model_then_fallback():
+    # хедж выключен: проверяем последовательную цепочку (с хеджем запасная стартует сразу параллельно, см. test_hedge_early.py)
     llm, log = make_llm({"gemini": [api_error(503, "UNAVAILABLE"), api_error(503, "UNAVAILABLE"),
-                                    FakeStream([chunk(part("Из запасной."))])]})
+                                    FakeStream([chunk(part("Из запасной."))])]}, llm_hedge_ms=0)
     out, st = await collect(llm)
     assert out == ["Из запасной."]
     assert [r.model for r in log] == ["gemini-3.5-flash-lite", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
@@ -131,7 +132,7 @@ async def test_quota_goes_straight_to_fallback_and_model_404_too():
 
 
 async def test_all_models_failing_raises_with_russian_message():
-    llm, _ = make_llm({"gemini": [api_error(503), api_error(503), api_error(503)]})
+    llm, _ = make_llm({"gemini": [api_error(503), api_error(503), api_error(503)]}, llm_hedge_ms=0)  # последовательная цепочка
     with pytest.raises(LLMError) as e:
         await collect(llm)
     assert e.value.user_msg == MSG_OVERLOAD

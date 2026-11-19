@@ -14,12 +14,30 @@ SEARCH_ENGINES = {
     "duckduckgo": "https://duckduckgo.com/?q={q}",
     "youtube": "https://www.youtube.com/results?search_query={q}",
     "wikipedia": "https://ru.wikipedia.org/w/index.php?search={q}",
+    "soundcloud": "https://soundcloud.com/search?q={q}",
 }
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_BAD_PERCENT = re.compile(r"%(?![0-9A-Fa-f]{2})")  # «%» без двух шестнадцатеричных цифр после него
+_PERCENT_RUN = re.compile(r"(?:%[0-9A-Fa-f]{2})+")
+BROKEN_URL_HINT = "адрес испорчен (сломана процентная кодировка), для поиска вызови web_search с engine, а адрес поиска сам не собирай"
 
 
 class BadUrl(ValueError):
     pass
+
+
+def _percent_broken(*parts: str) -> bool:
+    """Процентная кодировка сломана: «%» не из %XX, либо подряд идущие %XX не складываются в корректный UTF-8. Так выглядят адреса,
+    которые ИИ собирает сам: кириллица посреди %XX и обрывки вроде %D1%8%D1%88 (xdg-open открыл бы мусорную страницу)."""
+    for part in parts:
+        if _BAD_PERCENT.search(part):
+            return True
+        for run in _PERCENT_RUN.findall(part):
+            try:
+                bytes.fromhex(run.replace("%", "")).decode("utf-8")
+            except UnicodeDecodeError:
+                return True
+    return False
 
 
 def _bad_chars(s: str) -> bool:
@@ -49,6 +67,8 @@ def validate_url(raw: str) -> str:
         raise BadUrl("неверный адрес") from None
     if not host:
         raise BadUrl("в адресе нет имени сайта")
+    if _percent_broken(parts.path, parts.query, parts.fragment):
+        raise BadUrl(BROKEN_URL_HINT)
     try:
         ipaddress.ip_address(host)
         ascii_host = f"[{host}]" if ":" in host else host
