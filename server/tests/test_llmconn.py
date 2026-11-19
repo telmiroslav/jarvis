@@ -416,11 +416,11 @@ async def test_conn_tracker_new_reused_and_sinks_are_per_task():
 
 
 def test_turn_line_has_llm_conn_before_mode_and_why_only_for_silent():
-    assert TurnTiming().line().endswith(" llm_hedge=- llm_conn=- mode=ptt") and " why=" not in TurnTiming().line()
+    assert TurnTiming().line().endswith(" llm_hedge=- llm_conn=- music=- mode=ptt") and " why=" not in TurnTiming().line()
     line = TurnTiming(llm_conn="reused", llm_hedge="primary", mode="follow").line()
-    assert line.endswith(" llm_hedge=primary llm_conn=reused mode=follow")
+    assert line.endswith(" llm_hedge=primary llm_conn=reused music=- mode=follow")
     sil = TurnTiming(outcome="silent(not_addressed)", why="чужой разговор, видео!", llm_conn="new", mode="follow").line()
-    assert sil.startswith("TURN silent(not_addressed) ") and sil.endswith(" why=чужой_разговор_видео llm_conn=new mode=follow")
+    assert sil.startswith("TURN silent(not_addressed) ") and sil.endswith(" why=чужой_разговор_видео llm_conn=new music=- mode=follow")
     assert " why=-" in TurnTiming(why="!!!").line()
     assert len(TurnTiming(why="ж" * 200).line().split(" why=")[1].split(" ")[0]) == 40
 

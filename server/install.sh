@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Установка (и обновление) сервера Jarvis на ноутбуке с Arch Linux и видеокартой NVIDIA.
 #   ./server/install.sh                      первая установка
-#   cd jarvis && git pull && ./server/install.sh   обновление (повторный запуск безопасен: что готово, пропускается)
+#   cd jarvis && git pull && ./server/install.sh   обновление (повторный запуск безопасен: что готово, пропускается; yt-dlp обновляется всегда)
 # Параметры (нужны редко): --yes (без вопросов), --voice путь/jarvis_voice.zip, --no-firewall, --no-service,
 #   --no-selftest, --skip-models, --allow-no-gpu, --help
 set -euo pipefail
@@ -216,7 +216,15 @@ HAVE_UFW=0; command -v ufw >/dev/null 2>&1 && HAVE_UFW=1
 have() { command -v "$1" >/dev/null 2>&1; }
 OPT_PKGS=()
 if have hyprctl && ! have playerctl; then OPT_PKGS+=(playerctl); fi
-if [ ${#NEED_PKGS[@]} -gt 0 ] || [ ${#OPT_PKGS[@]} -gt 0 ] || { [ "$NO_FIREWALL" != "1" ] && [ "$HAVE_UFW" = "1" ]; }; then
+# Музыка голосом (шаг 7). Колонка платы играет через yt-dlp + ffmpeg, ноутбук через mpv. deno нужен yt-dlp для YouTube (с конца 2025
+# года без внешнего JavaScript-рантайма он не отдаёт звук), mpv-mpris показывает mpv для playerctl. Всё необязательное: без этих
+# программ сервер работает, просто музыки не будет (или не будет «на компе»).
+MUSIC_PKGS=()
+have ffmpeg || MUSIC_PKGS+=(ffmpeg)
+have deno || MUSIC_PKGS+=(deno)
+have mpv || MUSIC_PKGS+=(mpv)
+pacman -Q mpv-mpris >/dev/null 2>&1 || MUSIC_PKGS+=(mpv-mpris)
+if [ ${#NEED_PKGS[@]} -gt 0 ] || [ ${#OPT_PKGS[@]} -gt 0 ] || [ ${#MUSIC_PKGS[@]} -gt 0 ] || { [ "$NO_FIREWALL" != "1" ] && [ "$HAVE_UFW" = "1" ]; }; then
     say "Сейчас sudo попросит пароль от ноутбука. Его вводишь только ты, скрипт пароля не видит."
     $SUDO -v || die "Без sudo не получится поставить программы и открыть порты."
 fi
@@ -235,6 +243,17 @@ if [ ${#OPT_PKGS[@]} -gt 0 ]; then
     else
         warn "${OPT_PKGS[*]} не поставлен: музыкой голосом управлять не получится (поставить позже: sudo pacman -S --needed ${OPT_PKGS[*]})"
     fi
+fi
+if [ ${#MUSIC_PKGS[@]} -gt 0 ]; then
+    say "Для музыки нужны программы (необязательно): sudo pacman -S --needed ${MUSIC_PKGS[*]}"
+    say "ffmpeg: звук на колонку; deno: чтобы yt-dlp открывал YouTube; mpv и mpv-mpris: музыка на ноутбуке. pacman спросит подтверждение."
+    if $SUDO pacman -S --needed "${MUSIC_PKGS[@]}"; then
+        ok "Поставлено: ${MUSIC_PKGS[*]}"
+    else
+        warn "${MUSIC_PKGS[*]} не поставлено: без них музыка работает не полностью (поставить позже: sudo pacman -S --needed ${MUSIC_PKGS[*]})"
+    fi
+else
+    ok "Программы для музыки уже есть (ffmpeg, deno, mpv, mpv-mpris)"
 fi
 if have hyprctl; then
     ok "Hyprland найден (hyprctl): Джарвис сможет управлять ноутбуком. wpctl (громкость): $(have wpctl && echo есть || echo НЕТ, пакет wireplumber)," \
@@ -292,6 +311,14 @@ if [ "$GPU_OK" = "1" ]; then
     ok "PyTorch видит видеокарту"
 fi
 ok "Библиотеки готовы"
+# yt-dlp нарочно НЕ в requirements.lock: YouTube ломает старые версии каждые несколько недель, поэтому он обновляется при КАЖДОМ запуске
+# установщика (и отдельно командой ./server/update_ytdlp.sh), а остальные библиотеки стоят на проверенных версиях.
+say "Обновляю yt-dlp (для музыки; свежая версия нужна, потому что YouTube часто меняется)..."
+if update_ytdlp; then
+    ok "yt-dlp $(ytdlp_version) (с пакетом yt-dlp-ejs для YouTube)"
+else
+    warn "yt-dlp не обновился (нет интернета или VPN?): музыка из интернета может не работать. Повторить: ./server/update_ytdlp.sh"
+fi
 
 # ------------------------------------------------------------------------------------------------ 6
 step "6/9" "Модели: распознавание речи и голос (около 5 ГБ при первой установке)"
@@ -413,6 +440,15 @@ if [ -n "$PC_OUT" ]; then
     printf '%s\n' "$PC_OUT" | sed 's/^/      /'
     say "Выключить: JARVIS_PC_CONTROL=0 в $ENV_FILE и systemctl --user restart jarvis-server. Подробности: docs/SERVER.md"
     have brightnessctl || say "Яркость экрана голосом (необязательно): sudo pacman -S brightnessctl"
+    echo
+fi
+# Музыка: проверка только ищет программы и читает версии, ничего не играет и в сеть не ходит.
+MUSIC_OUT="$(run_server_py jarvis_server check-music 2>&1 || true)"
+if [ -n "$MUSIC_OUT" ]; then
+    printf '    %s\n' "${C_B}Музыка голосом:${C_0}"
+    printf '%s\n' "$MUSIC_OUT" | sed 's/^/      /'
+    say "Говори: «включи Capsize Ты любишь танцевать» (в колонку) или «включи на компе ...». Выключить: JARVIS_MUSIC=0 в $ENV_FILE."
+    say "Если YouTube перестал отвечать: ./server/update_ytdlp.sh (без перезапуска). Подробности: docs/SERVER.md, раздел «Музыка»"
     echo
 fi
 if [ -z "$(env_get GEMINI_API_KEY)" ]; then warn "Ключ Gemini не задан: без него Джарвис не ответит. Выполни ./server/set_key.sh"; fi

@@ -113,8 +113,10 @@ class FakeSTT:
 
 
 def make_settings(**kw) -> Settings:
+    # music=False: набор «музыка» не должен подключаться сам от того, что на машине разработчика случайно есть yt-dlp, mpv и ffmpeg;
+    # тесты музыки включают его явно, на подделках (test_music_*.py)
     base = dict(llm="mock", tts="mock", frame_ms=40, pacing_burst_s=0.5, pacing_max_lead_s=1.5, subtitle_lead_s=0.4,
-                llm_total_timeout_s=10.0)
+                llm_total_timeout_s=10.0, music=False)
     base.update(kw)
     return dataclasses.replace(Settings(), **base)
 

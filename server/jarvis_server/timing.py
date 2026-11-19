@@ -37,6 +37,7 @@ class TurnTiming:
     llm_hedge: str = "-"  # запасной запрос к ИИ: "-" не запускали (или никто не ответил), "primary" запускали, но первой ответила основная модель, "fallback" первой ответила запасная
     llm_conn: str = "-"  # соединение с Google у первого запроса хода: "new" (рукопожатие на пути хода) | "reused" | "-" неизвестно
     why: str = ""  # причина молчания (outcome silent(...)): слова, которыми ИИ объяснил пометку [SILENT]
+    music: str = "-"  # музыка после хода: - | box:playing | box:paused | laptop:playing | laptop:paused
     mode: str = "ptt"  # listen_start.mode (ptt | wake | follow); в строке TURN всегда последний ключ
 
     def line(self) -> str:
@@ -49,5 +50,5 @@ class TurnTiming:
             f"underruns={self.underruns} max_gap_s={self.max_gap_s:.2f} chars={self.chars} "
             f"first_split={self.first_split or '-'} model={self.model or '-'} "
             f"tools={','.join(self.tools) or '-'} llm_hedge={self.llm_hedge or '-'}"
-            f"{' why=' + _slug(self.why) if self.why else ''} llm_conn={self.llm_conn or '-'} mode={self.mode}"
+            f"{' why=' + _slug(self.why) if self.why else ''} llm_conn={self.llm_conn or '-'} music={self.music or '-'} mode={self.mode}"
         )

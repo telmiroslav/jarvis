@@ -89,6 +89,9 @@ class Session:
         self._closed = False
         self._mode = protocol.DEFAULT_LISTEN_MODE  # режим текущей записи (listen_start.mode)
         self.turns_done = 0
+        self.board_caps: frozenset[str] = frozenset()  # hello.caps: что умеет прошивка платы ("music" с v0.6.0)
+        self._music_svc = getattr(engines.tools, "services", {}).get("music")  # служба музыки (skills/music), если подключена
+        self.music = None  # она же, но только после hello этой платы: до него сессия в музыку не вмешивается
 
     # ------------------------------------------------------------- отправка ----
     async def _send(self, text: str) -> None:
@@ -112,9 +115,13 @@ class Session:
                 self.board = msg.data
                 if msg.data.get("proto") != protocol.PROTO:
                     log.warning("плата говорит на протоколе %r, сервер знает %d", msg.data.get("proto"), protocol.PROTO)
-                log.info("плата подключилась: fw=%s mac=%s mic=%s spk=%s", msg.data.get("fw"), msg.data.get("mac"),
-                         msg.data.get("mic_rate"), msg.data.get("spk_rate"))
+                self.board_caps = protocol.parse_caps(msg.data.get("caps"))
+                log.info("плата подключилась: fw=%s mac=%s mic=%s spk=%s caps=%s", msg.data.get("fw"), msg.data.get("mac"),
+                         msg.data.get("mic_rate"), msg.data.get("spk_rate"), ",".join(sorted(self.board_caps)) or "-")
                 await self._send(protocol.welcome(__version__, protocol.TTS_RATE))
+                if self._music_svc is not None:
+                    await self._music_svc.attach_board(self, self.board_caps, self._music_send_text, self._music_send_bytes)
+                    self.music = self._music_svc
             elif t == "listen_start":
                 mode, known = protocol.parse_listen_mode(msg.data.get("mode"))
                 if not known:
@@ -125,6 +132,9 @@ class Session:
                 await self._listen_stop()
             elif t == "abort":
                 await self._abort()
+            elif t == "music_done":  # плата доиграла музыку после music_end (PROTOCOL §10): серверу для сведения
+                if self.music is not None:
+                    self.music.board_music_done()
             elif t == "ping":
                 await self._send(protocol.pong())
             else:
@@ -152,9 +162,13 @@ class Session:
         if self._turn is not None and not self._turn.done():
             log.info("плата отключилась посреди хода: отменяю")
         await self._cancel_turn()
+        if self.music is not None:  # обрыв связи = стоп музыки на колонке (место запоминается)
+            await self.music.detach_board(self)
 
     # ------------------------------------------------------------ состояния ----
     async def _listen_start(self, mode: str) -> None:
+        if self.music is not None:
+            self.music.turn_started()  # плата сама остановила музыку: кадры больше не шлём, пока не кончится ход (PROTOCOL §10)
         if self._turn is not None and not self._turn.done():
             log.info("новый listen_start во время ответа: прерываю ответ")
             await self._cancel_turn()  # = abort + новая запись; плата сама знает, что слушает
@@ -192,6 +206,7 @@ class Session:
                      preroll, self._mode)
             self.state = "idle"
             await self._send_state("idle")
+            await self._music_turn_end()
             return
         self.state = "busy"
         self._turn = asyncio.create_task(self._turn_main(pcm, t_stop, self._mode), name="turn")
@@ -208,7 +223,28 @@ class Session:
         log.info("abort: %s", "ход прерван" if was_running else "ничего не шло")
         if audio_active:
             await self._send(protocol.audio_end())
+        if self.music is not None:  # abort = стоп музыки; если плата ждала сообщения после хода, music_stop идёт до state idle
+            await self.music.aborted()
         await self._send_state("idle")
+
+    async def _music_turn_end(self) -> None:
+        """Ход кончился (ответ, молчание, пустая запись, ошибка): плата ждёт от сервера одно сообщение про музыку (PROTOCOL §10)."""
+        if self.music is None or self._closed:
+            return
+        try:
+            await self.music.turn_finished()
+        except LinkClosed:
+            pass
+        except Exception:
+            log.exception("музыка: не удалось сообщить плате о конце хода")
+
+    async def _music_send_text(self, text: str) -> None:
+        await self._send(text)
+
+    async def _music_send_bytes(self, data: bytes) -> None:
+        if self._closed:
+            raise LinkClosed()
+        await self.link.send_bytes(data)
 
     async def _cancel_turn(self) -> None:
         """Отмена хода. Ждём её не дольше секунды, чтобы приём сообщений платы (ping, abort) никогда не вставал."""
@@ -316,6 +352,10 @@ class Session:
             self.turns_done += 1
             if ctx.spoken and ctx.user_text:  # в память идёт то, что реально ушло на плату (и при abort тоже)
                 self.memory.add(ctx.user_text, " ".join(ctx.spoken))
+            if tm.outcome not in ("aborted", "disconnected"):  # отменённый ход музыку не трогает: это сделает abort или новая запись
+                await self._music_turn_end()
+            if self.music is not None:
+                tm.music = self.music.label()
             log.info(tm.line())
             if self.state == "busy":
                 self.state = "idle"

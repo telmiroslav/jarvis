@@ -39,6 +39,7 @@ async def serve_forever(settings) -> int:
     await stop.wait()
     log.info("останавливаюсь")
     await server.stop()
+    await engines.tools.aclose()  # остановить музыку (mpv на ноутбуке) и прочие фоновые программы наборов функций
     await engines.llm.aclose()
     engines.shutdown()
     return 0
@@ -46,7 +47,7 @@ async def serve_forever(settings) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="jarvis_server", description="Мозг Jarvis: сервер для платы ESP32-S3")
-    ap.add_argument("command", nargs="?", default="serve", choices=["serve", "selftest", "check-llm", "check-pc", "config"])
+    ap.add_argument("command", nargs="?", default="serve", choices=["serve", "selftest", "check-llm", "check-pc", "check-music", "config"])
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
     # без полос загрузки в журнале (tqdm пишет в лог мусор из возвратов каретки)
@@ -73,6 +74,12 @@ def main(argv: list[str] | None = None) -> int:
 
         logging.getLogger("jarvis").setLevel(logging.WARNING)  # в отчёте только итог, без строк журнала
         print("\n".join(asyncio.run(check_pc(settings))))
+        return 0
+    if args.command == "check-music":  # музыка: есть ли yt-dlp, deno, ffmpeg, mpv (без запуска музыки и без сети)
+        from .skills.music import check_music
+
+        logging.getLogger("jarvis").setLevel(logging.WARNING)
+        print("\n".join(asyncio.run(check_music(settings))))
         return 0
     log.info("Jarvis server %s. %s", __version__, settings.describe())
     if settings.llm == "gemini" and not settings.api_key:

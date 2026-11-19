@@ -48,6 +48,12 @@ PY
     else
         echo "окружение $VENV_DIR не найдено"
     fi
+    section "Музыка (yt-dlp, deno, ffmpeg, mpv)"
+    if [ -x "$VENV_DIR/bin/yt-dlp" ]; then echo "yt-dlp (окружение сервера): $("$VENV_DIR/bin/yt-dlp" --version 2>&1 | head -1)"; else echo "yt-dlp в окружении сервера: нет"; fi
+    for prog in deno ffmpeg mpv playerctl; do
+        if command -v "$prog" >/dev/null 2>&1; then echo "$prog: $("$prog" --version 2>&1 | head -1)"; else echo "$prog: нет"; fi
+    done
+    pacman -Q mpv-mpris 2>/dev/null || echo "mpv-mpris: нет"
     section "Служба"
     systemctl --user status "$UNIT_NAME" --no-pager -l 2>&1 | head -20
     echo

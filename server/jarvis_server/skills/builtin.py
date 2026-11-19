@@ -1,4 +1,4 @@
-"""Встроенные умения: get_time. Управление ПК живёт в skills/pc/. Новые (музыка, свет) добавляются сюда или в
+"""Встроенные умения: get_time. Управление ПК живёт в skills/pc/, музыка в skills/music/. Новые (свет и т. п.) добавляются сюда или в
 отдельные модули и подключаются в build_default_registry()."""
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def get_time(timezone: str = "") -> dict:
 
 def build_default_registry(settings=None) -> ToolRegistry:
     """settings=None: только встроенные функции (так работают тесты и инструменты, чтобы не трогать рабочий стол).
-    С настройками подключается набор «pc» (управление ноутбуком), если он включён и есть Hyprland."""
+    С настройками подключается набор «pc» (управление ноутбуком), если он включён и есть Hyprland, и набор «music» (музыка)."""
     reg = ToolRegistry()
     reg.tool(
         name="get_time",
@@ -44,4 +44,12 @@ def build_default_registry(settings=None) -> ToolRegistry:
         from .pc import register_pc_tools  # управление ПК: skills/pc/
 
         register_pc_tools(reg, settings)
+        try:
+            from .music import register_music_tools  # музыка: skills/music/ (от Hyprland не зависит)
+
+            register_music_tools(reg, settings)
+        except Exception:  # сбой музыки не должен мешать серверу отвечать на остальное
+            import logging
+
+            logging.getLogger("jarvis.music").exception("музыка не подключилась, сервер работает без неё")
     return reg

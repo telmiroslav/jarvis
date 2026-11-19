@@ -66,3 +66,23 @@ class AudioPacer:
 
     def remaining(self, now: float | None = None) -> float:
         return self.buffered(now)
+
+    def hold(self, now: float | None = None) -> float:
+        """Плата поставила воспроизведение на паузу (музыка, PROTOCOL §10): её буфер перестаёт играть, но не пропадает.
+        Возвращает, сколько секунд отправленного звука в нём осталось; модель после этого пуста, пока не вызовут restore()."""
+        held = self.buffered(now)
+        self.play_end = 0.0
+        self.anchor = 0.0
+        self._started = False
+        return held
+
+    def restore(self, buffered_s: float, now: float | None = None) -> None:
+        """Плата продолжила играть: в её буфере снова buffered_s секунд (то, что вернул hold). Допустимое опережение сразу полное:
+        буфер уже накоплен, «первую секунду сразу» повторять не нужно."""
+        now = self.clock() if now is None else now
+        if buffered_s <= 0.0:
+            self._started = False
+            return
+        self._started = True
+        self.play_end = now + buffered_s
+        self.anchor = now - max(0.0, self.max_lead_s - self.burst_s)

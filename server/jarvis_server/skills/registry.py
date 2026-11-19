@@ -53,6 +53,9 @@ class ToolRegistry:
         self._available: dict[str, Callable[[], bool]] = {}
         self._instructions: list[tuple[str, Callable[[], bool] | None]] = []  # блоки для системной инструкции ИИ
         self._turn_hooks: list[Callable[[str], None]] = []
+        # Долгоживущие службы наборов функций, которые нужны не только ИИ, но и сессии платы (музыка: services["music"]).
+        self.services: dict[str, Any] = {}
+        self._closers: list[Callable[[], Any]] = []
 
     def register(self, tool: Tool, *, available: Callable[[], bool] | None = None) -> Tool:
         """available: функция без аргументов; пока она возвращает False, функцию ИИ не показывают и вызвать нельзя."""
@@ -90,6 +93,19 @@ class ToolRegistry:
     def on_turn(self, hook: Callable[[str], None]) -> None:
         """hook(текст фразы пользователя) вызывается в начале каждого хода, до запроса к ИИ (подтверждения: умения pc)."""
         self._turn_hooks.append(hook)
+
+    def add_closer(self, fn: Callable[[], Any]) -> None:
+        """fn() вызывается при остановке сервера (aclose); может быть обычной функцией или async (остановить фоновую программу)."""
+        self._closers.append(fn)
+
+    async def aclose(self) -> None:
+        for fn in self._closers:
+            try:
+                res = fn()
+                if inspect.isawaitable(res):
+                    await res
+            except Exception:
+                log.exception("остановка службы функций упала")
 
     def begin_turn(self, user_text: str) -> None:
         for hook in self._turn_hooks:

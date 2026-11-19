@@ -149,6 +149,12 @@ class Settings:
     # управление ноутбуком (skills/pc)
     pc_control: bool = True  # JARVIS_PC_CONTROL: 0 = функции управления ПК не подключаются
     pc_hypr_dialect: str = "auto"  # JARVIS_PC_HYPR_DIALECT: auto | lua | legacy (грамматика hyprctl dispatch)
+    # музыка (skills/music): колонка платы по умолчанию, ноутбук (mpv) по просьбе «на компе»
+    music: bool = True  # JARVIS_MUSIC: 0 = функции музыки не подключаются
+    music_proxy: str = ""  # JARVIS_MUSIC_PROXY: прокси для yt-dlp и потока (http://host:port, socks5://host:port); пусто = как у процесса сервера
+    music_volume: int = 40  # JARVIS_MUSIC_VOLUME: громкость музыки на колонке по умолчанию, 0..100 (громче слово слышно хуже)
+    music_dirs: tuple[str, ...] = ()  # JARVIS_MUSIC_DIRS: свои каталоги для поиска файлов на ноутбуке (через «:»), ищутся первыми
+    music_start_timeout_s: float = 20.0  # JARVIS_MUSIC_START_TIMEOUT: сколько ждать, пока музыка реально пойдёт (поиск ~2 с, разбор YouTube ~4 с, у роликов с рекламой ещё её 5-20 с)
 
     def describe(self) -> str:
         """Одна строка для лога, без секретов."""
@@ -159,7 +165,7 @@ class Settings:
             f"{'+прогрев' if self.llm_prewarm else ''} молчание_follow={'вкл' if self.follow_silence else 'выкл'} ключ={key} "
             f"stt={self.stt_model}/{self.stt_device}/"
             f"{self.stt_compute} подсказка_stt={self.stt_hotwords or '-'} tts={self.tts}/{self.tts_device}/{self.tts_dtype}/steps={self.tts_steps} "
-            f"порты udp={self.discovery_port} ws={self.ws_port}"
+            f"порты udp={self.discovery_port} ws={self.ws_port} музыка={'вкл' if self.music else 'выкл'}"
         )
 
 
@@ -236,4 +242,9 @@ def load_settings(env_override: dict[str, str] | None = None, *, files: list[Pat
         hf_offline=_bool(env, "JARVIS_HF_OFFLINE", base.hf_offline),
         pc_control=_bool(env, "JARVIS_PC_CONTROL", base.pc_control),
         pc_hypr_dialect=(env.get("JARVIS_PC_HYPR_DIALECT") or base.pc_hypr_dialect).strip().lower(),
+        music=_bool(env, "JARVIS_MUSIC", base.music),
+        music_proxy=(env.get("JARVIS_MUSIC_PROXY") or base.music_proxy).strip(),
+        music_volume=min(100, max(0, _int(env, "JARVIS_MUSIC_VOLUME", base.music_volume))),
+        music_dirs=tuple(x.strip() for x in (env.get("JARVIS_MUSIC_DIRS") or "").split(":") if x.strip()),
+        music_start_timeout_s=max(5.0, _float(env, "JARVIS_MUSIC_START_TIMEOUT", base.music_start_timeout_s)),
     )
