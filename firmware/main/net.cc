@@ -70,6 +70,41 @@ Ctx C;
 
 int64_t uptime_ms() { return esp_timer_get_time() / 1000; }
 
+const char *ps_name(wifi_ps_type_t t)
+{
+    switch (t) {
+    case WIFI_PS_NONE:      return "NONE";
+    case WIFI_PS_MIN_MODEM: return "MIN_MODEM";
+    case WIFI_PS_MAX_MODEM: return "MAX_MODEM";
+    default:                return "?";
+    }
+}
+
+// v0.5.1: экономия питания Wi-Fi выключена. Плата питается от USB, а в режиме по умолчанию (MIN_MODEM) радио спит между маяками точки
+// доступа (у неё 102 мс): всё, что точка и ноутбук ей шлют (подтверждения TCP, звук ответа), ждёт ближайшего маяка, и задержка прибавляется
+// к каждому обороту TCP. При окне TCP в 5,7 КБ и звуке микрофона 32 КБ/с это упирается в предел: в логе v0.5.0 сокет два раза не принимал
+// данные целую секунду. Возвращает true, если режим после вызова NONE.
+bool power_save_off(bool log_always)
+{
+    wifi_ps_type_t before = WIFI_PS_MIN_MODEM;
+    const bool had = esp_wifi_get_ps(&before) == ESP_OK;
+    if (had && before == WIFI_PS_NONE) {
+        if (log_always) {
+            ESP_LOGI(TAG, "Wi-Fi power save: NONE (radio stays awake: the board is USB-powered)");
+        }
+        return true;
+    }
+    const esp_err_t err = esp_wifi_set_ps(WIFI_PS_NONE);
+    wifi_ps_type_t after = before;
+    esp_wifi_get_ps(&after);
+    if (err != ESP_OK || after != WIFI_PS_NONE) {
+        ESP_LOGW(TAG, "Wi-Fi power save could not be switched off: %s (mode now %s)", esp_err_to_name(err), ps_name(after));
+        return false;
+    }
+    ESP_LOGI(TAG, "Wi-Fi power save: %s -> NONE (radio stays awake: the board is USB-powered)", had ? ps_name(before) : "?");
+    return true;
+}
+
 void apply_tz(const char *tz)
 {
     setenv("TZ", tz, 1);
@@ -237,6 +272,7 @@ void on_got_ip(const ip_event_got_ip_t *e)
     esp_timer_stop(C.retry_timer);
     ESP_LOGI(TAG, "WIFI connected: ssid='%s' ip=%s rssi=%d dBm channel=%d (failed attempts before: %u)", ssid, ip, rssi,
              channel, static_cast<unsigned>(attempts_before));
+    power_save_off(true);
     // Эту строку ждёт tools/flash.sh wifi: печатаем только после wifi_set (и в лог, и в ответ)
     if (announce) {
         printf("WIFI CONNECTED ip=%s rssi=%d\n", ip, rssi);
@@ -255,6 +291,7 @@ void on_event(void *, esp_event_base_t base, int32_t id, void *data)
             const wifi_event_sta_connected_t *e = static_cast<const wifi_event_sta_connected_t *>(data);
             ESP_LOGI(TAG, "associated: ssid='%.*s' channel=%d, waiting for an address", e->ssid_len,
                      reinterpret_cast<const char *>(e->ssid), e->channel);
+            power_save_off(false);   // драйвер мог вернуть режим по умолчанию при подключении
             break;
         }
         case WIFI_EVENT_STA_DISCONNECTED:
@@ -368,6 +405,7 @@ esp_err_t init_impl()
         ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
         return err;
     }
+    power_save_off(false);
     ESP_LOGI(TAG, "Wi-Fi started (STA, country CN, hostname jarvis), time zone %s", C.tz);
     return ESP_OK;
 }

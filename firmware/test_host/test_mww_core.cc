@@ -714,6 +714,52 @@ static void test_timing_sanity()
            r.inf_max_us);
 }
 
+// v0.5.1: разбор времени по операциям модели (стенд wake bench). Включение разбора не меняет ответов модели; в разборе только операции модели
+static void test_op_profile()
+{
+    const std::vector<int16_t> x = gen_golden(48000);
+    mww::Core plain;
+    char err[160] = {0};
+    CHECK(plain.init(make_init(), err, sizeof(err)));
+    const Run a = run_core(plain, x, 512);
+    wake_perf::OpAcc acc;
+    mww::CoreInit ci = make_init();
+    ci.op_profile = &acc;
+    mww::Core prof;
+    CHECK(prof.init(ci, err, sizeof(err)));
+    const Run b = run_core(prof, x, 512);
+    CHECK(a.inf_n > 50 && a.inf_n == b.inf_n && a.probs.size() == b.probs.size());
+    bool same = a.probs.size() == b.probs.size();
+    for (size_t i = 0; same && i < a.probs.size(); i++) {
+        same = a.probs[i] == b.probs[i];
+    }
+    CHECK(same);   // с разбором те же вероятности, до бита
+    CHECK(acc.n > 0 && acc.n <= wake_perf::kBenchMaxOps);
+    static const char *const kKnown[] = {"CALL_ONCE", "VAR_HANDLE", "RESHAPE", "READ_VARIABLE", "CONCATENATION", "STRIDED_SLICE", "ASSIGN_VARIABLE",
+                                         "CONV_2D", "DEPTHWISE_CONV_2D", "SPLIT_V", "FULLY_CONNECTED", "LOGISTIC", "QUANTIZE"};
+    bool have_conv = false;
+    bool all_known = true;
+    uint32_t fc_calls = 0;
+    for (size_t i = 0; i < acc.n; i++) {
+        bool known = false;
+        for (const char *k : kKnown) {
+            known = known || strcmp(acc.ops[i].tag, k) == 0;
+        }
+        all_known = all_known && known;
+        have_conv = have_conv || strcmp(acc.ops[i].tag, "CONV_2D") == 0;
+        if (strcmp(acc.ops[i].tag, "FULLY_CONNECTED") == 0) {
+            fc_calls = acc.ops[i].calls;
+        }
+    }
+    CHECK(all_known && have_conv);
+    CHECK(fc_calls >= b.inf_n);   // на каждый запуск модели приходится не меньше одного вызова FULLY_CONNECTED
+    // без заданного op_profile часы операциям не нужны: пустой накопитель не трогается
+    wake_perf::OpAcc untouched;
+    CHECK(untouched.n == 0 && make_init().op_profile == nullptr);
+    printf("  op profile (reference kernels, x86): %u distinct operation tags, %u FULLY_CONNECTED calls over %u inferences\n", static_cast<unsigned>(acc.n),
+           fc_calls, b.inf_n);
+}
+
 int main()
 {
     g_model = slurp(MODEL_DIR "/jarvis_ru.tflite");
@@ -734,6 +780,7 @@ int main()
     test_golden_features_and_model();
     test_streaming_properties();
     test_timing_sanity();
+    test_op_profile();
     test_false_accepts();
     CHECK(g_allocs == 0);
     printf("test_mww_core: %d checks, %d failed\n", g_checks, g_failed);

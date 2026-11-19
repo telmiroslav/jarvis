@@ -26,6 +26,8 @@
 //   wake barge thr ...             порог на время ответа: у mww по умолчанию обычный + 0.03
 //   wake silence <300..3000>       пауза в мс после речи, которая считается концом фразы (по умолчанию 800)
 //   wake gain <0..18>              усиление в дБ (целые) звука, который идёт в движок слова; для тихого микрофона (по умолчанию 0)
+//   wake bench                     стенд (v0.5.1): сколько времени тратят признаки и модель microWakeWord и по операциям модели, для весов
+//                                  в копии PSRAM и прямо во flash; идёт ~5 с, слово на это время глухо; результат строками «WAKE bench ...» в ответе на wake
 //   echo                           диагностика звука: запись 4 с с микрофона и воспроизведение
 //   status                         одна строка состояния
 //   reboot                         перезагрузка
@@ -40,7 +42,7 @@ namespace cmd {
 
 enum class Kind { Empty, WifiSet, WifiClear, Tz, Lcd, Server, Echo, Wake, Status, Reboot, Help, Error };
 
-enum class WakeOp { Status, On, Off, BeepOn, BeepOff, Threshold, Silence, Gain, BeepLevel, Follow, BargeOn, BargeOff, BargeThr, Engine };
+enum class WakeOp { Status, On, Off, BeepOn, BeepOff, Threshold, Silence, Gain, BeepLevel, Follow, BargeOn, BargeOff, BargeThr, Engine, Bench };
 
 constexpr size_t kMaxSsid = 32;      // байт, предел стандарта 802.11
 constexpr size_t kMaxPass = 64;      // 8..63 символа или ровно 64 шестнадцатеричные цифры

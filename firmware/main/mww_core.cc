@@ -10,6 +10,7 @@
 #include "tensorflow/lite/micro/micro_allocator.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/micro_profiler_interface.h"
 #include "tensorflow/lite/micro/micro_resource_variable.h"
 
 #include "time_util.h"
@@ -33,7 +34,38 @@ void set_err(char *err, size_t cap, const char *msg)
 
 }  // namespace
 
+// Разбор времени по операциям модели (интерпретатор зовёт BeginEvent/EndEvent вокруг каждой операции). События вложены не глубже
+// нескольких уровней (CALL_ONCE зовёт начальный подграф), кольцо из 32 ячеек хватает с запасом.
+class OpProfiler : public tflite::MicroProfilerInterface {
+public:
+    void set(wake_perf::OpAcc *acc, uint32_t (*clock)()) { acc_ = acc; clock_ = clock; }
+    uint32_t BeginEvent(const char *tag) override
+    {
+        const uint32_t h = next_++ % kSlots;
+        tag_[h] = tag;
+        t0_[h] = clock_ ? clock_() : 0;
+        return h;
+    }
+    void EndEvent(uint32_t h) override
+    {
+        if (!acc_ || !clock_ || h >= kSlots) {
+            return;
+        }
+        acc_->add(tag_[h], timeutil::elapsed(clock_(), t0_[h]));
+    }
+
+private:
+    static constexpr uint32_t kSlots = 32;
+    wake_perf::OpAcc *acc_ = nullptr;
+    uint32_t (*clock_)() = nullptr;
+    const char *tag_[kSlots] = {nullptr};
+    uint32_t t0_[kSlots] = {0};
+    uint32_t next_ = 0;
+};
+
 struct Core::Impl {
+    OpProfiler prof;
+    bool use_prof = false;
     FrontendState fe;
     bool fe_ok = false;
 
@@ -110,6 +142,10 @@ bool Core::init(const CoreInit &ci, char *err, size_t err_cap)
     }
     Impl *im = new (mem) Impl();
     impl_ = im;
+    if (ci.op_profile && ci.clock_us) {
+        im->prof.set(ci.op_profile, ci.clock_us);
+        im->use_prof = true;
+    }
     info_.model_bytes = ci.model_len;
     info_.object_bytes = sizeof(Impl);
 
@@ -151,8 +187,8 @@ bool Core::init(const CoreInit &ci, char *err, size_t err_cap)
             deinit();
             return false;
         }
-        tflite::MicroInterpreter *it =
-            new (im->interp_mem) tflite::MicroInterpreter(model, im->resolver, arena, len, im->vars);
+        tflite::MicroInterpreter *it = new (im->interp_mem)
+            tflite::MicroInterpreter(model, im->resolver, arena, len, im->vars, im->use_prof ? &im->prof : nullptr);
         if (it->AllocateTensors() == kTfLiteOk) {
             im->interp = it;
             im->arena = arena;

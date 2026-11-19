@@ -1,4 +1,4 @@
-// Jarvis v0.5: голосовой помощник. Плата слышит слово «Джарвис» сама (wake.cc: microWakeWord с моделью Давида или ESP-SR) или слушает кнопку BOOT, отправляет
+// Jarvis v0.5.1: голосовой помощник. Плата слышит слово «Джарвис» сама (wake.cc: microWakeWord с моделью Давида или ESP-SR) или слушает кнопку BOOT, отправляет
 // голос серверу на ноутбуке, показывает лицо и субтитры и играет ответ (поверх проверки железа из v0.1 и экрана, Wi-Fi и
 // часов из v0.2).
 //
@@ -1009,11 +1009,11 @@ void print_status_line()
         snprintf(wifi, sizeof(wifi), "no_creds");
     }
     const link::Status ls = link::status();
-    char srv[200];
-    snprintf(srv, sizeof(srv), "%s url=%s%s connected=%s rtt=%dms reconnects=%u discover=%u/%u", link_logic::phase_name(ls.phase),
-             ls.url[0] ? ls.url : "none", ls.manual ? "(manual)" : "", ls.ready ? "yes" : "NO", ls.rtt_ms,
-             static_cast<unsigned>(ls.reconnects), static_cast<unsigned>(ls.discover_sent),
-             static_cast<unsigned>(ls.discover_replies));
+    char srv[240];
+    snprintf(srv, sizeof(srv), "%s url=%s%s connected=%s rtt=%dms reconnects=%u discover=%u/%u tx_stalls=%u(max %ums)",
+             link_logic::phase_name(ls.phase), ls.url[0] ? ls.url : "none", ls.manual ? "(manual)" : "", ls.ready ? "yes" : "NO", ls.rtt_ms,
+             static_cast<unsigned>(ls.reconnects), static_cast<unsigned>(ls.discover_sent), static_cast<unsigned>(ls.discover_replies),
+             static_cast<unsigned>(ls.tx_stalls), static_cast<unsigned>(ls.tx_stall_max_ms));
     const playback::Stats ps = playback::stats();
     const session::View sv = session::view();
     const bool good = (ns.state == net::State::Connected || !ns.has_creds) && (ls.ready || ns.state != net::State::Connected);
@@ -1108,7 +1108,7 @@ bool apply_lcd_cfg(int n)
 void print_greeting()
 {
     ESP_LOGI(TAG, "################################################################");
-    ESP_LOGI(TAG, "# JARVIS v0.5.0: слово «Джарвис» (microWakeWord, своя модель; wake engine esp возвращает ESP-SR), продолжить без слова, перебить словом");
+    ESP_LOGI(TAG, "# JARVIS v0.5.1: связь не рвётся на записи (Wi-Fi без экономии питания, передача не блокирует сокет, слово на записи не считает), слово «Джарвис» (microWakeWord), wake bench");
     ESP_LOGI(TAG, "################################################################");
     ESP_LOGI(TAG, "Привет, Давид! Что должно быть:");
     ESP_LOGI(TAG, "  1. ЭКРАН: два бирюзовых глаза. Без Wi-Fi внизу подсказка, с Wi-Fi без ноутбука «Ищу ноутбук…» и «Нет связи…».");
@@ -1335,7 +1335,9 @@ extern "C" void app_main(void)
     set_mode(Mode::Idle);
 
     // Связь с ноутбуком стартует последней: самопроверка звука должна идти без сетевого шума, а динамик быть свободным
-    const esp_err_t link_err = link::start(session::callbacks());
+    link::Callbacks link_cb = session::callbacks();
+    link_cb.diag = &wake::diag_text;   // состояние слова и простой ядер в строке диагностики ошибки связи (v0.5.1)
+    const esp_err_t link_err = link::start(link_cb);
     if (link_err != ESP_OK) {
         ESP_LOGE(TAG, "server link did NOT start (%s): the board works as a face with no voice", esp_err_to_name(link_err));
     } else {

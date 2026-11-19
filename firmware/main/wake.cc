@@ -198,6 +198,10 @@ struct Ctx {
         char rec_mww[200];
     };
     PerfBufs *pb = nullptr;
+    // Простой ядер по последнему снимку (для строки диагностики ошибки связи, link.h): проценты ядра, -1 пока снимка не было
+    std::atomic<int> last_idle0{-1};
+    std::atomic<int> last_idle1{-1};
+    std::atomic<uint32_t> last_idle_ms{0};
 
     // ---- автомат и настройки (под ctl_mu)
     std::mutex ctl_mu;
@@ -566,6 +570,17 @@ bool take_snapshot(wake_perf::Snapshot *out)
     return true;
 }
 
+// Запоминает простой ядер по свежему снимку (строка диагностики связи берёт его оттуда)
+void note_idle(const wake_perf::CpuShare &sh)
+{
+    if (!sh.valid) {
+        return;
+    }
+    C.last_idle0.store(static_cast<int>(sh.pct[static_cast<size_t>(wake_perf::Group::Idle0)] + 0.5f));
+    C.last_idle1.store(static_cast<int>(sh.pct[static_cast<size_t>(wake_perf::Group::Idle1)] + 0.5f));
+    C.last_idle_ms.store(uptime_ms() | 1u);
+}
+
 // Забирает накопленное за период WAKE stat и начинает новый период (накопители кадров и снимок задач)
 void perf_period_take(wake_perf::FrameAcc *acc, wake_perf::CpuShare *share)
 {
@@ -578,6 +593,7 @@ void perf_period_take(wake_perf::FrameAcc *acc, wake_perf::CpuShare *share)
     if (C.pb && take_snapshot(&C.pb->cur)) {
         *share = wake_perf::cpu_share(C.pb->base_period, C.pb->cur);
         C.pb->base_period = C.pb->cur;
+        note_idle(*share);
     }
 }
 
@@ -606,6 +622,7 @@ void perf_rec_end(uint32_t rec_ms)
     wake_perf::CpuShare share;
     if (C.pb && take_snapshot(&C.pb->cur)) {
         share = wake_perf::cpu_share(C.pb->base_rec, C.pb->cur);
+        note_idle(share);
     }
     char f[200];
     char c[160];
@@ -826,10 +843,11 @@ void print_stat(uint32_t now)
         }
         ESP_LOGI(TAG,
                  "WAKE stat (microWakeWord): %s | cutoff %.3f, window %d | near-misses +%u (total %u), last peak %s | suppressed %u | "
-                 "task stack free %u B, overruns %u, errors %u",
+                 "task stack free %u B, overruns %u, errors %u | paused for recordings %u times, %u ms in total%s",
                  mw, ms.cutoff, ms.window, static_cast<unsigned>(ms.near_misses - C.stat_prev_near),
                  static_cast<unsigned>(ms.near_misses), last, static_cast<unsigned>(ms.suppressed),
-                 static_cast<unsigned>(ms.stack_free_bytes), static_cast<unsigned>(ms.overruns), static_cast<unsigned>(ms.step_errors));
+                 static_cast<unsigned>(ms.stack_free_bytes), static_cast<unsigned>(ms.overruns), static_cast<unsigned>(ms.step_errors),
+                 static_cast<unsigned>(ms.pauses), static_cast<unsigned>(ms.paused_ms), ms.paused_now ? " (paused now)" : "");
         C.stat_prev_near = ms.near_misses;
         if (C.pb) {
             snprintf(C.pb->period_mww, sizeof(C.pb->period_mww), "%s", mw);
@@ -1334,6 +1352,12 @@ void tick(uint32_t now, const Env &env)
         perf_rec_end(rec_ms);
     }
 
+    // v0.5.1: на время записи (любой: BOOT, слово, голос в окне, перебивание) microWakeWord не считает: всё, что услышано в записи, всё равно
+    // игнорируется, а процессор нужен связи (mww_logic.h, RunGate). В покое, THINKING и SPEAKING (перебивание) движок работает.
+    if (C.ok && C.engine == mww_logic::Engine::Mww) {
+        mww::set_paused(c.dialog_listening);
+    }
+
     // Звук и порог для движка на время ответа
     apply_attenuation(C.machine.engine_attenuated());
     apply_threshold(C.machine.barge() && sv.phase == dialog::Phase::Speaking);
@@ -1568,6 +1592,50 @@ PerfInfo perf_info()
         wake_perf::format_mww(mww::acc_total(), p.mww_total, sizeof(p.mww_total));
     }
     return p;
+}
+
+bool bench_start(char *why, size_t why_cap)
+{
+    // Стенд занимает ядро 0 на несколько секунд (приоритет 10), поэтому только пока разговор в покое
+    const session::View sv = session::view();
+    if (!C.ok || C.engine != mww_logic::Engine::Mww) {
+        snprintf(why, why_cap, "%s", "no_mww");
+        return false;
+    }
+    if (sv.phase != dialog::Phase::Idle || sv.button_down) {
+        snprintf(why, why_cap, "%s", "dialog_busy");
+        return false;
+    }
+    return mww::bench_start(why, why_cap);
+}
+
+int bench_state() { return mww::bench_state(); }
+
+size_t bench_line(int i, char *buf, size_t cap) { return mww::bench_line(i, buf, cap); }
+
+void diag_text(char *buf, size_t cap)
+{
+    if (!buf || cap == 0) {
+        return;
+    }
+    const char *m;
+    if (!C.ok || C.engine != mww_logic::Engine::Mww) {
+        m = "n/a";
+    } else if (!C.run.load()) {
+        m = "off";
+    } else if (mww::paused()) {
+        m = "paused";
+    } else {
+        m = "running";
+    }
+    const int i0 = C.last_idle0.load();
+    const int i1 = C.last_idle1.load();
+    const uint32_t at = C.last_idle_ms.load();
+    if (i0 >= 0 && i1 >= 0 && at != 0) {
+        snprintf(buf, cap, "mww=%s idle0=%d%% idle1=%d%% (perf %u s ago)", m, i0, i1, static_cast<unsigned>(timeutil::elapsed(uptime_ms(), at) / 1000));
+    } else {
+        snprintf(buf, cap, "mww=%s idle0=n/a idle1=n/a", m);
+    }
 }
 
 // ---------------------------------------------------------------- настройки

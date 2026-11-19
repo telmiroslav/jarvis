@@ -12,7 +12,7 @@ LVGL_CFLAGS := -O2 -std=gnu11 -DLV_CONF_INCLUDE_SIMPLE -DLV_LVGL_H_INCLUDE_SIMPL
 
 WARN := -Wall -Wextra -Wpedantic
 LOGIC_SRCS := test_main.cc $(MAIN)/dsp.cc $(MAIN)/text_util.cc $(MAIN)/ui_logic.cc $(MAIN)/cmd_parse.cc $(MAIN)/net_logic.cc \
-              $(MAIN)/proto.cc $(MAIN)/link_logic.cc $(MAIN)/pcm_queue.cc $(MAIN)/subtitle.cc $(MAIN)/dialog.cc $(MAIN)/face_logic.cc $(MAIN)/wake_logic.cc $(MAIN)/wake_perf.cc $(MAIN)/heap_logic.cc $(MAIN)/mww_logic.cc
+              $(MAIN)/proto.cc $(MAIN)/link_logic.cc $(MAIN)/pcm_queue.cc $(MAIN)/subtitle.cc $(MAIN)/dialog.cc $(MAIN)/face_logic.cc $(MAIN)/wake_logic.cc $(MAIN)/wake_perf.cc $(MAIN)/heap_logic.cc $(MAIN)/mww_logic.cc $(MAIN)/sample_ring.cc
 
 # ---- Движок microWakeWord (mww_core.cc): микрофронтенд (C) и TFLite Micro (C++, эталонные ядра) из управляемых компонентов,
 # они появляются после первой сборки прошивки idf.py build. Нет их, тест движка пропускается (run.sh пишет об этом).
@@ -67,22 +67,22 @@ $(OUT)/libmww_tflm.a: $(TFLM_OBJS)
 	ar rcs $@ $^
 
 # Свой код (mww_core.cc, mww_logic.cc) собирается строго и с проверкой памяти; чужие библиотеки готовые
-$(OUT)/test_mww_core: test_mww_core.cc $(MAIN)/mww_core.cc $(MAIN)/mww_core.h $(MAIN)/mww_logic.cc $(MAIN)/mww_logic.h $(MAIN)/text_util.cc \
+$(OUT)/test_mww_core: test_mww_core.cc $(MAIN)/mww_core.cc $(MAIN)/mww_core.h $(MAIN)/mww_logic.cc $(MAIN)/mww_logic.h $(MAIN)/wake_perf.cc $(MAIN)/text_util.cc \
                       $(OUT)/libmww_tflm.a $(OUT)/libmww_fe.a
 	@mkdir -p $(OUT)
 	g++ -std=c++17 -O1 -g $(WARN) -fno-rtti -fno-exceptions -DTF_LITE_STATIC_MEMORY -DMODEL_DIR=\"$(MAIN)/models\" -fsanitize=address,undefined \
 	    -I$(MAIN) -I$(FE_DIR)/include -isystem $(TFLM_DIR) -isystem $(TFLM_DIR)/third_party/gemmlowp -isystem $(TFLM_DIR)/third_party/flatbuffers/include \
 	    -isystem $(TFLM_DIR)/third_party/ruy -isystem $(TFLM_DIR)/third_party/kissfft \
-	    test_mww_core.cc $(MAIN)/mww_core.cc $(MAIN)/mww_logic.cc $(MAIN)/text_util.cc $(OUT)/libmww_tflm.a $(OUT)/libmww_fe.a -o $@ -lm
+	    test_mww_core.cc $(MAIN)/mww_core.cc $(MAIN)/mww_logic.cc $(MAIN)/wake_perf.cc $(MAIN)/text_util.cc $(OUT)/libmww_tflm.a $(OUT)/libmww_fe.a -o $@ -lm
 
 # Проверка модели на записях (инструмент, не тест): см. mww_check.cc
-$(OUT)/mww_check: mww_check.cc $(MAIN)/mww_core.cc $(MAIN)/mww_core.h $(MAIN)/mww_logic.cc $(MAIN)/mww_logic.h $(MAIN)/text_util.cc \
+$(OUT)/mww_check: mww_check.cc $(MAIN)/mww_core.cc $(MAIN)/mww_core.h $(MAIN)/mww_logic.cc $(MAIN)/mww_logic.h $(MAIN)/wake_perf.cc $(MAIN)/text_util.cc \
                   $(OUT)/libmww_tflm.a $(OUT)/libmww_fe.a
 	@mkdir -p $(OUT)
 	g++ -std=c++17 -O2 $(WARN) -fno-rtti -fno-exceptions -DTF_LITE_STATIC_MEMORY -I$(MAIN) -I$(FE_DIR)/include -isystem $(TFLM_DIR) \
 	    -isystem $(TFLM_DIR)/third_party/gemmlowp -isystem $(TFLM_DIR)/third_party/flatbuffers/include -isystem $(TFLM_DIR)/third_party/ruy \
 	    -isystem $(TFLM_DIR)/third_party/kissfft \
-	    mww_check.cc $(MAIN)/mww_core.cc $(MAIN)/mww_logic.cc $(MAIN)/text_util.cc $(OUT)/libmww_tflm.a $(OUT)/libmww_fe.a -o $@ -lm
+	    mww_check.cc $(MAIN)/mww_core.cc $(MAIN)/mww_logic.cc $(MAIN)/wake_perf.cc $(MAIN)/text_util.cc $(OUT)/libmww_tflm.a $(OUT)/libmww_fe.a -o $@ -lm
 endif
 
 $(OUT)/liblvgl.a: $(LVGL_OBJS)

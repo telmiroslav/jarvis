@@ -212,6 +212,7 @@ void Fsm::fail(uint32_t now, Actions *a)
     failures_++;
     backoff_until_ = now + reconnect_backoff_ms(failures_ - 1);
     ping_sent_ = 0;
+    tx_blocked_since_ = 0;
     if (down_since_ == 0) {
         down_since_ = now ? now : 1;
     }
@@ -232,6 +233,7 @@ Actions Fsm::on_wifi(bool up, uint32_t now)
             enter(Phase::WifiDown, now);
             failures_ = 0;
             ping_sent_ = 0;
+            tx_blocked_since_ = 0;
             down_since_ = 0;
         }
         return a;
@@ -340,6 +342,8 @@ Actions Fsm::on_ws_connected(uint32_t now)
         enter(Phase::Handshake, now);
         a.send_hello = true;
         last_tx_ = now;
+        last_rx_ = now;
+        tx_blocked_since_ = 0;
     }
     return a;
 }
@@ -362,6 +366,7 @@ Actions Fsm::on_welcome(uint32_t now)
         ever_ready_ = true;
         ping_sent_ = 0;
         last_tx_ = now;
+        last_rx_ = now;
         down_since_ = 0;
     }
     return a;
@@ -375,6 +380,31 @@ Actions Fsm::on_pong(uint32_t now)
         ping_sent_ = 0;
     }
     return a;
+}
+
+uint32_t Fsm::on_tx(uint32_t now)
+{
+    last_tx_ = now;
+    uint32_t stall = 0;
+    if (tx_blocked_since_ != 0) {
+        stall = timeutil::elapsed(now, tx_blocked_since_);
+        tx_blocked_since_ = 0;
+        if (stall >= kTxStallLogMs) {
+            stalls_++;
+        }
+        if (stall > stall_max_ms_) {
+            stall_max_ms_ = stall;
+        }
+    }
+    return stall;
+}
+
+void Fsm::on_tx_blocked(uint32_t now)
+{
+    if (tx_blocked_since_ == 0) {
+        tx_blocked_since_ = now ? now : 1;
+        stall_note_at_ = now + kTxStallFirstNoteMs;
+    }
 }
 
 Actions Fsm::tick(uint32_t now)
@@ -399,14 +429,31 @@ Actions Fsm::tick(uint32_t now)
         // Пока связь есть, поиск не идёт, а срок следующего не должен стареть: через 24 суток знаковое сравнение
         // reached() сочло бы его «ещё не наступившим». После потери связи поиск начинается сразу, как и раньше.
         next_discover_ = now;
+        if (tx_blocked_since_ != 0) {
+            // Передача стоит: в лог строка (раньше и чаще, чем связь признана мёртвой), а совсем долгий простой это обрыв
+            const uint32_t stall = timeutil::elapsed(now, tx_blocked_since_);
+            if (stall >= kTxStallDeadMs) {
+                fail(now, &a);
+                break;
+            }
+            if (timeutil::reached(now, stall_note_at_)) {
+                a.stall_note = true;
+                stall_note_at_ = now + kTxStallNoteEveryMs;
+            }
+        }
         if (ping_sent_ != 0) {
             if (timeutil::elapsed(now, ping_sent_) > kPongTimeoutMs) {
                 fail(now, &a);
             }
-        } else if (timeutil::elapsed(now, last_tx_) >= kPingEveryMs) {
-            a.send_ping = true;
-            ping_sent_ = now ? now : 1;
-            last_tx_ = now;
+        } else {
+            // Ping нужен, только если ни отправки, ни приёма не было целый интервал: приходящий звук ответа тоже признак жизни
+            const uint32_t tx_quiet = timeutil::elapsed(now, last_tx_);
+            const uint32_t rx_quiet = timeutil::elapsed(now, last_rx_);
+            if ((tx_quiet < rx_quiet ? tx_quiet : rx_quiet) >= kPingEveryMs) {
+                a.send_ping = true;
+                ping_sent_ = now ? now : 1;
+                last_tx_ = now;
+            }
         }
         break;
     case Phase::Backoff:
@@ -427,6 +474,45 @@ Actions Fsm::tick(uint32_t now)
 uint32_t Fsm::down_ms(uint32_t now) const
 {
     return down_since_ == 0 ? 0 : timeutil::elapsed(now, down_since_);
+}
+
+// ---------------------------------------------------------------- диагностика ошибки
+
+size_t format_diag(const LinkDiag &d, char *buf, size_t cap)
+{
+    if (cap == 0) {
+        return 0;
+    }
+    char rssi[24];
+    if (d.rssi_dbm != 0) {
+        snprintf(rssi, sizeof(rssi), "%d dBm", d.rssi_dbm);
+    } else {
+        snprintf(rssi, sizeof(rssi), "n/a");
+    }
+    char tx[32];
+    char rx[32];
+    if (d.last_send_age_ms >= 0) {
+        snprintf(tx, sizeof(tx), "%d ms ago", static_cast<int>(d.last_send_age_ms));
+    } else {
+        snprintf(tx, sizeof(tx), "never");
+    }
+    if (d.last_rx_age_ms >= 0) {
+        snprintf(rx, sizeof(rx), "%d ms ago", static_cast<int>(d.last_rx_age_ms));
+    } else {
+        snprintf(rx, sizeof(rx), "never");
+    }
+    const int n = snprintf(buf, cap,
+                           "rssi=%s | heap internal %u KB psram %u KB | mic backlog %u ms (dropped %u ms) | last send %s, last receive %s | "
+                           "tx stalled %u ms (stalls %u, longest %u ms)%s%s",
+                           rssi, static_cast<unsigned>(d.heap_internal_kb), static_cast<unsigned>(d.heap_psram_kb),
+                           static_cast<unsigned>(d.mic_backlog_ms), static_cast<unsigned>(d.mic_dropped_ms), tx, rx,
+                           static_cast<unsigned>(d.tx_stall_ms), static_cast<unsigned>(d.stalls), static_cast<unsigned>(d.stall_max_ms),
+                           d.extra[0] ? " | " : "", d.extra);
+    if (n < 0) {
+        buf[0] = '\0';
+        return 0;
+    }
+    return static_cast<size_t>(n) < cap ? static_cast<size_t>(n) : cap - 1;
 }
 
 // ---------------------------------------------------------------- подсказка

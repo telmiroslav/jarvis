@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include "mww_logic.h"
+#include "wake_perf.h"
 
 namespace jarvis {
 namespace mww {
@@ -24,6 +25,9 @@ struct CoreInit {
     void *(*alloc)(size_t bytes, size_t align) = nullptr;   // арена тензоров и объекты ядра (на плате: PSRAM). nullptr при отказе
     void (*release)(void *p) = nullptr;
     uint32_t (*clock_us)() = nullptr;   // для step(): время признака и запуска модели; nullptr = не мерить
+    // v0.5.1: если задан (и есть clock_us), время каждой операции модели (CONV_2D, ...) копится сюда (стенд «wake bench»). Должен жить,
+    // пока жив Core. nullptr = без разбора по операциям (рабочий движок так и работает: ни одного лишнего вызова часов).
+    wake_perf::OpAcc *op_profile = nullptr;
 };
 
 struct Step {

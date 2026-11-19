@@ -172,6 +172,13 @@ Command parse_wake(const char *a)
         c.wake_op = WakeOp::Off;
         return c;
     }
+    if (word_eq(w, wl, "bench")) {
+        if (*arg != '\0') {
+            return make_error("wake", "usage");
+        }
+        c.wake_op = WakeOp::Bench;
+        return c;
+    }
     if (word_eq(w, wl, "beep")) {
         const size_t al = strlen(arg);
         if (word_eq(arg, al, "on")) {

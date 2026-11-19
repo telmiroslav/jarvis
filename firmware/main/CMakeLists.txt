@@ -22,6 +22,7 @@ idf_component_register(
          "pcm_queue.cc"
          "playback.cc"
          "proto.cc"
+         "sample_ring.cc"
          "session.cc"
          "settings.cc"
          "subtitle.cc"
@@ -50,6 +51,13 @@ idf_component_get_property(mww_tflm_lib espressif__esp-tflite-micro COMPONENT_LI
 if(TARGET ${mww_tflm_lib})
     target_compile_options(${mww_tflm_lib} PRIVATE -Wno-shadow)
 endif()
+
+# v0.5.1: откуда движок microWakeWord читает веса модели: 0 (по умолчанию) копия в PSRAM, 1 прямо из образа во flash (mww.cc). Какая быстрее на плате,
+# показывает команда wake bench; включить: idf.py -DJARVIS_MWW_MODEL_IN_FLASH=1 build
+if(NOT DEFINED JARVIS_MWW_MODEL_IN_FLASH)
+    set(JARVIS_MWW_MODEL_IN_FLASH 0)
+endif()
+target_compile_definitions(${COMPONENT_LIB} PRIVATE JARVIS_MWW_MODEL_IN_FLASH=${JARVIS_MWW_MODEL_IN_FLASH})
 
 # Шрифты сгенерированы lv_font_conv и подключают lvgl.h коротким путём
 target_compile_definitions(${COMPONENT_LIB} PRIVATE LV_LVGL_H_INCLUDE_SIMPLE)

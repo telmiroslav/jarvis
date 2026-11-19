@@ -166,12 +166,15 @@ void run_wake(const cmd::Command &c)
                     snprintf(lp, sizeof(lp), "none");
                 }
                 reply("WAKE v0.5.0 mww model=%s window=%d near_miss=%u last_peak=%s avg_now=%.2f words=%u suppressed=%u overruns=%u errors=%u "
-                      "stack_free=%uB arena=%u/%uB(%d try) model_bytes=%u",
+                      "stack_free=%uB arena=%u/%uB(%d try) model_bytes=%u(%s)",
                       s.mww.model, s.mww.window, static_cast<unsigned>(s.mww.near_misses), lp, s.mww.avg_now,
                       static_cast<unsigned>(s.mww.detections), static_cast<unsigned>(s.mww.suppressed),
                       static_cast<unsigned>(s.mww.overruns), static_cast<unsigned>(s.mww.step_errors),
                       static_cast<unsigned>(s.mww.stack_free_bytes), static_cast<unsigned>(s.mww.arena_used),
-                      static_cast<unsigned>(s.mww.arena_bytes), s.mww.arena_attempts, static_cast<unsigned>(s.mww.model_bytes));
+                      static_cast<unsigned>(s.mww.arena_bytes), s.mww.arena_attempts, static_cast<unsigned>(s.mww.model_bytes),
+                      s.mww.model_in_flash ? "flash" : "psram");
+                reply("WAKE v0.5.1 mww paused_now=%s pauses=%u paused_ms=%u (the engine computes nothing while the dialog listens)",
+                      s.mww.paused_now ? "yes" : "no", static_cast<unsigned>(s.mww.pauses), static_cast<unsigned>(s.mww.paused_ms));
             }
         }
         if (s.available) {
@@ -197,6 +200,24 @@ void run_wake(const cmd::Command &c)
             if (p.rec_mww[0]) {
                 reply("WAKE perf %s: %s", p.rec_head, p.rec_mww);
             }
+        }
+        if (wake::bench_state() == 1) {
+            reply("WAKE bench: running (about 5 s after the command), ask again with: wake");
+        } else {
+            // Результат стенда (wake bench), если он был: каждая строка короче 200 символов
+            char bl[220];
+            for (int i = 0; wake::bench_line(i, bl, sizeof(bl)) > 0; i++) {
+                reply("WAKE bench %s", bl);
+            }
+        }
+        break;
+    }
+    case WakeOp::Bench: {
+        char why[24] = {0};
+        if (wake::bench_start(why, sizeof(why))) {
+            reply("WAKE OK bench started: about 5 s, the word is deaf meanwhile; read the result with: wake (lines WAKE bench)");
+        } else {
+            reply("ERR wake bench_%s", why);
         }
         break;
     }
@@ -402,7 +423,7 @@ void run_command(const cmd::Command &c)
     case cmd::Kind::Help:
         reply("HELP wifi_set <ssid><TAB><password> | wifi_clear | tz <POSIX TZ> | lcd <1-6> | server [ws://ip:port/ws|auto] | "
               "wake [on|off|engine mww|esp|beep on|off|0-5|thr <0.50-0.99 mww, 0.40-0.9999 esp|default>|silence <300-3000 ms>|gain <0-18 dB>|"
-              "follow <0|2000-15000 ms>|barge on|off|barge thr <as thr|default>] | echo | status | reboot");
+              "follow <0|2000-15000 ms>|barge on|off|barge thr <as thr|default>|bench] | echo | status | reboot");
         break;
     case cmd::Kind::Error:
         reply("ERR %s %s", c.err_cmd, c.err_reason);

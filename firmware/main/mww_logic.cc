@@ -90,6 +90,26 @@ GuardAction guard_action(Engine wanted, bool guard_set)
     return wanted == Engine::Mww ? GuardAction::DemoteToEsp : GuardAction::Fail;
 }
 
+RunAction RunGate::next(bool wake_on, bool recording)
+{
+    const bool want = wake_on && !recording;
+    if (!want) {
+        if (active_ && recording && wake_on) {
+            pauses_++;
+        }
+        active_ = false;
+        paused_for_recording_ = wake_on && recording;
+        return RunAction::Idle;
+    }
+    if (!active_) {
+        active_ = true;
+        resumed_from_recording_ = paused_for_recording_;
+        paused_for_recording_ = false;
+        return RunAction::Restart;
+    }
+    return RunAction::Run;
+}
+
 // ------------------------------------------------------------------ манифест
 
 namespace {

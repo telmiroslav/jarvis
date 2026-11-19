@@ -74,6 +74,57 @@ struct MwwAcc {
 };
 void merge(MwwAcc *a, const MwwAcc &b);
 
+// v0.5.1, стенд «wake bench» (mww.cc): прогон модели и признаков на фиксированном звуке с высоким приоритетом, чтобы вытеснение другими
+// задачами не искажало цифры. Накопитель времени по операциям TFLite Micro (CONV_2D, DEPTHWISE_CONV_2D, ...): куда уходит время модели.
+constexpr size_t kBenchMaxOps = 16;
+constexpr size_t kBenchTagLen = 28;
+
+struct OpAcc {
+    struct Op {
+        char tag[kBenchTagLen] = {0};
+        uint32_t calls = 0;
+        uint64_t sum_us = 0;
+        uint32_t max_us = 0;
+    };
+    Op ops[kBenchMaxOps];
+    size_t n = 0;
+
+    // Добавляет один вызов операции tag длиной us. Новых тегов больше kBenchMaxOps не заводится: лишнее идёт в последнюю строку «other».
+    void add(const char *tag, uint32_t us);
+    void clear() { n = 0; for (Op &o : ops) o = Op(); }
+    uint64_t total_us() const;
+};
+
+// Один прогон стенда: признаки (микрофронтенд, на каждые 10 мс звука) и модель (на каждые 30 мс), время в мкс
+struct BenchRun {
+    bool ran = false;               // прогон состоялся
+    char why[96] = {0};             // если нет: причина (одна строка)
+    char weights[16] = {0};         // «psram» (копия в PSRAM, 16 байт выравнивания) или «flash» (прямо из образа)
+    uint32_t inf = 0;               // запусков модели
+    uint32_t fe = 0;                // признаков
+    uint64_t inf_sum_us = 0;
+    uint64_t fe_sum_us = 0;
+    uint32_t inf_max_us = 0;
+    uint32_t fe_max_us = 0;
+    OpAcc ops;                      // по операциям (суммы за все inf запусков)
+
+    void add_inf(uint32_t us);
+    void add_fe(uint32_t us);
+    float inf_avg_us() const { return inf ? static_cast<float>(inf_sum_us) / static_cast<float>(inf) : 0.0f; }
+    float fe_avg_us() const { return fe ? static_cast<float>(fe_sum_us) / static_cast<float>(fe) : 0.0f; }
+    // Мс счёта на каждые 30 мс звука: один запуск модели и три признака (kMwwInferenceMs / 10)
+    float ms_per_30ms() const { return (inf_avg_us() + 3.0f * fe_avg_us()) / 1000.0f; }
+    float busy_pct() const { return 100.0f * ms_per_30ms() / static_cast<float>(kMwwInferenceMs); }
+};
+
+// «psram: inference avg 8410 max 8650 us (94 runs), features avg 1310 max 1700 us (282 steps) => 12.3 ms per 30 ms of audio = 41% of a core»
+// или «flash: not run (причина)». Возвращает длину.
+size_t format_bench_run(const BenchRun &r, char *buf, size_t cap);
+// «psram ops, avg us per inference: CONV_2D 4100 (49%), DEPTHWISE_CONV_2D 2000 (24%), ...»: top самых долгих. Нет данных: «psram ops: none».
+size_t format_bench_ops(const BenchRun &r, size_t top, char *buf, size_t cap);
+// «flash is 35% slower than psram (inference), features unchanged» и т. п.; если одного из прогонов не было, «verdict: need both runs»
+size_t format_bench_verdict(const BenchRun &psram, const BenchRun &flash, char *buf, size_t cap);
+
 // Сколько кадров реально ждёт в кольце: подано минус получено, с поправкой на то, что счётчики читаются по отдельности и
 // «получено» может на единицу обогнать «подано». Никогда не отрицательно.
 uint32_t pending_frames(uint32_t fed, uint32_t fetched);

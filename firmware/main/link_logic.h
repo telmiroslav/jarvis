@@ -9,6 +9,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "time_util.h"
+
 namespace jarvis {
 namespace link_logic {
 
@@ -59,8 +61,14 @@ const char *phase_name(Phase p);
 
 constexpr uint32_t kConnectTimeoutMs = 8000;     // WebSocket не открылся за это время: считаем отказом
 constexpr uint32_t kWelcomeTimeoutMs = 3000;     // после hello welcome не пришёл: это не наш сервер
-constexpr uint32_t kPingEveryMs = 10000;         // PROTOCOL.md: ping раз в 10 с без другого трафика
+constexpr uint32_t kPingEveryMs = 10000;         // PROTOCOL.md: ping раз в 10 с без другого трафика (с v0.5.1 трафик это и приём, и передача)
 constexpr uint32_t kPongTimeoutMs = 8000;        // pong не пришёл: связь мертва
+// v0.5.1: передача звука больше не убивает связь, когда сокет на время не принимает данные (WebSocket-клиент при любом таймауте записи
+// рвёт соединение, поэтому link.cc сам проверяет, что сокет готов, и не пишет, пока он не готов). Простой передачи:
+constexpr uint32_t kTxStallLogMs = 300;          // простой короче в лог не пишем (обычное ожидание подтверждений TCP)
+constexpr uint32_t kTxStallFirstNoteMs = 1000;   // пока простой идёт, первая строка через столько, дальше каждые kTxStallNoteEveryMs
+constexpr uint32_t kTxStallNoteEveryMs = 2000;
+constexpr uint32_t kTxStallDeadMs = 15000;       // передача стоит столько: связь мертва (TCP сам сдаётся ещё позже)
 uint32_t reconnect_backoff_ms(uint32_t failures);   // 1, 2, 4, 8, потом по 10 с
 
 // Что должен сделать link.cc после очередного события или тика
@@ -70,7 +78,8 @@ struct Actions {
     bool send_hello = false;
     bool send_ping = false;
     bool discover = false;       // разослать JARVIS_DISCOVER
-    bool any() const { return connect || disconnect || send_hello || send_ping || discover; }
+    bool stall_note = false;     // передача стоит уже давно: написать в лог строку (длину простоя link.cc берёт у tx_stall_ms())
+    bool any() const { return connect || disconnect || send_hello || send_ping || discover || stall_note; }
 };
 
 class Fsm {
@@ -87,7 +96,13 @@ public:
     Actions on_ws_disconnected(uint32_t now);   // оборвалось, не открылось или закрыто сервером
     Actions on_welcome(uint32_t now);
     Actions on_pong(uint32_t now);
-    void on_tx(uint32_t now) { last_tx_ = now; }   // любое отправленное сообщение или кадр звука
+    // Любое отправленное сообщение или кадр звука (его приняло ядро TCP). Возвращает длину простоя в мс, если передача только что
+    // возобновилась после on_tx_blocked() (0, если простоя не было).
+    uint32_t on_tx(uint32_t now);
+    // Что-то хотели отправить, а сокет не готов принять. Начало простоя считается с первого такого вызова после удачной отправки.
+    void on_tx_blocked(uint32_t now);
+    // v0.5.1: любой кадр от сервера (звук ответа, сообщение, pong, ping самого WebSocket): связь жива, ping не нужен
+    void on_rx(uint32_t now) { last_rx_ = now; }
     Actions tick(uint32_t now);
 
     Phase phase() const { return phase_; }
@@ -101,6 +116,13 @@ public:
     uint32_t reconnects() const { return reconnects_; }     // сколько раз связь потеряна после welcome
     // Сколько мс уже нет связи с сервером при живом Wi-Fi (0, если связь есть или Wi-Fi нет)
     uint32_t down_ms(uint32_t now) const;
+    // Сколько мс стоит передача (0, если не стоит)
+    uint32_t tx_stall_ms(uint32_t now) const { return tx_blocked_since_ == 0 ? 0 : timeutil::elapsed(now, tx_blocked_since_); }
+    uint32_t stalls() const { return stalls_; }               // простоев не короче kTxStallLogMs за всё время
+    uint32_t stall_max_ms() const { return stall_max_ms_; }   // самый долгий простой
+    // Сколько мс назад что-то отправили / что-то приняли (-1: ещё не было)
+    int32_t last_tx_age_ms(uint32_t now) const { return last_tx_ == 0 ? -1 : static_cast<int32_t>(timeutil::elapsed(now, last_tx_)); }
+    int32_t last_rx_age_ms(uint32_t now) const { return last_rx_ == 0 ? -1 : static_cast<int32_t>(timeutil::elapsed(now, last_rx_)); }
 
 private:
     void fail(uint32_t now, Actions *a);
@@ -116,10 +138,35 @@ private:
     uint32_t next_discover_ = 0;
     uint32_t backoff_until_ = 0;
     uint32_t last_tx_ = 0;
+    uint32_t last_rx_ = 0;
     uint32_t ping_sent_ = 0;     // 0: нет неотвеченного ping
     int rtt_ms_ = -1;
     uint32_t down_since_ = 0;    // 0: связь есть или Wi-Fi нет
+    uint32_t tx_blocked_since_ = 0;   // 0: передача не стоит
+    uint32_t stall_note_at_ = 0;
+    uint32_t stalls_ = 0;
+    uint32_t stall_max_ms_ = 0;
 };
+
+// ---- одна строка диагностики при любой ошибке связи (v0.5.1)
+
+// Что link.cc собирает в момент ошибки. Значение -1 / 0 / пустая строка = неизвестно (в строке пишется n/a).
+struct LinkDiag {
+    int rssi_dbm = 0;                // 0: неизвестно
+    uint32_t heap_internal_kb = 0;
+    uint32_t heap_psram_kb = 0;
+    uint32_t mic_backlog_ms = 0;     // сколько звука микрофона ждёт отправки
+    uint32_t mic_dropped_ms = 0;     // сколько самого старого звука выброшено за всё время
+    int32_t last_send_age_ms = -1;   // сколько назад что-то ушло серверу
+    int32_t last_rx_age_ms = -1;     // и сколько назад что-то пришло
+    uint32_t tx_stall_ms = 0;        // сколько стоит передача сейчас
+    uint32_t stalls = 0;
+    uint32_t stall_max_ms = 0;
+    char extra[96] = {0};            // от слова: «mww=paused idle0=22 idle1=9 (perf 4 s ago)» (пусто: нет)
+};
+// «rssi=-35 dBm | heap internal 54 KB psram 6918 KB | mic backlog 120 ms (dropped 0 ms) | last send 35 ms ago, last receive 12 ms ago |
+//  tx stalled 0 ms (stalls 2, longest 1300 ms) | mww=running idle0=22 idle1=9». Возвращает длину; буфер любого размера, ноль на месте.
+size_t format_diag(const LinkDiag &d, char *buf, size_t cap);
 
 // ---- подсказка на экране
 

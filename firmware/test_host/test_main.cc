@@ -23,6 +23,7 @@
 #include "net_logic.h"
 #include "pcm_queue.h"
 #include "proto.h"
+#include "sample_ring.h"
 #include "subtitle.h"
 #include "text_util.h"
 #include "time_util.h"
@@ -2673,6 +2674,11 @@ struct WakeSim {
     int ignored = 0;
     const char *last_reject = "";
     wake_logic::StopReason last_reason = wake_logic::StopReason::None;
+    // v0.5.1: что сделала бы задача mww на каждом проходе (mww_logic::RunGate, сигнал «разговор слушает» как в wake::tick), по фазам разговора
+    mww_logic::RunGate gate;
+    int gate_run[5] = {0, 0, 0, 0, 0};    // проходы, на которых движок считал (в том числе возврат после паузы)
+    int gate_idle[5] = {0, 0, 0, 0, 0};   // и на которых не считал
+    int gate_restart = 0;                 // сколько раз начинал с чистого состояния
 
     WakeSim()
     {
@@ -2744,6 +2750,14 @@ struct WakeSim {
                         beeps += x.beep;
                     }
                 }
+            }
+            const mww_logic::RunAction ga = gate.next(enabled, d.phase() == dialog::Phase::Listening);
+            const int pi = static_cast<int>(d.phase());
+            if (ga == mww_logic::RunAction::Idle) {
+                gate_idle[pi]++;
+            } else {
+                gate_run[pi]++;
+                gate_restart += ga == mww_logic::RunAction::Restart;
             }
         }
     }
@@ -5746,6 +5760,571 @@ static void test_wake_perf_mww()
     CHECK(strncmp(buf, "cpu%=fetch:12,mww:7,feed:0,", 27) == 0);
 }
 
+// ---------------------------------------------------------------- v0.5.1: кольцо микрофона, связь, пауза слова на записи, стенд
+
+static void test_sample_ring()
+{
+    SampleRing r;
+    int16_t store[8];
+    int16_t in[40];
+    for (int i = 0; i < 40; i++) {
+        in[i] = static_cast<int16_t>(i + 1);
+    }
+    int16_t out[40];
+    CHECK(r.size() == 0 && r.capacity() == 0 && r.push_drop_oldest(in, 3) == 0 && r.peek(out, 3) == 0);   // не готово: ничего не делает
+    r.init(store, 8);
+    CHECK(r.size() == 0 && r.capacity() == 8 && r.dropped_total() == 0 && r.peek(out, 8) == 0);
+
+    // обычная работа без переполнения, с заходом через конец кольца
+    CHECK(r.push_drop_oldest(in, 5) == 0 && r.size() == 5);
+    uint64_t mark = 0;
+    CHECK(r.peek(out, 3, &mark) == 3 && out[0] == 1 && out[1] == 2 && out[2] == 3 && r.size() == 5);   // peek ничего не забирает
+    r.consume_peeked(3, mark);
+    CHECK(r.size() == 2);
+    CHECK(r.push_drop_oldest(in + 5, 6) == 0 && r.size() == 8 && r.dropped_total() == 0);   // 4,5 и 6..11: ровно по кольцу, с заходом
+    CHECK(r.pop(out, 20) == 8 && out[0] == 4 && out[1] == 5 && out[2] == 6 && out[7] == 11 && r.size() == 0);
+
+    // переполнение: выбрасывается самый СТАРЫЙ звук, остаётся ровный свежий кусок
+    r.clear();
+    CHECK(r.push_drop_oldest(in, 6) == 0);                       // 1..6
+    CHECK(r.push_drop_oldest(in + 6, 5) == 3);                   // 7..11: 3 старых (1..3) выброшены
+    CHECK(r.size() == 8 && r.dropped_total() == 3);
+    CHECK(r.pop(out, 8) == 8);
+    for (int i = 0; i < 8; i++) {
+        CHECK(out[i] == i + 4);                                  // 4..11 подряд, без дыр и без повторов
+    }
+    // долгий простой: звук идёт блоками, кольцо всё время полное, в нём всегда последние 8 отсчётов
+    r.clear();
+    uint64_t total_dropped = 0;
+    for (int blk = 0; blk < 10; blk++) {
+        total_dropped += r.push_drop_oldest(in + blk * 3, 3);
+    }
+    CHECK(r.size() == 8 && total_dropped == 30 - 8 && r.dropped_total() == total_dropped + 3 + 0);
+    CHECK(r.pop(out, 8) == 8 && out[0] == 23 && out[7] == 30);
+    // кусок не меньше кольца: остаётся его хвост
+    r.clear();
+    r.push_drop_oldest(in, 3);
+    const uint64_t before = r.dropped_total();
+    const size_t lost = r.push_drop_oldest(in + 10, 12);         // 11..22, кольцо 8
+    CHECK(lost == 3 + 4 && r.dropped_total() == before + lost && r.size() == 8);
+    CHECK(r.pop(out, 8) == 8 && out[0] == 15 && out[7] == 22);
+
+    // peek / consume_peeked, пока микрофон вытесняет самое старое
+    r.clear();
+    r.push_drop_oldest(in, 8);                                   // 1..8
+    CHECK(r.peek(out, 4, &mark) == 4 && out[0] == 1 && out[3] == 4);
+    r.push_drop_oldest(in + 8, 3);                               // 9..11: 1..3 вытеснены, пока кадр уходил
+    r.consume_peeked(4, mark);                                   // от кадра осталась одна четвёрка: забирается только она
+    CHECK(r.size() == 7);
+    CHECK(r.pop(out, 7) == 7 && out[0] == 5 && out[6] == 11);    // не пропал ни один ещё не отправленный отсчёт
+    r.clear();
+    r.push_drop_oldest(in, 8);
+    CHECK(r.peek(out, 4, &mark) == 4);
+    r.push_drop_oldest(in + 8, 6);                               // вытеснено 6: весь кадр (1..4) ушёл из кольца
+    r.consume_peeked(4, mark);
+    CHECK(r.size() == 8 && r.pop(out, 8) == 8 && out[0] == 7 && out[7] == 14);   // новый звук цел
+    // после очистки (запись отменена, началась новая) старый кадр ничего не забирает
+    r.clear();
+    r.push_drop_oldest(in, 6);
+    CHECK(r.peek(out, 4, &mark) == 4);
+    r.clear();
+    r.push_drop_oldest(in + 20, 6);
+    r.consume_peeked(4, mark);
+    CHECK(r.size() == 6 && r.pop(out, 6) == 6 && out[0] == 21);
+    // consume больше, чем есть: не уходит в минус
+    r.clear();
+    r.push_drop_oldest(in, 2);
+    r.consume(10);
+    CHECK(r.size() == 0);
+}
+
+static void test_link_stability_fsm()
+{
+    using namespace link_logic;
+    const char *URL = "ws://192.168.1.5:47801/ws";
+    auto ready = [&](Fsm &f) {
+        f.on_wifi(true, 0);
+        f.set_url(URL, false, 0);
+        f.on_ws_connected(10);
+        f.on_welcome(20);
+    };
+
+    // ---- приём считается живостью: пока идёт звук ответа, ping не нужен (раньше он уходил раз в 10 с и мог упереться в занятый сокет)
+    {
+        Fsm f;
+        ready(f);
+        for (uint32_t t = 100; t < 30000; t += 100) {
+            f.on_rx(t);   // сервер шлёт звук ответа, а мы молчим
+            CHECK(!f.tick(t).send_ping);
+        }
+        CHECK(!f.tick(39800).send_ping);   // звук кончился на 29900: 10 с тишины в обе стороны ещё не прошло
+        const Actions a = f.tick(39900);
+        CHECK(a.send_ping);
+        CHECK(!f.tick(40100).send_ping);   // ping уже в пути: второй не шлём
+        f.on_pong(40150);
+        CHECK(f.rtt_ms() == 250);
+    }
+    // приём и передача вместе: ping нужен, только когда молчали обе стороны
+    {
+        Fsm f;
+        ready(f);
+        f.on_tx(8000);
+        f.on_rx(9000);
+        CHECK(!f.tick(18900).send_ping);   // с последнего приёма (9000) нет и 10 с
+        CHECK(f.tick(19000).send_ping);
+        Fsm g;
+        ready(g);
+        g.on_rx(5000);
+        g.on_tx(12000);
+        CHECK(!g.tick(21900).send_ping);   // с последней передачи (12000) нет и 10 с
+        CHECK(g.tick(22000).send_ping);
+    }
+    // приём не заменяет pong на уже отправленный ping: нет pong, значит обрыв, как и было
+    {
+        Fsm f;
+        ready(f);
+        CHECK(f.tick(10020).send_ping);
+        f.on_rx(12000);
+        f.on_rx(17000);
+        CHECK(!f.tick(10020 + kPongTimeoutMs).disconnect);
+        const Actions a = f.tick(10020 + kPongTimeoutMs + 1);
+        CHECK(a.disconnect && f.phase() == Phase::Backoff);
+    }
+    // ping прошёл, pong пришёл: дальше снова ping только после тишины
+    {
+        Fsm f;
+        ready(f);
+        CHECK(f.tick(10020).send_ping);
+        f.on_pong(10040);
+        f.on_rx(10040);   // то же событие приёма, что и pong (link.cc ставит оба)
+        CHECK(f.rtt_ms() == 20 && !f.tick(20000).send_ping && f.tick(20050).send_ping);
+    }
+
+    // ---- простой передачи: сокет не принимает данные
+    {
+        Fsm f;
+        ready(f);
+        CHECK(f.tx_stall_ms(1000) == 0 && f.stalls() == 0 && f.last_tx_age_ms(1000) == 980 && f.last_rx_age_ms(1000) == 980);
+        f.on_tx_blocked(1000);
+        f.on_tx_blocked(1100);   // повторно: начало простоя не сдвигается
+        CHECK(f.tx_stall_ms(1500) == 500);
+        CHECK(!f.tick(1500).stall_note);
+        CHECK(!f.tick(1999).stall_note);
+        Actions a = f.tick(2000);   // через kTxStallFirstNoteMs после начала
+        CHECK(a.stall_note && !a.disconnect && f.ready());
+        CHECK(!f.tick(2100).stall_note && !f.tick(3999).stall_note);
+        CHECK(f.tick(4000).stall_note);   // дальше раз в kTxStallNoteEveryMs
+        const uint32_t len = f.on_tx(4200);   // сокет принял: простой кончился, вернули его длину
+        CHECK(len == 3200 && f.tx_stall_ms(4300) == 0 && f.stalls() == 1 && f.stall_max_ms() == 3200);
+        CHECK(f.on_tx(4300) == 0);   // без простоя возвращает 0
+        // короткий простой считается, но в «простои» не входит
+        f.on_tx_blocked(5000);
+        CHECK(f.on_tx(5100) == 100 && f.stalls() == 1 && f.stall_max_ms() == 3200);
+        // ping во время простоя уходит в очередь link.cc, автомат его по-прежнему требует (после тишины в обе стороны)
+        f.on_tx_blocked(6000);
+        CHECK(f.tick(15100).send_ping || f.ready());
+    }
+    // совсем долгий простой это обрыв: звук копится, но связь, которая не принимает ничего 15 с, мертва; приём этого не отменяет
+    {
+        Fsm f;
+        ready(f);
+        f.on_tx_blocked(5000);
+        for (uint32_t t = 5100; t < 5000 + kTxStallDeadMs; t += 100) {
+            f.on_rx(t);
+            CHECK(!f.tick(t).disconnect);
+        }
+        CHECK(f.ready());
+        const Actions a = f.tick(5000 + kTxStallDeadMs);
+        CHECK(a.disconnect && f.phase() == Phase::Backoff && f.reconnects() == 1 && f.tx_stall_ms(5000 + kTxStallDeadMs + 1) == 0);
+        // новое соединение начинается без памяти о простое
+        f.tick(5000 + kTxStallDeadMs + 1000);
+        f.on_ws_connected(5000 + kTxStallDeadMs + 1010);
+        f.on_welcome(5000 + kTxStallDeadMs + 1020);
+        CHECK(f.ready() && f.tx_stall_ms(5000 + kTxStallDeadMs + 2000) == 0);
+    }
+    // простой короче kTxStallDeadMs и успешная передача: связь жива, обрыва нет
+    {
+        Fsm f;
+        ready(f);
+        f.on_tx_blocked(1000);
+        CHECK(!f.tick(1000 + kTxStallDeadMs - 1).disconnect);
+        f.on_tx(1000 + kTxStallDeadMs - 1);
+        CHECK(!f.tick(1000 + kTxStallDeadMs).disconnect && f.ready());
+    }
+    // Wi-Fi пропал во время простоя: память о простое сброшена
+    {
+        Fsm f;
+        ready(f);
+        f.on_tx_blocked(1000);
+        f.on_wifi(false, 2000);
+        CHECK(f.tx_stall_ms(3000) == 0);
+    }
+    // метки времени через переполнение 32 бит
+    {
+        Fsm f;
+        const uint32_t t0 = 0xFFFFFF00u;
+        f.on_wifi(true, t0);
+        f.set_url(URL, false, t0);
+        f.on_ws_connected(t0 + 10);
+        f.on_welcome(t0 + 20);
+        f.on_tx_blocked(t0 + 100);
+        CHECK(f.tx_stall_ms(t0 + 600) == 500);                   // t0 + 600 уже после переполнения
+        CHECK(f.on_tx(t0 + 600) == 500);
+        f.on_rx(t0 + 700);
+        CHECK(!f.tick(t0 + 700 + kPingEveryMs - 1).send_ping && f.tick(t0 + 700 + kPingEveryMs).send_ping);
+    }
+
+    // ---- строка диагностики
+    {
+        LinkDiag d;
+        char buf[400];
+        size_t n = format_diag(d, buf, sizeof(buf));   // ничего не известно: n/a и never, строка всё равно целая
+        CHECK(n == strlen(buf) && strstr(buf, "rssi=n/a") != nullptr && strstr(buf, "last send never, last receive never") != nullptr);
+        d.rssi_dbm = -35;
+        d.heap_internal_kb = 54;
+        d.heap_psram_kb = 6918;
+        d.mic_backlog_ms = 1250;
+        d.mic_dropped_ms = 80;
+        d.last_send_age_ms = 35;
+        d.last_rx_age_ms = 12;
+        d.tx_stall_ms = 1300;
+        d.stalls = 2;
+        d.stall_max_ms = 1900;
+        snprintf(d.extra, sizeof(d.extra), "mww=paused idle0=22%% idle1=9%% (perf 4 s ago)");
+        n = format_diag(d, buf, sizeof(buf));
+        CHECK(n == strlen(buf));
+        CHECK(strstr(buf, "rssi=-35 dBm") != nullptr && strstr(buf, "heap internal 54 KB psram 6918 KB") != nullptr);
+        CHECK(strstr(buf, "mic backlog 1250 ms (dropped 80 ms)") != nullptr && strstr(buf, "last send 35 ms ago, last receive 12 ms ago") != nullptr);
+        CHECK(strstr(buf, "tx stalled 1300 ms (stalls 2, longest 1900 ms)") != nullptr);
+        CHECK(strstr(buf, " | mww=paused idle0=22% idle1=9% (perf 4 s ago)") != nullptr);
+        // короткие буферы: обрезается, ноль на месте, за границы не выходит
+        for (size_t cap = 0; cap < 40; cap++) {
+            char small[48];
+            memset(small, 'x', sizeof(small));
+            const size_t w = format_diag(d, small, cap);
+            CHECK(cap == 0 ? small[0] == 'x' : (w < cap && small[w] == '\0'));
+        }
+    }
+}
+
+// Движок mww на записи: RunGate сам по себе
+static void test_mww_run_gate()
+{
+    using namespace mww_logic;
+    RunGate g;
+    CHECK(!g.active() && g.pauses() == 0);
+    CHECK(g.next(true, false) == RunAction::Restart && g.active() && !g.resumed_from_recording());   // запуск: чистое состояние
+    CHECK(g.next(true, false) == RunAction::Run && g.next(true, false) == RunAction::Run);
+    // запись началась: не считаем; пауза считается один раз, сколько бы проходов она ни длилась
+    CHECK(g.next(true, true) == RunAction::Idle && !g.active() && g.paused_for_recording() && g.pauses() == 1);
+    for (int i = 0; i < 100; i++) {
+        CHECK(g.next(true, true) == RunAction::Idle);
+    }
+    CHECK(g.pauses() == 1);
+    // запись кончилась: возврат с чистого состояния, один раз
+    CHECK(g.next(true, false) == RunAction::Restart && g.active() && g.resumed_from_recording() && !g.paused_for_recording());
+    CHECK(g.next(true, false) == RunAction::Run);
+    // следующая запись: вторая пауза
+    CHECK(g.next(true, true) == RunAction::Idle && g.pauses() == 2);
+    CHECK(g.next(true, false) == RunAction::Restart && g.resumed_from_recording());
+    // слово выключено (wake off) в покое: пауза не на запись и в счёт не идёт; после «wake on» чистое состояние, но не «после записи»
+    CHECK(g.next(false, false) == RunAction::Idle && !g.paused_for_recording() && g.pauses() == 2);
+    CHECK(g.next(true, false) == RunAction::Restart && !g.resumed_from_recording());
+    // слово выключили посреди записи: пауза на запись не числится, возврат тоже не «после записи»
+    CHECK(g.next(true, true) == RunAction::Idle && g.pauses() == 3);
+    CHECK(g.next(false, true) == RunAction::Idle && !g.paused_for_recording());
+    CHECK(g.next(true, false) == RunAction::Restart && !g.resumed_from_recording() && g.pauses() == 3);
+    // запись уже шла, когда движок только запускался: сначала ждём её конца
+    RunGate h;
+    CHECK(h.next(true, true) == RunAction::Idle && h.pauses() == 0);
+    CHECK(h.next(true, false) == RunAction::Restart);
+}
+
+// Детектор и RunGate вместе: на записи ни одного запуска модели, после записи прогрев kWarmupMs, потом слово снова слышно
+static void test_mww_pause_detector()
+{
+    using namespace mww_logic;
+    struct Eng {
+        RunGate gate;
+        Detector det;
+        uint32_t audio_ms = 0;
+        int inferences = 0;
+        int inferences_in_recording = 0;
+        int detections = 0;
+        int restarts = 0;
+        Eng()
+        {
+            det.configure(5, 0.90);
+            det.reset(0);
+        }
+        // 30 мс звука (одна вероятность модели), p: что выдала бы модель; recording: разговор слушает
+        bool step(bool recording, double p)
+        {
+            audio_ms += 30;
+            const RunAction a = gate.next(true, recording);
+            if (a == RunAction::Idle) {
+                return false;
+            }
+            if (a == RunAction::Restart) {
+                restarts++;
+                det.reset(audio_ms);
+            }
+            inferences++;
+            inferences_in_recording += recording;
+            const Event e = det.push(p, audio_ms);
+            detections += e.detected;
+            return e.detected;
+        }
+    };
+    Eng e;
+    // 3 с тишины: прогрев прошёл, слов нет
+    for (int i = 0; i < 100; i++) {
+        CHECK(!e.step(false, 0.02));
+    }
+    // слово: среднее окна дошло до порога
+    bool heard = false;
+    for (int i = 0; i < 8 && !heard; i++) {
+        heard = e.step(false, 0.99);
+    }
+    CHECK(heard && e.detections == 1 && e.restarts == 1);
+    // запись 3 с: модель не запускается ни разу, даже если в записи опять звучит слово (всё равно игнорировалось бы)
+    const int inf_before = e.inferences;
+    for (int i = 0; i < 100; i++) {
+        CHECK(!e.step(true, 0.99));
+    }
+    CHECK(e.inferences == inf_before && e.inferences_in_recording == 0 && e.detections == 1);
+    // запись кончилась: чистое состояние и прогрев 1 с (слово в первую секунду не слышно: окно и состояние модели ещё пустые)
+    int heard_early = 0;
+    for (int i = 0; i < 30; i++) {   // 30 * 30 мс = 900 мс после возврата
+        heard_early += e.step(false, 0.99);
+    }
+    CHECK(e.restarts == 2 && heard_early == 0 && e.det.suppressed() > 0);
+    // после прогрева слово слышно снова
+    heard = false;
+    for (int i = 0; i < 20 && !heard; i++) {
+        heard = e.step(false, 0.99);
+    }
+    CHECK(heard && e.detections == 2);
+}
+
+// Пауза движка на записи во всех путях разговора: по слову, по BOOT, по голосу в окне, при перебивании
+static void test_mww_pause_flow()
+{
+    using dialog::Phase;
+    const int L = static_cast<int>(Phase::Listening);
+    const int I = static_cast<int>(Phase::Idle);
+    const int T = static_cast<int>(Phase::Thinking);
+    const int S = static_cast<int>(Phase::Speaking);
+
+    auto ask = [](WakeSim &s) {
+        s.detect = true;
+        s.step(10);
+        s.step(400);
+        s.speech = true;
+        s.step(800);
+        s.speech = false;
+        s.step(900);
+        CHECK(s.d.phase() == Phase::Thinking);
+        s.r.add(s.d.on_server_state(proto::ServerState::Thinking, nullptr, s.t));
+        s.step(100);
+    };
+
+    // ---- по слову: на записи движок не считает ни одного прохода, в покое, THINKING и SPEAKING считает; с записи возвращается с нуля
+    {
+        WakeSim s;
+        CHECK(s.gate_restart == 1 && s.gate_run[I] > 100 && s.gate_idle[I] == 0);   // взвод: движок работал с запуска
+        ask(s);
+        CHECK(s.gate_run[L] == 0 && s.gate_idle[L] > 100);
+        CHECK(s.gate_restart == 2);   // один возврат с записи
+        CHECK(s.gate_run[T] > 0 && s.gate_idle[T] == 0);
+        s.r.add(s.d.on_audio_start(s.t));
+        s.drained = false;
+        s.step(1500);
+        CHECK(s.d.phase() == Phase::Speaking && s.gate_run[S] > 100 && s.gate_idle[S] == 0);   // перебивание словом возможно
+        CHECK(s.gate.pauses() == 1);
+    }
+    // ---- по BOOT: запись по кнопке тоже пауза
+    {
+        WakeSim s;
+        s.r.add(s.d.on_press(s.t));
+        s.step(250);
+        CHECK(s.d.phase() == Phase::Listening && s.gate_run[L] == 0 && s.gate_idle[L] > 0);
+        const int idle_in_rec = s.gate_idle[L];
+        s.step(500);
+        CHECK(s.gate_run[L] == 0 && s.gate_idle[L] > idle_in_rec);
+        s.r.add(s.d.on_release(s.t));
+        s.step(20);
+        CHECK(s.d.phase() == Phase::Thinking && s.gate_restart == 2 && s.gate_run[T] > 0);
+    }
+    // ---- по голосу в окне после ответа: запись mode=follow тоже пауза, окно до записи работает (движок слышит слово и в нём)
+    {
+        WakeSim s;
+        ask(s);
+        flow_server_answer(s);
+        CHECK(s.d.phase() == Phase::Idle);
+        s.step(wake_logic::kResumeMs + 10);
+        CHECK(s.m.follow_open() && s.gate_idle[I] == 0);
+        const int restarts = s.gate_restart;
+        const int run_listening = s.gate_run[L];
+        s.step(500);   // окно открыто, никто не говорит: движок считает
+        s.follow_run_ms = wake_logic::kFollowSpeechMs;
+        s.step(10);
+        CHECK(s.follow_starts == 1 && s.d.phase() == Phase::Listening);
+        s.step(600);
+        CHECK(s.gate_run[L] == run_listening && s.gate_restart == restarts);   // пока идёт запись follow, не считал
+        s.follow_run_ms = 0;
+        s.speech = true;
+        s.step(600);
+        s.speech = false;
+        s.step(900);
+        CHECK(s.d.phase() == Phase::Thinking && s.gate_restart == restarts + 1);   // вернулся с нуля
+    }
+    // ---- перебивание словом: слово в SPEAKING (движок работал) -> запись (пауза) -> ответ на новую фразу (движок вернулся с нуля)
+    {
+        WakeSim s;
+        ask(s);
+        s.r.add(s.d.on_audio_start(s.t));
+        s.drained = false;
+        s.step(1500);
+        CHECK(s.d.phase() == Phase::Speaking && s.gate_idle[S] == 0);
+        const int restarts = s.gate_restart;
+        const int run_l = s.gate_run[L];
+        s.detect = true;   // слово посреди ответа
+        s.step(10);
+        CHECK(s.barges == 1 && s.d.phase() == Phase::Listening);
+        s.step(450);
+        s.speech = true;
+        s.step(600);
+        s.speech = false;
+        s.step(900);
+        CHECK(s.d.phase() == Phase::Thinking);
+        CHECK(s.gate_run[L] == run_l && s.gate_restart == restarts + 1 && s.gate.pauses() == 2);   // обе записи пропущены, возврат с нуля
+        s.step(100);
+        CHECK(s.gate_idle[T] == 0);
+    }
+    // ---- потеря связи посреди записи: запись обрывается, движок возвращается с нуля (в покое, но «слово ждёт связи»: считать всё равно можно)
+    {
+        WakeSim s;
+        s.detect = true;
+        s.step(10);
+        s.step(300);
+        CHECK(s.d.phase() == Phase::Listening && s.gate_run[L] == 0);
+        s.r.add(s.d.on_link(false, s.t));
+        s.step(20);
+        CHECK(s.d.phase() == Phase::Idle && s.gate_restart == 2);
+    }
+    // ---- слово выключено командой: движок не считает ни в покое, ни в ответе (как и раньше), возврат «с нуля» после wake on
+    {
+        WakeSim s;
+        s.enabled = false;
+        s.step(200);
+        CHECK(s.gate_idle[I] == 20 && s.gate.pauses() == 0);
+        s.enabled = true;
+        s.step(20);
+        CHECK(s.gate_restart == 2);
+    }
+}
+
+static void test_wake_bench_logic()
+{
+    using namespace wake_perf;
+    // накопитель по операциям
+    OpAcc a;
+    CHECK(a.n == 0 && a.total_us() == 0);
+    a.add("CONV_2D", 3000);
+    a.add("CONV_2D", 4000);
+    a.add("DEPTHWISE_CONV_2D", 1000);
+    a.add("FULLY_CONNECTED", 500);
+    a.add(nullptr, 7);
+    CHECK(a.n == 4 && a.total_us() == 8507);
+    CHECK(strcmp(a.ops[0].tag, "CONV_2D") == 0 && a.ops[0].calls == 2 && a.ops[0].sum_us == 7000 && a.ops[0].max_us == 4000);
+    // больше тегов, чем строк: лишнее копится в последней строке («other»), потерь нет
+    OpAcc many;
+    uint64_t sum = 0;
+    for (int i = 0; i < 40; i++) {
+        char tag[16];
+        snprintf(tag, sizeof(tag), "OP_%d", i);
+        many.add(tag, 10 + static_cast<uint32_t>(i));
+        sum += 10 + static_cast<uint64_t>(i);
+    }
+    CHECK(many.n == kBenchMaxOps && many.total_us() == sum && strcmp(many.ops[kBenchMaxOps - 1].tag, "other") == 0);
+    many.clear();
+    CHECK(many.n == 0 && many.total_us() == 0);
+
+    // прогон: 100 запусков по 8 мс и 300 признаков по 1,2 мс
+    BenchRun p;
+    snprintf(p.weights, sizeof(p.weights), "psram");
+    for (int i = 0; i < 100; i++) {
+        p.add_inf(i == 99 ? 9000 : 8000);
+        p.ops.add("CONV_2D", 5000);
+        p.ops.add("DEPTHWISE_CONV_2D", 2000);
+        p.ops.add("FULLY_CONNECTED", 900);
+    }
+    for (int i = 0; i < 300; i++) {
+        p.add_fe(i == 0 ? 1900 : 1200);
+    }
+    p.ran = true;
+    CHECK(p.inf == 100 && p.fe == 300 && p.inf_max_us == 9000 && p.fe_max_us == 1900);
+    CHECK_NEAR(p.inf_avg_us(), 8010.0, 0.5);
+    CHECK_NEAR(p.fe_avg_us(), 1202.3, 0.5);
+    CHECK_NEAR(p.ms_per_30ms(), (8010.0 + 3.0 * 1202.33) / 1000.0, 0.01);
+    CHECK_NEAR(p.busy_pct(), 100.0 * p.ms_per_30ms() / 30.0, 0.01);
+    char buf[260];
+    size_t n = format_bench_run(p, buf, sizeof(buf));
+    CHECK(n == strlen(buf) && strncmp(buf, "psram: inference avg 8010 max 9000 us (100 runs), features avg 1202 max 1900 us (300 steps)", 91) == 0);
+    CHECK(strstr(buf, "ms per 30 ms of audio") != nullptr && strstr(buf, "% of a core") != nullptr && n < 200);
+    n = format_bench_ops(p, 5, buf, sizeof(buf));
+    CHECK(n == strlen(buf) && strncmp(buf, "psram ops, avg us per inference: CONV_2D 5000 (63%), DEPTHWISE_CONV_2D 2000 (25%), FULLY_CONNECTED 900 (11%)", 100) == 0);
+    n = format_bench_ops(p, 2, buf, sizeof(buf));
+    CHECK(strstr(buf, "FULLY_CONNECTED") == nullptr && strstr(buf, "DEPTHWISE_CONV_2D") != nullptr);
+    // не состоялся: причина в строке
+    BenchRun f;
+    snprintf(f.weights, sizeof(f.weights), "flash");
+    snprintf(f.why, sizeof(f.why), "the model in the image is not 16-byte aligned (address offset 4)");
+    format_bench_run(f, buf, sizeof(buf));
+    CHECK(strcmp(buf, "flash: not run (the model in the image is not 16-byte aligned (address offset 4))") == 0);
+    format_bench_ops(f, 5, buf, sizeof(buf));
+    CHECK(strcmp(buf, "flash ops: none") == 0);
+    format_bench_verdict(p, f, buf, sizeof(buf));
+    CHECK(strcmp(buf, "verdict: need both runs to compare") == 0);
+    // вердикт: flash медленнее, быстрее, так же
+    BenchRun q = p;
+    snprintf(q.weights, sizeof(q.weights), "flash");
+    q.inf_sum_us = p.inf_sum_us * 13 / 10;   // на 30% дольше
+    format_bench_verdict(p, q, buf, sizeof(buf));
+    CHECK(strstr(buf, "model from flash is 30% slower than the PSRAM copy") != nullptr);
+    q.inf_sum_us = p.inf_sum_us * 8 / 10;
+    format_bench_verdict(p, q, buf, sizeof(buf));
+    CHECK(strstr(buf, "20% faster") != nullptr);
+    q.inf_sum_us = p.inf_sum_us + p.inf_sum_us / 100;
+    format_bench_verdict(p, q, buf, sizeof(buf));
+    CHECK(strstr(buf, "about the same as the PSRAM copy") != nullptr);
+    // короткие буферы
+    for (size_t cap = 0; cap < 40; cap++) {
+        char small[48];
+        memset(small, 'x', sizeof(small));
+        size_t w = format_bench_run(p, small, cap);
+        CHECK(cap == 0 ? small[0] == 'x' : (w < cap && small[w] == '\0'));
+        memset(small, 'x', sizeof(small));
+        w = format_bench_ops(p, 5, small, cap);
+        CHECK(cap == 0 ? small[0] == 'x' : (w < cap && small[w] == '\0'));
+        memset(small, 'x', sizeof(small));
+        w = format_bench_verdict(p, q, small, cap);
+        CHECK(cap == 0 ? small[0] == 'x' : (w < cap && small[w] == '\0'));
+    }
+    // задача websocket (она у нас названа ws) входит в группу связи
+    CHECK(classify_task("ws") == Group::Link && classify_task("link") == Group::Link);
+    // команда
+    cmd::Command c = cmd::parse_command("wake bench");
+    CHECK(c.kind == cmd::Kind::Wake && c.wake_op == cmd::WakeOp::Bench);
+    c = cmd::parse_command("  WAKE   Bench  ");
+    CHECK(c.kind == cmd::Kind::Wake && c.wake_op == cmd::WakeOp::Bench);
+    c = cmd::parse_command("wake bench now");
+    CHECK(c.kind == cmd::Kind::Error && strcmp(c.err_reason, "usage") == 0);
+    c = cmd::parse_command("wake benchmark");
+    CHECK(c.kind == cmd::Kind::Error);
+}
+
 int main()
 {
     test_dbfs();
@@ -5803,6 +6382,12 @@ int main()
     test_mww_commands();
     test_mww_machine_flow();
     test_wake_perf_mww();
+    test_sample_ring();
+    test_link_stability_fsm();
+    test_mww_run_gate();
+    test_mww_pause_detector();
+    test_mww_pause_flow();
+    test_wake_bench_logic();
     printf("%d checks, %d failed\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

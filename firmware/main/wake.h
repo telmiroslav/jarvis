@@ -128,6 +128,16 @@ struct PerfInfo {
 };
 PerfInfo perf_info();
 
+// v0.5.1: стенд «wake bench» (mww.h: bench_start). false: причина в why (no_mww, dialog_busy, busy, engine_busy, no_memory). Результат строками:
+// bench_line(0), (1), ... (без префикса «WAKE bench»), 0 в конце; bench_state(): 0 не было, 1 идёт, 2 готов.
+bool bench_start(char *why, size_t why_cap);
+int bench_state();
+size_t bench_line(int i, char *buf, size_t cap);
+
+// v0.5.1: дописывает в buf состояние слова и простой ядер по последнему снимку («mww=paused idle0=22% idle1=9% (perf 4 s ago)»). Для строки
+// диагностики ошибки связи (link.h Callbacks::diag): быстрая, ничего не ждёт.
+void diag_text(char *buf, size_t cap);
+
 // Настройки (сохраняются в NVS). false: не записалось, либо значение вне пределов, либо движок отказал.
 bool set_enabled(bool on);
 // Писк: уровень 0..5 (0 = выключен). Новый уровень один раз проигрывается, если динамик свободен и разговор в покое.

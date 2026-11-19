@@ -92,6 +92,66 @@ void merge(MwwAcc *a, const MwwAcc &b)
     }
 }
 
+void OpAcc::add(const char *tag, uint32_t us)
+{
+    if (!tag) {
+        tag = "?";
+    }
+    Op *slot = nullptr;
+    for (size_t i = 0; i < n; i++) {
+        if (strncmp(ops[i].tag, tag, kBenchTagLen - 1) == 0) {
+            slot = &ops[i];
+            break;
+        }
+    }
+    if (!slot) {
+        if (n < kBenchMaxOps - 1) {
+            slot = &ops[n++];
+            snprintf(slot->tag, sizeof(slot->tag), "%s", tag);
+        } else {
+            // последняя строка копит всё, что не поместилось
+            if (n < kBenchMaxOps) {
+                slot = &ops[n++];
+                snprintf(slot->tag, sizeof(slot->tag), "other");
+            } else {
+                slot = &ops[kBenchMaxOps - 1];
+            }
+        }
+    }
+    slot->calls++;
+    slot->sum_us += us;
+    if (us > slot->max_us) {
+        slot->max_us = us;
+    }
+}
+
+uint64_t OpAcc::total_us() const
+{
+    uint64_t t = 0;
+    for (size_t i = 0; i < n; i++) {
+        t += ops[i].sum_us;
+    }
+    return t;
+}
+
+void BenchRun::add_inf(uint32_t us)
+{
+    inf++;
+    inf_sum_us += us;
+    if (us > inf_max_us) {
+        inf_max_us = us;
+    }
+}
+
+void BenchRun::add_fe(uint32_t us)
+{
+    fe++;
+    fe_sum_us += us;
+    if (us > fe_max_us) {
+        fe_max_us = us;
+    }
+}
+
 uint32_t pending_frames(uint32_t fed, uint32_t fetched)
 {
     const int32_t d = static_cast<int32_t>(fed - fetched);
@@ -136,6 +196,7 @@ Group classify_task(const char *name)
         {"main", Group::Main},
         {"link", Group::Link},
         {"websocket_task", Group::Link},
+        {"ws", Group::Link},                 // v0.5.1: так названа задача клиента WebSocket (link.cc), раньше она попадала в «other»
         {"audio_in", Group::Audio},
         {"audio_out", Group::Audio},
         {"wifi", Group::Wifi},
@@ -234,6 +295,78 @@ size_t format_mww(const MwwAcc &a, char *buf, size_t cap)
                          static_cast<double>(a.inf_avg_ms()), static_cast<double>(a.inf_max_ms()), static_cast<unsigned>(a.slow),
                          static_cast<unsigned>(a.inf), static_cast<double>(a.fe_avg_ms()), static_cast<double>(a.fe_max_ms()),
                          static_cast<double>(a.busy_pct()), static_cast<unsigned>(a.lag_max_ms), a.p_max),
+                cap);
+}
+
+size_t format_bench_run(const BenchRun &r, char *buf, size_t cap)
+{
+    if (cap == 0) {
+        return 0;
+    }
+    const char *w = r.weights[0] ? r.weights : "?";
+    if (!r.ran || r.inf == 0) {
+        return clip(snprintf(buf, cap, "%s: not run (%s)", w, r.why[0] ? r.why : "no data"), cap);
+    }
+    return clip(snprintf(buf, cap,
+                         "%s: inference avg %.0f max %u us (%u runs), features avg %.0f max %u us (%u steps) => %.1f ms per 30 ms of audio = "
+                         "%.0f%% of a core",
+                         w, static_cast<double>(r.inf_avg_us()), static_cast<unsigned>(r.inf_max_us), static_cast<unsigned>(r.inf),
+                         static_cast<double>(r.fe_avg_us()), static_cast<unsigned>(r.fe_max_us), static_cast<unsigned>(r.fe),
+                         static_cast<double>(r.ms_per_30ms()), static_cast<double>(r.busy_pct())),
+                cap);
+}
+
+size_t format_bench_ops(const BenchRun &r, size_t top, char *buf, size_t cap)
+{
+    if (cap == 0) {
+        return 0;
+    }
+    const char *w = r.weights[0] ? r.weights : "?";
+    const uint64_t total = r.ops.total_us();
+    if (!r.ran || r.inf == 0 || total == 0 || r.ops.n == 0) {
+        return clip(snprintf(buf, cap, "%s ops: none", w), cap);
+    }
+    // Самые долгие по сумме, по убыванию (выбор по одному: операций немного)
+    bool used[kBenchMaxOps] = {false};
+    size_t n = clip(snprintf(buf, cap, "%s ops, avg us per inference: ", w), cap);
+    const size_t shown = top < r.ops.n ? top : r.ops.n;
+    for (size_t k = 0; k < shown; k++) {
+        size_t best = kBenchMaxOps;
+        for (size_t i = 0; i < r.ops.n; i++) {
+            if (!used[i] && (best == kBenchMaxOps || r.ops.ops[i].sum_us > r.ops.ops[best].sum_us)) {
+                best = i;
+            }
+        }
+        if (best == kBenchMaxOps) {
+            break;
+        }
+        used[best] = true;
+        const OpAcc::Op &o = r.ops.ops[best];
+        const int x = snprintf(buf + n, cap - n, "%s%s %.0f (%.0f%%)", k == 0 ? "" : ", ", o.tag,
+                               static_cast<double>(o.sum_us) / static_cast<double>(r.inf),
+                               100.0 * static_cast<double>(o.sum_us) / static_cast<double>(total));
+        n += clip(x, cap - n);
+    }
+    return n;
+}
+
+size_t format_bench_verdict(const BenchRun &psram, const BenchRun &flash, char *buf, size_t cap)
+{
+    if (cap == 0) {
+        return 0;
+    }
+    if (!psram.ran || !flash.ran || psram.inf == 0 || flash.inf == 0 || psram.inf_avg_us() <= 0.0f) {
+        return clip(snprintf(buf, cap, "verdict: need both runs to compare"), cap);
+    }
+    const double d = 100.0 * (static_cast<double>(flash.inf_avg_us()) / static_cast<double>(psram.inf_avg_us()) - 1.0);
+    const char *what = d > 3.0 ? "slower" : d < -3.0 ? "faster" : "about the same";
+    if (d > 3.0 || d < -3.0) {
+        return clip(snprintf(buf, cap, "verdict: model from flash is %.0f%% %s than the PSRAM copy (inference avg %.0f vs %.0f us)",
+                             d < 0 ? -d : d, what, static_cast<double>(flash.inf_avg_us()), static_cast<double>(psram.inf_avg_us())),
+                    cap);
+    }
+    return clip(snprintf(buf, cap, "verdict: model from flash is %s as the PSRAM copy (inference avg %.0f vs %.0f us)", what,
+                         static_cast<double>(flash.inf_avg_us()), static_cast<double>(psram.inf_avg_us())),
                 cap);
 }
 
