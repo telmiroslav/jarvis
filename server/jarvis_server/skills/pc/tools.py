@@ -143,8 +143,9 @@ class PcControl:
                                "description": "для set: громкость 0-100; для up и down: на сколько изменить (1-50)"}},
                   ["action"]), self.volume_control),
             ("media_control",
-             "Управление музыкой и видео на ноутбуке (любой плеер: Spotify, браузер, VLC). action: play_pause переключить, play, "
-             "pause, next следующий трек, previous предыдущий, stop, status узнать, что играет. Возвращает состояние и название трека.",
+             "Управление тем, что УЖЕ играет на ноутбуке (любой плеер: Spotify, браузер, VLC). action: play_pause переключить, play "
+             "продолжить, pause, next следующий трек, previous предыдущий, stop, status узнать, что играет. Новую музыку или видео "
+             "НЕ включает: если плеера нет, вернёт no_player. Возвращает состояние и название трека.",
              _obj({"action": {"type": "string", "enum": list(MEDIA_ACTIONS)}}, ["action"]), self.media_control),
             ("brightness_control",
              "Яркость экрана ноутбука. action: get узнать; set установить percent процентов (1-100); up или down изменить на "
@@ -154,13 +155,17 @@ class PcControl:
                                "description": "для set: яркость 1-100; для up и down: на сколько изменить (1-50)"}},
                   ["action"]), self.brightness_control),
             ("open_website",
-             "Открыть сайт в браузере на ноутбуке. url: адрес вида youtube.com или https://example.com/page, только http и https. "
-             "Чтобы что-то найти, используй web_search.",
+             "Открыть сайт в браузере на ноутбуке. url: готовый адрес вида youtube.com или https://example.com/page, только http и "
+             "https. Только открывает страницу: ничего на ней не нажимает и не включает. Адреса поиска сам не собирай, для поиска "
+             "всегда используй web_search.",
              _obj({"url": {"type": "string", "description": "адрес сайта"}}, ["url"]), self.open_website),
             ("web_search",
-             "Открыть в браузере на ноутбуке результаты поиска (сам поиск не читает вслух). query: что искать.",
+             "Открыть в браузере на ноутбуке страницу результатов поиска (результаты не читает вслух, найденное видео или трек не "
+             "включает). query: что искать. engine: где искать.",
              _obj({"query": {"type": "string", "description": "поисковый запрос"},
-                   "engine": {"type": "string", "enum": list(SEARCH_ENGINES), "description": "по умолчанию google"}},
+                   "engine": {"type": "string", "enum": list(SEARCH_ENGINES),
+                              "description": "где искать, по умолчанию google; youtube: видео, soundcloud: музыка и треки, "
+                                             "wikipedia: статьи, yandex и duckduckgo: обычный поиск"}},
                   ["query"]), self.web_search),
             ("lock_screen", "Заблокировать экран ноутбука.", _obj({}), self.lock_screen),
             ("power_action",
@@ -432,7 +437,7 @@ class PcControl:
             except BadUrl as e:
                 raise PcError("bad_argument", f"url: {e}") from None
             await self._open_url(good)
-            return _ok(url=good, message="Открываю сайт в браузере")
+            return _ok(url=good, message="Открыл страницу в браузере, больше на ней ничего не нажато и не включено")
 
         return await self._run("open_website", {"url": url}, go)
 
@@ -444,7 +449,8 @@ class PcControl:
             except BadUrl as e:
                 raise PcError("bad_argument", f"query: {e}") from None
             await self._open_url(good)
-            return _ok(engine=(eng or "google").lower(), message="Открываю результаты поиска в браузере")
+            return _ok(engine=(eng or "google").lower(),
+                       message="Открыл страницу результатов поиска, сам трек или видео не включён")
 
         return await self._run("web_search", {"query": query, "engine": engine}, go)
 
