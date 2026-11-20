@@ -28,6 +28,7 @@
 #include "mww.h"
 #include "mww_logic.h"
 #include "playback.h"
+#include "reset_name.h"
 #include "session.h"
 #include "settings.h"
 #include "time_util.h"
@@ -267,6 +268,31 @@ bool fail(const char *why, const char *what)
     C.why = why;
     ESP_LOGE(TAG, "wake word is UNAVAILABLE (%s): %s. Push-to-talk (BOOT) works as before.", why, what);
     return false;
+}
+
+// Причина сброса, которым начался этот запуск (то есть чем кончился прошлый), в виде для чистой логики сторожа (mww_logic::ResetKind)
+mww_logic::ResetKind reset_kind_of(esp_reset_reason_t r)
+{
+    using mww_logic::ResetKind;
+    switch (r) {
+    case ESP_RST_POWERON:    return ResetKind::PowerOn;
+    case ESP_RST_EXT:        return ResetKind::Ext;
+    case ESP_RST_SW:         return ResetKind::Sw;
+    case ESP_RST_PANIC:      return ResetKind::Panic;
+    case ESP_RST_INT_WDT:    return ResetKind::IntWdt;
+    case ESP_RST_TASK_WDT:   return ResetKind::TaskWdt;
+    case ESP_RST_WDT:        return ResetKind::Wdt;
+    case ESP_RST_DEEPSLEEP:  return ResetKind::DeepSleep;
+    case ESP_RST_BROWNOUT:   return ResetKind::Brownout;
+    case ESP_RST_SDIO:       return ResetKind::Sdio;
+    case ESP_RST_USB:        return ResetKind::Usb;
+    case ESP_RST_JTAG:       return ResetKind::Jtag;
+    case ESP_RST_EFUSE:      return ResetKind::Efuse;
+    case ESP_RST_PWR_GLITCH: return ResetKind::PwrGlitch;
+    case ESP_RST_CPU_LOCKUP: return ResetKind::CpuLockup;
+    case ESP_RST_UNKNOWN:
+    default:                 return ResetKind::Unknown;
+    }
 }
 
 void log_memory(const char *when)
@@ -1040,22 +1066,44 @@ bool init(AudioOut *out, AudioIn *in)
                       "Push-to-talk (BOOT) works as always.");
         return false;
     }
-    const mww_logic::GuardAction guard = mww_logic::guard_action(C.engine_wanted, settings::get_wake_guard());
+    // Сторож запуска. Если он ещё стоит, прошлый запуск кончился раньше, чем движок прожил kGuardClearMs. Виноват ли движок, говорит только причина
+    // сброса: падение программы (PANIC, сторожевые таймеры, CPU_LOCKUP) да, а кабель USB, reboot, монитор, перепрошивка или обесточенный порт ноутбука нет
+    const esp_reset_reason_t prev_rr = esp_reset_reason();
+    const bool guard_set = settings::get_wake_guard();
+    const mww_logic::ResetKind prev_reset = reset_kind_of(prev_rr);
+    const mww_logic::GuardAction guard = mww_logic::guard_action(C.engine_wanted, guard_set, prev_reset);
     if (guard == mww_logic::GuardAction::DemoteToEsp) {
         // Плата упала при запуске слова (или в первые 30 с работы) с движком microWakeWord. Чтобы не остаться без слова совсем,
         // переходим на проверенный движок ESP-SR и запоминаем это: новый запуск microWakeWord только по команде wake engine mww
         ESP_LOGE(TAG,
-                 "the board crashed during the previous start of the wake word engine while microWakeWord was selected: switching "
-                 "to the ESP-SR engine (saved). Send me the log of the crash. To try microWakeWord again: wake engine mww and reboot");
+                 "the board crashed (%s) during the previous start of the wake word engine while microWakeWord was selected: switching "
+                 "to the ESP-SR engine (saved). Send me the log of the crash. To try microWakeWord again: wake engine mww and reboot",
+                 reset_short_name(prev_rr));
         settings::set_wake_engine_mww(false);
         settings::set_wake_guard(false);
         C.engine_wanted = mww_logic::Engine::Esp;
         C.engine_fell_back = true;
         snprintf(C.fallback_why, sizeof(C.fallback_why), "%s", "mww_crashed_last_start");
     } else if (guard == mww_logic::GuardAction::Fail) {
-        return fail("previous_start_crashed",
-                    "the board crashed during the previous start of the wake word engine, so it is skipped now. Send the command "
-                    "'wake on' and reboot to try again, and send me the log of the crash");
+        // Движок в этом запуске не стартует, значит, чем бы он ни кончился (хоть падением по другой причине), к движку это не относится. Поэтому сторож
+        // снимаем сразу: следующая загрузка пробует движок снова (а не ждёт команды wake on)
+        settings::set_wake_guard(false);
+        char what[240];
+        snprintf(what, sizeof(what),
+                 "the board crashed (%s) during the previous start of the wake word engine, so the engine is skipped in this run only. "
+                 "Reboot to try again and send me the log of the crash",
+                 reset_short_name(prev_rr));
+        return fail("previous_start_crashed", what);
+    } else if (guard_set) {
+        // Сторож стоял, но прошлый запуск кончился не падением: запускаем как обычно (ниже сторож встанет заново)
+        if (mww_logic::reset_is_power(prev_reset)) {
+            ESP_LOGW(TAG,
+                     "start guard was left by a power reset (%s), not by the engine: starting the engine as usual. Check the USB cable and "
+                     "the power supply",
+                     reset_short_name(prev_rr));
+        } else {
+            ESP_LOGI(TAG, "start guard was left by a reset that is not a crash (%s): starting the engine as usual", reset_short_name(prev_rr));
+        }
     }
     if (!esp_psram_is_initialized()) {
         return fail("no_psram", "the engine needs PSRAM");
@@ -1777,7 +1825,7 @@ bool set_enabled(bool on)
     C.enabled = on;
     C.run.store(on);
     if (on && !C.ok && strcmp(C.why, "previous_start_crashed") == 0) {
-        settings::set_wake_guard(false);   // следующая загрузка попробует снова
+        settings::set_wake_guard(false);   // следующая загрузка попробует снова (запуск с упавшим движком уже снял сторож, это на случай сбоя записи в NVS)
         C.why = "will_retry_after_reboot";
     } else if (on && !C.ok && strcmp(C.why, "off_in_settings") == 0) {
         C.why = "reboot_to_start";         // при выключенном слове движок не запускался

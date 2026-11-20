@@ -1,4 +1,4 @@
-// Jarvis v0.6.0: голосовой помощник. Плата слышит слово «Джарвис» сама (wake.cc: microWakeWord с моделью Давида или ESP-SR) или слушает кнопку BOOT, отправляет
+// Jarvis v0.6.1: голосовой помощник. Плата слышит слово «Джарвис» сама (wake.cc: microWakeWord с моделью Давида или ESP-SR) или слушает кнопку BOOT, отправляет
 // голос серверу на ноутбуке, показывает лицо и субтитры и играет ответ (поверх проверки железа из v0.1 и экрана, Wi-Fi и
 // часов из v0.2). С v0.6.0 ещё играет музыку с ноутбука на своей колонке и слышит слово «Джарвис» поверх неё.
 //
@@ -70,6 +70,7 @@
 #include "net.h"
 #include "net_logic.h"
 #include "playback.h"
+#include "reset_name.h"
 #include "session.h"
 #include "settings.h"
 #include "text_util.h"
@@ -212,30 +213,6 @@ ResetText describe_reset(esp_reset_reason_t r)
     case ESP_RST_CPU_LOCKUP: return {"CPU_LOCKUP (двойное исключение)", 2};
     case ESP_RST_UNKNOWN:
     default:                return {"UNKNOWN", 1};
-    }
-}
-
-// Короткое имя для строки-вердикта (без пробелов, чтобы удобно искать grep-ом)
-const char *reset_short_name(esp_reset_reason_t r)
-{
-    switch (r) {
-    case ESP_RST_POWERON:    return "POWERON";
-    case ESP_RST_EXT:        return "EXT";
-    case ESP_RST_SW:         return "SW";
-    case ESP_RST_PANIC:      return "PANIC!!!";
-    case ESP_RST_INT_WDT:    return "INT_WDT!!!";
-    case ESP_RST_TASK_WDT:   return "TASK_WDT!!!";
-    case ESP_RST_WDT:        return "WDT!!!";
-    case ESP_RST_DEEPSLEEP:  return "DEEPSLEEP";
-    case ESP_RST_BROWNOUT:   return "BROWNOUT!!!";
-    case ESP_RST_SDIO:       return "SDIO";
-    case ESP_RST_USB:        return "USB";
-    case ESP_RST_JTAG:       return "JTAG";
-    case ESP_RST_EFUSE:      return "EFUSE";
-    case ESP_RST_PWR_GLITCH: return "PWR_GLITCH!!!";
-    case ESP_RST_CPU_LOCKUP: return "CPU_LOCKUP!!!";
-    case ESP_RST_UNKNOWN:
-    default:                 return "UNKNOWN";
     }
 }
 
@@ -1134,7 +1111,7 @@ bool apply_lcd_cfg(int n)
 void print_greeting()
 {
     ESP_LOGI(TAG, "################################################################");
-    ESP_LOGI(TAG, "# JARVIS v0.6.0: музыка на колонке (сервер шлёт звук), слово «Джарвис» слышно поверх неё (эхоподавление ESP-SR AEC), короткое нажатие BOOT = стоп музыки, команды aec и music");
+    ESP_LOGI(TAG, "# JARVIS v0.6.1: слово «Джарвис» не выключается и не уходит на запасной движок после обычного сброса (USB, reboot, монитор, перепрошивка) в первые 30 с, только после настоящего падения; музыка на колонке, слово поверх неё (эхоподавление ESP-SR AEC), BOOT коротко = стоп музыки, команды aec и music");
     ESP_LOGI(TAG, "################################################################");
     ESP_LOGI(TAG, "Привет, Давид! Что должно быть:");
     ESP_LOGI(TAG, "  1. ЭКРАН: два бирюзовых глаза. Без Wi-Fi внизу подсказка, с Wi-Fi без ноутбука «Ищу ноутбук…» и «Нет связи…».");
