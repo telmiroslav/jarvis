@@ -45,7 +45,7 @@ TFLM_INC := -I$(TFLM_DIR) -I$(TFLM_DIR)/third_party/gemmlowp -I$(TFLM_DIR)/third
 
 all: $(OUT)/test_main $(OUT)/render $(if $(HAVE_MWW),$(OUT)/test_mww_core $(OUT)/mww_check)
 
-$(OUT)/test_main: $(LOGIC_SRCS) test_v060.inc $(wildcard $(MAIN)/*.h)
+$(OUT)/test_main: $(LOGIC_SRCS) test_v060.inc test_v061.inc $(wildcard $(MAIN)/*.h)
 	@mkdir -p $(OUT)
 	g++ -std=c++17 -O1 -g $(WARN) -fsanitize=address,undefined -I$(MAIN) $(LOGIC_SRCS) -o $@ -lm
 

@@ -5572,10 +5572,10 @@ static void test_mww_engine_choice()
     CHECK(c.active == Engine::Esp && !c.fell_back);         // esp выбран: mww не трогаем, это не «запасной путь»
     c = choose_engine(Engine::Esp, false);
     CHECK(c.active == Engine::Esp && !c.fell_back);
-    // сторож запуска: плата упала на запуске
-    CHECK(guard_action(Engine::Mww, false) == GuardAction::Proceed && guard_action(Engine::Esp, false) == GuardAction::Proceed);
-    CHECK(guard_action(Engine::Mww, true) == GuardAction::DemoteToEsp);    // с mww переходим на проверенный ESP-SR
-    CHECK(guard_action(Engine::Esp, true) == GuardAction::Fail);           // с esp как в v0.4.2: слова нет до «wake on» и перезагрузки
+    // сторож запуска: плата упала на запуске (все причины сброса и не-падения: test_guard_v061 в test_v061.inc)
+    CHECK(guard_action(Engine::Mww, false, ResetKind::Panic) == GuardAction::Proceed && guard_action(Engine::Esp, false, ResetKind::Panic) == GuardAction::Proceed);
+    CHECK(guard_action(Engine::Mww, true, ResetKind::Panic) == GuardAction::DemoteToEsp);    // с mww переходим на проверенный ESP-SR
+    CHECK(guard_action(Engine::Esp, true, ResetKind::Panic) == GuardAction::Fail);           // с esp как в v0.4.2: слова в этом запуске нет
 }
 
 static void test_mww_commands()
@@ -6327,6 +6327,8 @@ static void test_wake_bench_logic()
 
 // v0.6.0: музыка на колонке и эхоподавление
 #include "test_v060.inc"
+// v0.6.1: сторож запуска слова смотрит на причину сброса
+#include "test_v061.inc"
 
 int main()
 {
@@ -6413,6 +6415,9 @@ int main()
     test_aec_config_logic();
     test_commands_v060();
     test_music_turn_flow();
+    test_reset_kind_v061();
+    test_guard_v061();
+    test_guard_boot_sequences_v061();
     printf("%d checks, %d failed\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

@@ -82,9 +82,25 @@ EngineChoice choose_engine(Engine wanted, bool mww_ready)
     return c;
 }
 
-GuardAction guard_action(Engine wanted, bool guard_set)
+bool reset_is_crash(ResetKind k)
 {
-    if (!guard_set) {
+    switch (k) {
+    case ResetKind::Panic:
+    case ResetKind::IntWdt:
+    case ResetKind::TaskWdt:
+    case ResetKind::Wdt:
+    case ResetKind::CpuLockup:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool reset_is_power(ResetKind k) { return k == ResetKind::Brownout || k == ResetKind::PwrGlitch; }
+
+GuardAction guard_action(Engine wanted, bool guard_set, ResetKind previous_reset)
+{
+    if (!guard_set || !reset_is_crash(previous_reset)) {
         return GuardAction::Proceed;
     }
     return wanted == Engine::Mww ? GuardAction::DemoteToEsp : GuardAction::Fail;
